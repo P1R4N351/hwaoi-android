@@ -1,0 +1,80 @@
+{
+  "title_id": "0400486024DEC000",
+  "update_title_id": "0400486024DEC800",
+  "content_version": 131072,
+  "display_version": "2.0.0",
+  "nup_v1": {
+    "header_version": 1,
+    "package_count": 2,
+    "base_version": 65536,
+    "update_version": 131072
+  },
+  "pkg0_v65536_exefs": {
+    "main": {
+      "size": 29840183,
+      "sha256": "efe7b93dfacb091fa0948a92152fd014962a498e463114a924c265522397d990",
+      "build_id": "33fa6c2c23848282a77e8b88a0a93f4887c55920000000000000000000000000"
+    },
+    "main.npdm": {
+      "size": 1828,
+      "sha256": "8209df42c978bfcea8b3c9fd9839ed854b17e698890e393495e133a945d5f733"
+    },
+    "rtld": {
+      "size": 10521,
+      "sha256": "ecc7520952255e5749fe01d8726ecdec1e6ef69845cfd95f113109f79432d803",
+      "build_id": "599a9175d735e56d0b531d32f7dd8c726d335d65000000000000000000000000"
+    },
+    "sdk": {
+      "size": 7834834,
+      "sha256": "f9286045ed905d2dccb5f13323f0312b4fd108766bc61ecf4cea73b4207f218e",
+      "build_id": "5fd6d40b36fb19c82ef24a03dbcb474c51bb190d000000000000000000000000"
+    },
+    "subsdk0": {
+      "size": 533397,
+      "sha256": "0b63d94da127456f7ecc9cf598f9896e235c3645386866348cdee05097ae0160",
+      "build_id": "ecf61f74a892d5b55be2ad09888179eda659d3d7000000000000000000000000"
+    }
+  },
+  "pkg1_v131072_exefs": {
+    "main": {
+      "size": 29953289,
+      "sha256": "7db9ddfda088c22d219ef13496decd7077c68cd67d4b37f53f4ac46a082768f2",
+      "build_id": "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348000000000000000000000000",
+      "nso_flags": "0xff",
+      "segments": {
+        "text": {"size": 63201744, "sha256_prefix": "f71eb7b75b11dcc8"},
+        "rodata": {"size": 12603520, "sha256_prefix": "51b0ba7be05f806e"},
+        "data": {"size": 5217152, "sha256_prefix": "ae2b071269be36d1"},
+        "bss": {"size": 1414272}
+      }
+    },
+    "main.npdm": {
+      "size": 1828,
+      "sha256": "94c154d83cbaca00d092958cc2b3a0494d7308fe49de8cb33ece7e9e67303ea7"
+    },
+    "rtld": {
+      "size": 10524,
+      "sha256": "219f25ef4a64a704e86dacfeb25d9e8977045f2145e629268b94baf34d5e0bbe",
+      "build_id": "8e213f228d12c7b0f8c21c3ce81b95e214417369000000000000000000000000",
+      "nso_flags": "0x3f"
+    },
+    "sdk": {
+      "size": 7833714,
+      "sha256": "3ae3cd4cf340d72bdaba9e6f66016a74c1eae13737a5f7299375ed6654b9b1c5",
+      "build_id": "1643a838814f9c10c696f930ed681e7fa3fb9af8000000000000000000000000",
+      "nso_flags": "0x3f"
+    },
+    "subsdk0": {
+      "size": 533396,
+      "sha256": "0d32c4bdbcfcfa1c4110c37eff18eaf70061a55090b7fedc741a2e37224065ba",
+      "build_id": "b0110087a7b339ef74588d3bd0b4dd5d5c7abd0f000000000000000000000000",
+      "nso_flags": "0x3f"
+    }
+  },
+  "pkg1_v131072_romfs": {
+    "files": 186583,
+    "uncompressed_bytes": 26236422768,
+    "shader_archives": 5,
+    "zsdic": "Pack/ZsDic.pack.zs"
+  }
+}
