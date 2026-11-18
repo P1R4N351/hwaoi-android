@@ -1,6 +1,6 @@
 # The Legend of Zelda: Ocarina of Time (Switch 2) — M0 Inventory, Reference Audit & M1 Gap Analysis
 
-Status: **M0 binary/shader inventory** and **M1 gap analysis** complete on `0400486024DEC000` (`v65536` base + `v131072` update). Roadmap, milestones, and technical hurdles (`H1`–`H5`): [../../MILESTONES.md](../../MILESTONES.md). Second-screen tie-in ledger: [SECOND_SCREEN_NOTES.md](SECOND_SCREEN_NOTES.md). Gameplay bring-up precedes second-screen implementation.
+Status: **M0**, **M1**, **M2a** (dev APK + Turnip driver zip), and **M2b** (offline `v131072` `android-pack` + `dmsh_vk.lib`) complete on `0400486024DEC000` (`v131072`); **M2c** (on-device 16 GB AYN Thor validation) pending owner permission. Roadmap, milestones, and technical hurdles (`H1`–`H5`): [../../MILESTONES.md](../../MILESTONES.md). Second-screen tie-in ledger: [SECOND_SCREEN_NOTES.md](SECOND_SCREEN_NOTES.md). Gameplay bring-up precedes second-screen implementation.
 
 ---
 
@@ -118,3 +118,16 @@ Comparing all `nvn*` symbols in `v131072` `main` + `sdk` (`775` functions) again
 - **M2 (Pack & Cold/Warm Boot on 16 GB Thor)**: Stage `v131072` pack + bundled Mesa Turnip `27.0-devel` (`VK_EXT_map_memory_placed`), verify Kokiri Forest 3D gameplay, frame pacing (30 / 60 fps), audio, AV1 cutscenes, Ocarina vibration query, and save round-trip (`slot_00/progress.sav`), logging VMA count (`/proc/<pid>/maps`) and thermals.
 - **M3 (Thor App Identity & Bridges)**: `io.github.p1r4n351.oot` package, controller-first launcher/settings, procedural launcher icon (no Nintendo art), `companion_state.h` waist, and Bifrost stick-LED integration.
 - **M4 (Second-Screen Companion on Display 4)**: Author `OcarinaOfTime` (`0400486024DEC000`) Eden Duo native module + declarative `1240x1080` pages following `companion-convergence.md` (Rodin NTLG B font decoded on-device from `Font/*.bfarc.zs`, north-up/rotating scene & dungeon minimap with Link XYZ + camera forward, item/equipment grids, C-button assignment with safe-state refusal reasons, learned Ocarina songs reference + optional live note playback, Gold Skulltula & Spiritual Stone / Medallion status).
+
+---
+
+## 7. M2a / M2b Build & Verification Snapshot (2026-11-18)
+
+| Artifact | Verified Output | Notes |
+|---|---|---|
+| Base integration commit | `538ff8a29131` (`main`) | Upstream `BananaNative` `af1ed596` + `-PnxApplicationId` / `-PnxLabel`; upstream `gradle.properties` kept intact (`test_android_games.py` green) |
+| Dev APK | `OoT-Native-0.1.0-dev.apk` (`9,236,908` B, SHA-256 `ec4e5410bcec523adc30706dfb33b9c12a64405efdf2fb77c5846100623133ce`) | `io.github.p1r4n351.oot.dev`, `arm64-v8a`, `NX_DMSH_VK_CHAIN=19662e4c4a25`, `NX_DMSH_VK_ABI=4fbeb79f5ab7`, `NX_LSFG=true`, `NX_PACK_ENGINE=fake`, `nintendo_ext.ttf` (`29` glyphs); `apksigner` verified |
+| Turnip driver zip | `turnip-27.0.0-cs-slabs-adreno740.zip` (`2,708,741` B, SHA-256 `6ed3a8369e058b807f731dbea2616fd6aecaf470eb26c5ed413b5a990ce27650`) | Wraps Mesa Turnip `libtotk_turnip.so` (`14,070,224` B, `9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6`), `minApi=33` |
+| Rewritten `v131072` modules | `main.patched.bin` (`85,148,044` B), `sdk.patched.bin` (`18,508,604` B), `subsdk0.patched.bin` (`1,131,516` B) | `51,739` / `25,995` / `3,371` slot refs; `85` / `114` / `2` gates; `0` failures |
+| Shader library (`dmsh_vk.lib`) | `v-19662e4c4a25` (`695,628,760` B, SHA-256 `06314ba3c4b7c3893d219741cf1e3d1958552ce3ee85b788c14f86793473c9b7`) | `42,843 / 42,848` shaders (`52,858` SPIR-V modules passing `spirv-val --target-env vulkan1.3` via `SPIRV-Tools v2025.1`); `5` point-mesh keys (`2582bd7ea6490d33`, `28f82c129deea140`, `3a6340a04bf09797`, `58d06e7230b59741`, `a203347bb7bdbd03`) omitted on `VUID-CullPrimitiveEXT-CullPrimitiveEXT-07036` |
+| Pack manifest & overlays | `android-pack` (`766 MiB` apparent) | `pack.tsv` (`format 1`), `7` `scene_res` overlays, `71`-line `cheats/E0F3CCFAF50065AE.txt`, `.nup:update/131072/romfs` external stream |
