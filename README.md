@@ -16,6 +16,7 @@ It is **not a CPU emulator**: the game's AArch64 modules (`main`, `subsdk0`, `sd
 - **Next Up (M2):** Gameplay bring-up & performance validation on the 16 GB AYN Thor, followed by controller menu, Bifrost stick-LED bridge, and the bottom-screen companion (`Presentation` on display 4).
 
 Full technical inventory, reference audit, and gap analysis: **[games/oot/README.md](games/oot/README.md)**.
+Roadmap, completed milestones, and upcoming technical hurdles (`H1`–`H5`): **[MILESTONES.md](MILESTONES.md)**.
 
 ---
 

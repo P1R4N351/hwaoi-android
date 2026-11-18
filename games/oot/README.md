@@ -1,6 +1,6 @@
 # The Legend of Zelda: Ocarina of Time (Switch 2) — M0 Inventory, Reference Audit & M1 Gap Analysis
 
-Status: **M0 binary/shader inventory** and **M1 gap analysis** complete on `0400486024DEC000` (`v65536` base + `v131072` update). Second-screen tie-in ledger started in [SECOND_SCREEN_NOTES.md](SECOND_SCREEN_NOTES.md). Gameplay bring-up precedes second-screen implementation.
+Status: **M0 binary/shader inventory** and **M1 gap analysis** complete on `0400486024DEC000` (`v65536` base + `v131072` update). Roadmap, milestones, and technical hurdles (`H1`–`H5`): [../../MILESTONES.md](../../MILESTONES.md). Second-screen tie-in ledger: [SECOND_SCREEN_NOTES.md](SECOND_SCREEN_NOTES.md). Gameplay bring-up precedes second-screen implementation.
 
 ---
 
