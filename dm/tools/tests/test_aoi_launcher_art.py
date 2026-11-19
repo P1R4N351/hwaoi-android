@@ -1,4 +1,4 @@
-"""Tests for generated OoT vector launcher icons, banner, safe-zone bounds, and manifest wiring."""
+"""Tests for generated AoI vector launcher icons, banner, bounds, and manifest wiring."""
 import re
 import sys
 import unittest
@@ -13,21 +13,25 @@ MANIFEST = REPO / 'android/app/src/main/AndroidManifest.xml'
 ANDROID_NS = '{http://schemas.android.com/apk/res/android}'
 
 sys.path.insert(0, str(SCRIPTS))
-import make_oot_launcher_art as art  # noqa: E402
+import make_aoi_launcher_art as art  # noqa: E402
 
 
 def parse_path_coords(path_data: str) -> list[tuple[float, float]]:
+    """Extract (x, y) pairs from SVG/Android pathData."""
     nums = [float(x) for x in re.findall(r'-?\d+(?:\.\d+)?', path_data)]
     assert len(nums) % 2 == 0, f'odd coordinate count in pathData: {len(nums)}'
     return [(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
 
 
-class OotLauncherArtTests(unittest.TestCase):
+class AoiLauncherArtTests(unittest.TestCase):
+    """Validate AoI vector launcher icons, monochrome mask, banner, and manifest."""
+
     def test_xml_well_formed_and_viewports(self):
+        """Check VectorDrawable viewport attributes and adaptive-icon XML syntax."""
         expected = {
-            DRAWABLE / 'ic_oot_bg.xml': ('108dp', '108dp', '108', '108'),
-            DRAWABLE / 'ic_oot_foreground.xml': ('108dp', '108dp', '108', '108'),
-            DRAWABLE / 'ic_oot_monochrome.xml': ('108dp', '108dp', '108', '108'),
+            DRAWABLE / 'ic_aoi_bg.xml': ('108dp', '108dp', '108', '108'),
+            DRAWABLE / 'ic_aoi_foreground.xml': ('108dp', '108dp', '108', '108'),
+            DRAWABLE / 'ic_aoi_monochrome.xml': ('108dp', '108dp', '108', '108'),
             DRAWABLE / 'ic_banner.xml': ('320dp', '180dp', '320', '180'),
         }
         for path, dims in expected.items():
@@ -50,7 +54,8 @@ class OotLauncherArtTests(unittest.TestCase):
             ET.fromstring(p.read_text(encoding='utf-8'))
 
     def test_foreground_safe_zone_and_clean_vocabulary(self):
-        for fname in ('ic_oot_foreground.xml', 'ic_oot_monochrome.xml'):
+        """Ensure adaptive foreground/monochrome stay inside [18, 90] and avoid trademark terms."""
+        for fname in ('ic_aoi_foreground.xml', 'ic_aoi_monochrome.xml'):
             path = DRAWABLE / fname
             text = path.read_text(encoding='utf-8')
             lower = text.lower()
@@ -66,6 +71,7 @@ class OotLauncherArtTests(unittest.TestCase):
                     self.assertLessEqual(y, 90.0, f'{fname}: y={y} > 90')
 
     def test_banner_clean_and_manifest_wired(self):
+        """Ensure banner has clean terms and AndroidManifest points to ic_banner."""
         btext = (DRAWABLE / 'ic_banner.xml').read_text(encoding='utf-8').lower()
         for banned in ('triforce', 'hylian', 'nintendo', 'zelda'):
             self.assertNotIn(banned, btext, 'ic_banner.xml')
@@ -81,10 +87,11 @@ class OotLauncherArtTests(unittest.TestCase):
         self.assertIn('com.moonbench.bifrost', pkgs)
 
     def test_generator_matches_checked_in_files(self):
+        """Verify checked-in drawables match make_aoi_launcher_art output byte-for-byte."""
         pairs = {
-            DRAWABLE / 'ic_oot_bg.xml': art.render_bg(),
-            DRAWABLE / 'ic_oot_foreground.xml': art.render_foreground(),
-            DRAWABLE / 'ic_oot_monochrome.xml': art.render_monochrome(),
+            DRAWABLE / 'ic_aoi_bg.xml': art.render_bg(),
+            DRAWABLE / 'ic_aoi_foreground.xml': art.render_foreground(),
+            DRAWABLE / 'ic_aoi_monochrome.xml': art.render_monochrome(),
             DRAWABLE / 'ic_banner.xml': art.render_banner(),
         }
         for path, generated in pairs.items():

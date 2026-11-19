@@ -2,9 +2,17 @@
 
 [![Support with Bitcoin](https://img.shields.io/badge/Support_with-Bitcoin-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white)](#support)
 
-**AoI Native** (`io.github.p1r4n351.hwaoi.dev`, playable in opening field on AYN Thor) brings **Hyrule Warriors: Age of Imprisonment** (`04003F40232DE000`, update `v196608`) natively to 64-bit Android handhelds with Qualcomm Adreno GPUs — targeting the 16 GB **AYN Thor** (`QCS8550` / Adreno 740, Android 13 SDK 33).
+**AoI Native** (`io.github.p1r4n351.hwaoi`, beta `v0.1.0-beta.1`; bring-up package `io.github.p1r4n351.hwaoi.dev`) brings **Hyrule Warriors: Age of Imprisonment** (`04003F40232DE000`, update `v196608`) natively to 64-bit Android handhelds with Qualcomm Adreno GPUs — targeting the 16 GB **AYN Thor** (`QCS8550` / Adreno 740, Android 13 SDK 33).
 
 It is **not a CPU emulator**: the game's AArch64 modules (`main`, `subsdk0`, `sdk`) are rewritten once to execute directly on the phone's ARMv9 cores, Horizon / Switch 2 (`Ounce`, `NintendoSDK 20.5.15`) services are answered natively by the host runtime, VP9 movies play through host `libvpx`, and NVN 2 + Ampere (`sm86`) shaders execute on Vulkan 1.3 with Mesa Turnip. The repository and APKs contain **no game files, keys, firmware, shaders, saves, or Nintendo artwork** — you supply your own legally obtained dump from your own Switch 2.
+
+---
+
+## Release & Signing Identity (`v0.1.0-beta.1`)
+
+- **Release package:** `io.github.p1r4n351.hwaoi` (`versionName` `0.1.0-beta.1`, `versionCode` `1`, non-debuggable release build; bring-up dev builds use `io.github.p1r4n351.hwaoi.dev`).
+- **Signing certificate SHA-256:** `8F:2A:C4:84:41:50:B6:84:46:BF:3F:69:23:5C:43:EF:45:6C:DF:22:D3:5A:B6:D7:74:3C:D4:EA:2D:C7:A7:2C`
+- **In-app updater source:** [`P1R4N351/hwaoi-android`](https://github.com/P1R4N351/hwaoi-android/releases) (`UpdateCheck` tag `vX.Y.Z` / release asset `.apk` SHA-256 verification).
 
 ---
 
@@ -32,7 +40,7 @@ Tested live on AYN Thor (`QCS8550` / Adreno 740, `14.9 GiB` RAM, Android 13 SDK 
 
 ```bash
 cd android/app
-./gradlew assembleDebug   -PnxGames=04003F40232DE000   -PnxApplicationId=io.github.p1r4n351.hwaoi.dev   -PnxLabel="AoI Native"   -PnxPackEngine=fake   -PnxLsfg=true
+./gradlew assembleRelease   -PnxLive=true   -PnxGames=04003F40232DE000   -PnxApplicationId=io.github.p1r4n351.hwaoi   -PnxLabel="AoI Native"   -PnxVersion=0.1.0-beta.1   -PnxVersionCode=1   -PnxUpdateRepo=P1R4N351/hwaoi-android   -PnxOfficialSigner=8f2ac4844150b68446bf3f69235c43ef456cdf22d35ab6d7743cd4ea2dc7a72c   -PnxWikiUrl="https://github.com/P1R4N351/hwaoi-android#readme"   -PnxPackEngine=fake   -PnxLsfg=true
 ```
 
 Prepare the Android pack and SPIR-V shader library (`shader_seen.tsv`) from your own dumped NUP / folder with `scripts/pack_android.py`.
@@ -58,4 +66,4 @@ If this work is useful to you, donations are gratefully accepted:
 
 ## License & Legal
 
-Repository-authored documentation, scripts, and clean interfaces follow [`LICENSE`](LICENSE); builds integrating GPL-3.0-or-later components (such as LSFG and compute shader tooling) are distributed under GPL-3.0-or-later. **You must own the game** and supply your own legally dumped Nintendo Switch 2 copy of *Hyrule Warriors: Age of Imprisonment*. This is an independent interoperability and preservation research project with no affiliation with Nintendo or Koei Tecmo.
+Repository-authored documentation, scripts, and clean interfaces follow [`LICENSE`](LICENSE); builds integrating GPL-3.0-or-later components (such as LSFG and compute shader tooling) are distributed under GPL-3.0-or-later, with corresponding source published in full at the matching release tag in [`P1R4N351/hwaoi-android`](https://github.com/P1R4N351/hwaoi-android). **You must own the game** and supply your own legally dumped Nintendo Switch 2 copy of *Hyrule Warriors: Age of Imprisonment*. This is an independent interoperability and preservation research project with no affiliation with Nintendo or Koei Tecmo.

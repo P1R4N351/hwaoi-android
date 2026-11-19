@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Procedural OoT astrolabe/wave emblem inside the 66 dp safe zone plus the variant badge -->
+<!-- Procedural AoI golden solar-crescent emblem inside the 66 dp safe zone plus the variant badge -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@drawable/ic_oot_foreground" />
+    <item android:drawable="@drawable/ic_aoi_foreground" />
     <item android:drawable="@drawable/ic_launcher_badge" />
 </layer-list>
