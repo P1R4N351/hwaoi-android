@@ -108,7 +108,9 @@ final class Updater {
 
     /** The sources this app asks, in order: UpdateCheck.SOURCES in the release app, those update.txt names in a test app (none without it) */
     static List<UpdateCheck.Source> sources(Context c) {
-        if (BuildConfig.NX_LIVE) return UpdateCheck.SOURCES;
+        if (BuildConfig.NX_LIVE) return !BuildConfig.NX_UPDATE_REPO.isEmpty()
+                ? java.util.Collections.singletonList(UpdateCheck.github(BuildConfig.NX_UPDATE_REPO))
+                : UpdateCheck.SOURCES;
         java.util.Map<String, String> o = override(c);
         List<UpdateCheck.Source> l = new ArrayList<>();
         if (o.containsKey("repo")) l.add(UpdateCheck.github(o.get("repo")));

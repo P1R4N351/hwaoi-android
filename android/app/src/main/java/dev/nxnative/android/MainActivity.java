@@ -380,6 +380,7 @@ public final class MainActivity extends Activity {
 
     /** The player wiki (its pages are written and kept up to date on the project's site, so the app links to it and keeps no copy) */
     static final String WIKI_URL = "https://git.eden-emu.dev/moceure/BananaNative/wiki";
+    private static String wikiUrl() { return !BuildConfig.NX_WIKI_URL.isEmpty() ? BuildConfig.NX_WIKI_URL : WIKI_URL; }
 
     // ---- Home: the games as one row of artwork tiles, a dock of round buttons under it, and under the dock what is selected (as the console's home screen) ----
 
@@ -460,7 +461,7 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams up = new LinearLayout.LayoutParams(dp(36), dp(36));
         up.leftMargin = up.rightMargin = dp(3);
         dockRow.addView(userButton, up);
-        dockRow.addView(dockButton(R.drawable.ic_wiki, Tx.s(R.string.settings_player_wiki), false, v -> openLink(WIKI_URL)));
+        dockRow.addView(dockButton(R.drawable.ic_wiki, Tx.s(R.string.settings_player_wiki), false, v -> openLink(wikiUrl())));
         dockRow.addView(dockButton(R.drawable.ic_settings, Tx.s(R.string.home_settings), false, v -> page(true)));
         return dockRow;
     }
@@ -709,7 +710,7 @@ public final class MainActivity extends Activity {
         upd.addView(new Ui.Setting(this, "🩹", Tx.s(R.string.settings_small_fix_updates), null)
                 .toggle(this, Prefs.hotfixUpdates(this), (b, on) -> Prefs.hotfixUpdates(this, on))
                 .value(Tx.s(R.string.settings_small_fix_updates_help)).view);
-        upd.addView(new Ui.Setting(this, "📖", Tx.s(R.string.settings_player_wiki), v -> openLink(WIKI_URL)).chevron(this)
+        upd.addView(new Ui.Setting(this, "📖", Tx.s(R.string.settings_player_wiki), v -> openLink(wikiUrl())).chevron(this)
                 .value(Tx.s(R.string.settings_guides_what_every_setting_does)).view);
 
         Ui.add(content, Ui.section(this, Tx.s(R.string.common_appearance)), Ui.SECTION_GAP);

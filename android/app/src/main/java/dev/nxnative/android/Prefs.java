@@ -634,7 +634,15 @@ final class Prefs {
      * tree had changes. The play app adds " · official" when the release key signed the APK, else " · unofficial build" (Signer). The main screen shows it and it
      * is the first line of every game log ("[nxlaunch] build ...").
      */
-    static String buildTag(Context ctx) { return Signer.tag(buildTag(), BuildConfig.NX_PLAY, signers(ctx)); }
+    static String buildTag(Context ctx) {
+        if (!BuildConfig.NX_OFFICIAL_SIGNER.isEmpty()) {
+            if (!BuildConfig.NX_PLAY) return buildTag();
+            String[] s = signers(ctx);
+            boolean off = s != null && s.length == 1 && BuildConfig.NX_OFFICIAL_SIGNER.equalsIgnoreCase(s[0]);
+            return buildTag() + (off ? " · official" : " · unofficial build");
+        }
+        return Signer.tag(buildTag(), BuildConfig.NX_PLAY, signers(ctx));
+    }
 
     private static String[] signers;
 
@@ -661,7 +669,11 @@ final class Prefs {
         return Signer.buildId(BuildConfig.NX_PLAY, BuildConfig.VERSION_NAME, BuildConfig.NX_COMMIT, BuildConfig.NX_DIRTY, BuildConfig.NX_BRANCH);
     }
 
-    private static String buildTag() { return Signer.buildTag(BuildConfig.NX_PLAY, buildId()); }
+    private static String buildTag() {
+        if (!BuildConfig.NX_LABEL.isEmpty())
+            return BuildConfig.NX_LABEL + (BuildConfig.NX_PLAY ? " " : " test · ") + buildId();
+        return Signer.buildTag(BuildConfig.NX_PLAY, buildId());
+    }
 
     /** Game settings › Aspect ratio, for a game whose profile has a variant labelled w:h (Profile.aspectVariant; a native 4:3 mod): the label chosen ("4:3"), null = as
      *  shipped (16:9). GameActivity passes DM_PATCH_VARIANT=<variant> and DM_VK_PICTURE_ASPECT=<label>; the pack holds both versions (pack_android.py rewrite_variants) */
