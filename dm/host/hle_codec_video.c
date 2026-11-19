@@ -85,6 +85,12 @@ static _Atomic int g_vpool_n;
 static _Atomic uint64_t g_vpool_epoch = 1, g_vpool_writes;
 uint64_t dm_codec_video_epoch(void) { return atomic_load_explicit(&g_vpool_epoch, memory_order_acquire); }
 uint64_t dm_codec_video_writes(void) { return atomic_load_explicit(&g_vpool_writes, memory_order_acquire); }
+#define CV_PLAYING_NS 500000000ull
+static _Atomic uint64_t g_cv_pic_ns;
+int dm_codec_video_playing(void) {
+    uint64_t t = atomic_load_explicit(&g_cv_pic_ns, memory_order_relaxed);
+    return t != 0 && now_ns() - t < CV_PLAYING_NS;
+}
 
 static cv_dec *cv_of(void *t) { cv_dec *d = t ? *(cv_dec **)t : NULL; return d && d->magic == CV_MAGIC ? d : NULL; }
 static cv_pool *pool_of(const void *t) { cv_pool *p = t ? *(cv_pool *const *)t : NULL; return p && p->magic == CV_MAGIC ? p : NULL; }
@@ -205,6 +211,7 @@ static void drain_from(cv_dec *d, int took, int before) {
             if (b->pool && b->pidx < b->pool->count) { pool_native_write(b->pool, b->pidx, im, d->codec == CV_AV1 && mav1_async(d->av1)); free(im->user_priv); im->user_priv = NULL;
                 if (b->pool->img[b->pidx]) cv_img_free(b->pool->img[b->pidx]); b->pool->img[b->pidx] = im; } else cv_img_free(im);
             if (!d->pictures++) LOG("[codec] %s decoder %u: first picture %ux%u into buffer %u", k_cv_name[d->codec], d->id, b->w, b->h, i);
+            atomic_store_explicit(&g_cv_pic_ns, now_ns(), memory_order_relaxed);
         } else { b->w = b->h = 0; b->ts = 0; b->eos = 1; d->eos_pending = 0; }
         if (b->eos) LOG("[codec] %s decoder %u: end of stream after %llu pictures", k_cv_name[d->codec], d->id, (unsigned long long)d->pictures);
         b->filled = 1; b->filled_gen = b->gen; d->seen[i] = 0; d->st.nfill++;
@@ -430,7 +437,10 @@ static Result cv_dec_fin(void *t) {
         pthread_join(d->th, NULL);   // (th_ok stays set: the last stats line still names the decode thread)
     }
     LOG("[codec] %s decoder %u finalized at %.1f s: %llu packets in, %llu pictures out", k_cv_name[d->codec], d->id, dm_rel_s(), (unsigned long long)d->submits, (unsigned long long)d->pictures);
-    pthread_mutex_lock(&g_cv_mu); g_cv[d->id - 1] = NULL; pthread_mutex_lock(&d->mu); if (cv_stat_on()) cv_stat_flush(d, now_ns(), " (the last, at Finalize)"); pthread_mutex_unlock(&d->mu); pthread_mutex_unlock(&g_cv_mu);   // no sync handle lookup is still inside
+    pthread_mutex_lock(&g_cv_mu); g_cv[d->id - 1] = NULL;
+    int any_alive = 0; for (int k = 0; k < 16; k++) if (g_cv[k]) any_alive = 1;
+    if (!any_alive) atomic_store_explicit(&g_cv_pic_ns, 0, memory_order_relaxed);
+    pthread_mutex_lock(&d->mu); if (cv_stat_on()) cv_stat_flush(d, now_ns(), " (the last, at Finalize)"); pthread_mutex_unlock(&d->mu); pthread_mutex_unlock(&g_cv_mu);   // no sync handle lookup is still inside
     if (d->codec != CV_H264 && d->codec != CV_AV1 && d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->avc) mavc_free(d->avc);
     if (d->av1) mav1_free(d->av1);
@@ -473,6 +483,7 @@ static Result cv_dec_reset(void *t) {   // Stop / Flush: pictures not yet given 
     for (int i = 0; i < d->nheld; i++) cv_img_free(d->held[i]);
     if (cv_stat_on()) { cv_stat_flush(d, now_ns(), " (to Stop / Flush)"); d->st.last_pic_ns = 0; }
     d->nheld = 0; d->eos_pending = 0; d->skipped = 0; d->stream_pkts = 0; d->ref_pending = 0;
+    atomic_store_explicit(&g_cv_pic_ns, 0, memory_order_relaxed);
     cv_open(d);
     if (d->event) hle_signal_system_event(d->event);
     pthread_mutex_unlock(&d->mu);

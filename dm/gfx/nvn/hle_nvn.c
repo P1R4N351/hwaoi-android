@@ -2159,6 +2159,7 @@ static int g_engine_stub = 1;   // the weak dm_fps_lock_engine's answer, for gra
 __attribute__((weak)) int dm_fps_lock_engine(void) { return g_engine_stub; }   // hle_fpslock.c: the host writes fps_target into an engine limiter of this main
 __attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool (profile ue_texture_pool)
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }   // hle_movie.c: a movie's pictures are being handed out; graphics unit tests have no movie decoder
+__attribute__((weak)) int dm_codec_video_playing(void) { return 0; }   // hle_codec_video.c; graphics unit tests have no movie decoder
 // Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
 // has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
 // then took 17-26 ms a frame and dropped a frame in most windows; a steady 30 instead also lets the device cool. DM_THERMAL_CAP=0 turns it off; the Mac reports no thermal state
@@ -2310,6 +2311,7 @@ static int fstep_hold(void) {
     int o = dm_fps_hold60 ? dm_fps_hold60() : 0;
     if (o != h60) { if (h60 >= 0 || o) LOG("[nvn] frame step: hold 60 fps %s: frames %s", o ? "on" : "off", o ? "are shown as soon as they are ready, late time paid back one extra step a frame" : "may be held longer than the cap's vsyncs again"); h60 = o; }
     if (o) return 0;
+    if (dm_codec_video_playing()) return 0;   // Switch 2 nn::codec 60 fps streams step one picture per present: never hold above kmin
     if (h < 0) {
         const char *e = getenv("DM_FPS_HOLD"); h = e ? strcmp(e, "off") != 0 : DM_GAME_FPS_HOLD;
         if (!h) LOG("[nvn] frame step: frames are not held longer than the cap's vsyncs (%s)", e ? "DM_FPS_HOLD" : "game profile fps_hold");

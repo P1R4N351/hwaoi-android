@@ -348,6 +348,19 @@ int main(void) {
         sim m = {0}; m.s.shown_slack = 60.0 / 165; run(&m, 60, 0.5, 1, 3, 0); run(&m, 300, 1.32, 1, 3, 0);
         check(m.s.k == 2, "  the slack does not hide work: 22 ms frames still step to hold 2");
     }
+    {   // GPU-slowed guard (nvn_fgpu_slow): distinguish DVFS clock drop on same scene from 2D-to-3D scene jump
+        nvn_fgpu g1 = {0};
+        for (int i = 0; i < 10; i++) nvn_fstep_gpu_slowed(&g1, 0.85, 1, 1, 0);
+        int slow1 = 0;
+        for (int i = 0; i < 35; i++) slow1 = nvn_fstep_gpu_slowed(&g1, 1.50, 2, 1, 0);
+        check(slow1 == 1, "gpu slowed: 1.76x same-scene drop starts a probe");
+
+        nvn_fgpu g2 = {0};
+        for (int i = 0; i < 10; i++) nvn_fstep_gpu_slowed(&g2, 0.03, 1, 1, 0);
+        int slow2 = 0;
+        for (int i = 0; i < 35; i++) slow2 = nvn_fstep_gpu_slowed(&g2, 2.50, 3, 1, 0);
+        check(slow2 == 0, "gpu slowed: 83x 2D-to-3D scene change does not probe");
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }

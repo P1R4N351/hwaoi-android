@@ -148,9 +148,10 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
 // learned at a 30 fps cap is the GPU time at the clock that cap left (lowered for 30 fps, and under the thermal cap for the heat), and taken as hold 1's after the cap rose it
 // made the same work at hold 2 look not slowed
 #define FSTEP_GPU_SLOW 1.3    // GPU time at the longer hold against its time at kmin
+#define FSTEP_GPU_SLOW_MAX 4.0   // above 4x ref is a 2D-to-3D scene change, not a DVFS clock drop
 #define FSTEP_GPU_N 30        // frames at the longer hold before the comparison counts
 typedef struct { double ref, cur; int n, k; double ref_at[FSTEP_MAX + 1]; } nvn_fgpu;   // GPU time at kmin (running mean; of every kmin in ref_at); at the current hold k and its frame count
-static inline int nvn_fgpu_slow(const nvn_fgpu *g) { return g->n >= FSTEP_GPU_N && g->ref > 0 && g->cur >= FSTEP_GPU_SLOW * g->ref && g->cur > FSTEP_FIT * (g->k - 1); }
+static inline int nvn_fgpu_slow(const nvn_fgpu *g) { return g->n >= FSTEP_GPU_N && g->ref > 0 && g->cur >= FSTEP_GPU_SLOW * g->ref && g->cur <= FSTEP_GPU_SLOW_MAX * g->ref && g->cur > FSTEP_FIT * (g->k - 1); }
 // Once per frame, with the frame's GPU time (vsyncs; 0 = none finished yet) and the hold and probe state (nvn_fstep.probe) it ran under
 static inline int nvn_fstep_gpu_slowed(nvn_fgpu *g, double gpu, int k, int kmin, int probe) {
     if (kmin < 1 || kmin > FSTEP_MAX) return 0;   // no reference slot for it (hle_nvn.c passes 1 or 2)
