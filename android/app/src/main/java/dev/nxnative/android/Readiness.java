@@ -153,6 +153,10 @@ final class Readiness {
                 out.add(new Check(r.title, Status.PASS, Words.s("ready_guest_address_memory_is_available", "Guest-address memory is available through a tested exported-memory alias (memory.fdAlias=1)."), null));
                 continue;
             }
+            if (r.fact.equals("ext.VK_KHR_map_memory2") && have == null && facts.get("vk.api") != null && compare(facts.get("vk.api"), "1.4") >= 0) {
+                out.add(new Check(r.title, Status.PASS, "Present (Vulkan " + facts.get("vk.api") + " core, needs " + r.min + ").", null));
+                continue;
+            }
             boolean ok = have != null && compare(have, r.min) >= 0;
             String shown = have == null ? Words.s("ready_not_reported", "not reported") : "reports " + have;
             if (ok) out.add(new Check(r.title, Status.PASS, "Present (" + label(r.fact) + " " + have + ", needs " + r.min + ").", null));
@@ -175,7 +179,6 @@ final class Readiness {
         return new Check(Words.s("ready_status_on_android", "Status on Android"), Status.INFO, status, null);
     }
 
-    /** Of a game's environment (KEY=VALUE, in start's order), the lines that pick its GPU driver: what the readiness facts must be read on */
     /**
      * The game's environment for the check, as start() will set it (KEY=VALUE lines in start's order, the last of a key winning), less the keys in skip (the paths
      * start sets itself). A driver reads some variables once, when its first device is made (Mesa's FD_DEV_FEATURES, TU_DEBUG): the check makes that device in the
@@ -273,7 +276,7 @@ final class Readiness {
         try { v = Long.decode(f.getOrDefault("driver.version", "").trim()); } catch (NumberFormatException e) { return null; }
         switch (f.getOrDefault("driver.id", "").trim()) {
             case "8": return "Qualcomm " + ((v >> 12) & 0x3ff) + "." + (v & 0xfff);   // VK_DRIVER_ID_QUALCOMM_PROPRIETARY
-            case "13": return "Turnip " + ((v >> 22) & 0x3ff) + "." + ((v >> 12) & 0x3ff) + "." + (v & 0xfff);   // VK_DRIVER_ID_MESA_TURNIP
+            case "13": case "18": return "Turnip " + ((v >> 22) & 0x3ff) + "." + ((v >> 12) & 0x3ff) + "." + (v & 0xfff);   // VK_DRIVER_ID_MESA_TURNIP
             default: return null;
         }
     }

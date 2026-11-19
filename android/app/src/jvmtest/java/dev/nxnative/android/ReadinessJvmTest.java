@@ -61,6 +61,15 @@ public final class ReadinessJvmTest {
         check(!Readiness.any(l, Readiness.Status.FAIL) && !Readiness.any(l, Readiness.Status.WARNING), "all present: " + l);
         check(Readiness.summary("0123456789ABCDEF", f, l).startsWith("[readiness] 0123456789ABCDEF: PASS; Test GPU, Vulkan 1.4.295; driver Test driver (v1 = one), driver ID 8"), "summary " + Readiness.summary("0123456789ABCDEF", f, l));
 
+        // Android 13 + Vulkan 1.4 core promotion: loader strips ext.VK_KHR_map_memory2 while vk.api >= 1.4 provides vkMapMemory2 in core
+        Map<String, String> f14 = Readiness.merge(all.replace("vk.instance=1.4.0\nvk.api=1.4.295\n", "vk.instance=1.3.0\nvk.api=1.4.363\n").replace("ext.VK_KHR_map_memory2=1\n", ""), 14.9, 33);
+        List<Readiness.Check> l14 = Readiness.evaluate(f14, rows);
+        check(!Readiness.any(l14, Readiness.Status.FAIL) && find(l14, "Memory map 2").status == Readiness.Status.PASS, "Vulkan 1.4 core Memory map 2: " + l14);
+        // Negative control: Vulkan 1.3 without ext.VK_KHR_map_memory2 must still FAIL
+        Map<String, String> f13 = Readiness.merge(all.replace("vk.instance=1.4.0\nvk.api=1.4.295\n", "vk.instance=1.3.0\nvk.api=1.3.295\n").replace("ext.VK_KHR_map_memory2=1\n", ""), 14.9, 33);
+        List<Readiness.Check> l13 = Readiness.evaluate(f13, rows);
+        check(find(l13, "Memory map 2").status == Readiness.Status.FAIL, "Vulkan 1.3 without ext.VK_KHR_map_memory2 still fails: " + l13);
+
         // Missing: a required row fails, a degraded one warns, a degraded row of a failed fact is left out, a host need fails once per title
         f = Readiness.merge(all.replace("limit.maxComputeSharedMemorySize=49152", "limit.maxComputeSharedMemorySize=32768").replace("sparse.format.bc6h=1", "sparse.format.bc6h=0")
                 .replace("ext.VK_EXT_map_memory_placed=1\nfeature.memoryMapPlaced=1\n", ""), 11.2, 36);
@@ -112,6 +121,7 @@ public final class ReadinessJvmTest {
         // Game settings' state chip: the driver in a few words from the kept facts, the GPU's name from GLES's renderer string
         check("Qualcomm 842.44".equals(Readiness.driverWord(Readiness.facts("driver.id=8\ndriver.version=0x8034a02c"))), "Qualcomm's driver version as its build string shows it");
         check("Turnip 26.1.0".equals(Readiness.driverWord(Readiness.facts("driver.id=13\ndriver.version=0x6801000"))), "Turnip's Mesa version");
+        check("Turnip 26.99.99".equals(Readiness.driverWord(Readiness.facts("driver.id=18\ndriver.version=0x6863063"))), "Turnip driver.id=18");
         check(Readiness.driverWord(Readiness.facts("driver.id=9\ndriver.version=0x1")) == null && Readiness.driverWord(Readiness.facts("")) == null, "another driver, or none known");
         check("Adreno 840".equals(Readiness.gpuName("Adreno (TM) 840")) && Readiness.gpuName(" ") == null && Readiness.gpuName(null) == null, "the GPU's name");
 

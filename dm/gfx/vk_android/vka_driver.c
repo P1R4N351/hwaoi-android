@@ -121,7 +121,7 @@ static void *driver_open(void) {
         if (!dladdr((void *)vka_driver_open, &di) || !di.dli_fname || !(sl = strrchr(di.dli_fname, '/'))) { VRED("DM_VK_DRIVER: cannot tell where libnxhost.so is: the system driver is used"); return NULL; }
         snprintf(hook, sizeof hook, "%.*s/", (int)(sl - di.dli_fname), di.dli_fname);
     }
-    if (!strncmp(name, "vulkan.ad0", 10)) ubwc_hint();   // Turnip (Mesa's Adreno driver): before the driver reads FD_DEV_FEATURES at its first device
+    if (!strncmp(name, "vulkan.ad0", 10) || strstr(name, "turnip") || strstr(name, "freedreno") || strstr(dir, "Turnip") || strstr(dir, "turnip")) ubwc_hint();   // Turnip (Mesa's Adreno driver): before the driver reads FD_DEV_FEATURES at its first device
     void *at = dlopen("libnxadreno.so", RTLD_NOW | RTLD_LOCAL);
     open_libvulkan_fn open_vk = at ? (open_libvulkan_fn)dlsym(at, "adrenotools_open_libvulkan") : NULL;
     if (!open_vk) { VRED("DM_VK_DRIVER: libnxadreno.so not loaded (%s): the system driver is used", dlerror()); return NULL; }

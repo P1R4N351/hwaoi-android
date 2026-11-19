@@ -123,7 +123,7 @@ __attribute__((visibility("default"))) int nxhost_vk_readiness(char *buf, int n)
     put_ver(&o, "vk.instance", api);
     if (!vkCreateInstance) { put(&o, "error=no vkCreateInstance\n"); return 1; }
     VkApplicationInfo ai = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "nxnative readiness", .pEngineName = "nxnative",
-                            .apiVersion = api >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3 : api >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0};
+                            .apiVersion = api >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_4 : api >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai};
     VkInstance inst; VkResult r = vkCreateInstance(&ici, NULL, &inst);
     if (r) { put(&o, "error=vkCreateInstance returned %d\n", r); return 1; }
@@ -157,6 +157,7 @@ __attribute__((visibility("default"))) int nxhost_vk_readiness(char *buf, int n)
         }
     put(&o, "ext.count=%u\n", nde);
     free(de);
+    if (!map2_ext && p.apiVersion >= VK_API_VERSION_1_4) { put(&o, "ext.%s=1\n", VK_KHR_MAP_MEMORY_2_EXTENSION_NAME); map2_ext = 1; }
     // Placed maps the driver has but does not advertise count as present (the replay uses them the same way: vka_dev.c)
     int fd_alias = 0, placed_hidden = !placed && placed_unadvertised(gipa, inst, pd, map2_ext, fd_ext, &o, &fd_alias);
     if (placed_hidden) put(&o, "ext.%s=1\next.%s=1\nplaced.unadvertised=1\n", VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);

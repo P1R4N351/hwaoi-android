@@ -131,7 +131,7 @@ static int init_once(void) {
         for (uint32_t i = 0; i < nl; i++) if (!strcmp(lp[i].layerName, layer)) nlayer = 1;
         free(lp); VLOG("DM_VK_VALIDATE: validation layer %s", nlayer ? "on" : "not installed");
     }
-    VkApplicationInfo ai = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "nxnative", .pEngineName = "nxnative", .apiVersion = VK_API_VERSION_1_3};
+    VkApplicationInfo ai = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "nxnative", .pEngineName = "nxnative", .apiVersion = VK_API_VERSION_1_4};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai, .enabledExtensionCount = niext, .ppEnabledExtensionNames = iext,
                                 .enabledLayerCount = nlayer, .ppEnabledLayerNames = &layer};
     VkResult r = vk.vkCreateInstance(&ici, NULL, &V.inst);
@@ -165,7 +165,8 @@ static int init_once(void) {
     { char q[700]; size_t qn = 0; q[0] = 0;   // the vendor's own extensions (tile properties, render pass transforms ...): what a tiler-specific path could use
       for (uint32_t i = 0; i < nde && qn < sizeof q; i++) if (strstr(de[i].extensionName, "_QCOM_")) qn += (size_t)snprintf(q + qn, sizeof q - qn, " %s", de[i].extensionName + 3);
       if (qn) VLOG("device extensions of the vendor:%s", q); }
-    int swap = has_ext(de, nde, VK_KHR_SWAPCHAIN_EXTENSION_NAME), map2 = has_ext(de, nde, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME), placed = map2 && has_ext(de, nde, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
+    int swap = has_ext(de, nde, VK_KHR_SWAPCHAIN_EXTENSION_NAME), map2 = has_ext(de, nde, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+    int placed = (map2 || V.props.apiVersion >= VK_API_VERSION_1_4) && has_ext(de, nde, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
     V.display_timing = swap && has_ext(de, nde, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
 #ifdef NX_LINUX
     // Linux: VK_GOOGLE_display_timing is there only when Gamescope's Vulkan layer is (Mesa's X11 and Wayland WSI have none). With present times given through it,
