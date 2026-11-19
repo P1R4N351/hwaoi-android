@@ -1350,4 +1350,7 @@
         <item>SGSR 1</item>
         <item>기기(절전)</item>
     </string-array>
+    <string name="game_stick_leds_bifrost">스틱 LED (Bifrost)</string>
+    <string name="game_stick_leds_bifrost_on">AYN Thor에서 하트, 일시정지 화면 및 오카리나 상태 표시 (시작 시 적용)</string>
+    <string name="game_stick_leds_bifrost_off">AYN Thor 스틱 LED를 Bifrost 자체 제어로 유지</string>
 </resources>

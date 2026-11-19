@@ -1364,4 +1364,7 @@
     <string name="game_fast_fp16_shader_math">Matemáticas de sombreado FP16 rápidas</string>
     <string name="game_fp16_on_turnip_faster">Media precisión de 16 bits en Turnip: sombreado más rápido y menos calor</string>
     <string name="game_fp16_default_precision">Precisión predeterminada</string>
+    <string name="game_stick_leds_bifrost">LED de los sticks (Bifrost)</string>
+    <string name="game_stick_leds_bifrost_on">Seguir corazones, menú de pausa y Ocarina en AYN Thor (al iniciar)</string>
+    <string name="game_stick_leds_bifrost_off">Dejar los LED del AYN Thor bajo el control propio de Bifrost</string>
 </resources>

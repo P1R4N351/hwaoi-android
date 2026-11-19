@@ -30,6 +30,10 @@ Rows appear only when the game's profile has them. If this app has no profile fo
 - **What to expect:** the layers were judged hidden by eye in a few places only; expect mistakes. Shown for Ocarina of Time.
 - **Default:** off.
 
+### Stick LEDs (Bifrost)
+- **What it does:** Ocarina of Time (`0400486024DEC000`) only, on AYN Thor devices with Bifrost installed. Follows low hearts, pause subscreen, and Ocarina playback on the analog stick LED rings via the companion state waist (`DM_BIFROST=0` turns it off; `2` selects public effects). Applies at the next launch.
+- **Default:** on.
+
 ### The game's own switches
 Ocarina of Time has these, each with a line saying what it does. They apply at the next start. A row that needs the game's code patched shows "Needs Prepare again: patches the game's code (Storage > Prepare again)" until you run Prepare again.
 

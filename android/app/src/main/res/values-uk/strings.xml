@@ -1455,4 +1455,7 @@
         <item>SGSR 1</item>
         <item>Пристрій (економія енергії)</item>
     </string-array>
+    <string name="game_stick_leds_bifrost">Підсвітка стіків (Bifrost)</string>
+    <string name="game_stick_leds_bifrost_on">Відстежувати серця, меню паузи та окарину на AYN Thor (під час запуску)</string>
+    <string name="game_stick_leds_bifrost_off">Залишити керування підсвіткою AYN Thor самому Bifrost</string>
 </resources>

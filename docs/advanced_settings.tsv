@@ -30,6 +30,7 @@ DM_AV1_DAV1D	developer	Diagnostics			text			both
 DM_AV1_DAV1D_FP	developer	Game			text			both							
 DM_AV1_MC_FAIL	developer	Diagnostics			text			both							
 DM_AV1_RGBA_EARLY	developer	Game			text			both							
+DM_BIFROST	developer	Game			text			both							
 DM_BOOTPROF	internal	Diagnostics			text			both						Mac or iOS only	
 DM_BUILD_COMMIT	developer	Diagnostics			text			both							
 DM_BUNDLE_ID	internal	Game			text			both						Mac or iOS only	
@@ -40,6 +41,7 @@ DM_CHEATS_ON	developer	Packing			text			both
 DM_CHEATS_WINDOW	internal	Packing			text			both						Mac or iOS only	
 DM_CODEC_STATS	developer	Diagnostics			text			both							
 DM_CODEC_THREAD	developer	Performance			text			both							
+DM_COMPANION	developer	Game			text			both							
 DM_COOP	developer	Game			text			both							
 DM_COOP_INTERNET	developer	Game			text			both							
 DM_COOP_ROOM	developer	Game			text			both							

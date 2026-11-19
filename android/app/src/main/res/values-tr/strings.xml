@@ -1357,4 +1357,7 @@
     <string name="game_fast_fp16_shader_math">Hızlı FP16 gölgelendirici matematiği</string>
     <string name="game_fp16_on_turnip_faster">Turnip\'te 16 bit yarım duyarlık: daha hızlı gölgelendirme, daha az ısı</string>
     <string name="game_fp16_default_precision">Varsayılan duyarlık</string>
+    <string name="game_stick_leds_bifrost">Çubuk LED\'leri (Bifrost)</string>
+    <string name="game_stick_leds_bifrost_on">AYN Thor\'da kalpleri, duraklatma menüsünü ve Okarinayı izle (başlatmada)</string>
+    <string name="game_stick_leds_bifrost_off">AYN Thor çubuk LED\'lerini Bifrost\'un kendi denetimine bırak</string>
 </resources>

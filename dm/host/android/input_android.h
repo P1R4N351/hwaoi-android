@@ -102,3 +102,8 @@ NXHOST_API void nxhost_fps_cap_set(int fps);
 NXHOST_API int nxhost_fps_cap_status(char *buf, int n);
 // Logs which decoders the phone has for H.264, HEVC, VP8, VP9, AV1 and AAC (AMediaCodec_createDecoderByType), for a bring-up log
 NXHOST_API void nxhost_codecs_log(void);
+
+// Companion waist (companion_state.h): writes 8 int64 words (status..age_ms) into out[]; returns 1 when populated, 0 when off/unready
+NXHOST_API int nxhost_companion_state(int64_t out[8]);
+// Sets the second screen's user-chosen page index (-1 when none / cleared)
+NXHOST_API void nxhost_companion_set_page(int page);

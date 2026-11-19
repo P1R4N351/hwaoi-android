@@ -178,4 +178,10 @@ final class Native {
     static native int ndsrStatus();
     /** The skipped-work warning (vka_exec.c nxhost_skip_status): "<percent> <causes>" once the replay skipped a large share of the game's draws for causes of the GPU driver or for shaders missing from the pack, "" before or when it is off; SkipNotice reads it */
     static native String skipStatus();
+    /** Companion waist (companion_state.h / oot_companion.c): writes 8 words (status..ageMs) into out[]; false when off/unready */
+    static native boolean companionState(long[] out);
+    /** Sets the user-chosen companion page index (-1 when none / cleared) */
+    static native void companionSetPage(int page);
+    /** Bifrost stick-LED bridge mode (DM_BIFROST): 0 off, 1 Pip-Boy feed (default), 2 classic public effects */
+    static native int bifrostMode();
 }

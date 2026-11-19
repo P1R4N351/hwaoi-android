@@ -183,14 +183,18 @@ static void keep_init(void) {
     if (e && *e) { unsigned long v = strtoul(e, &end, 16); if (!*end) g_keep = (unsigned)v & 0xf; }
 }
 
+__attribute__((weak)) void oot_companion_note_canvas(uint64_t vtable_rel) { (void)vtable_rel; }
+
 static void hud(uint64_t *r) {
-    double a = aspect();
     uint64_t m = r[2], cv = r[0];
-    if (!a || !m || (m & 3) || !cv) return;
+    if (!m || (m & 3) || cv < 0x10000ULL || (cv & 7)) return;
     if (rdf(m) != 2.0f / 3840.0f || rdf(m + 0x14) != 2.0f / 2160.0f) return;   // not the full-screen UI projection
+    uint64_t vt = 0, base = (uint64_t)(uintptr_t)main_base();
+    memcpy(&vt, (void *)(uintptr_t)(cv - 0x1b8), 8);
+    if (base && vt > base && !strcmp(dm_main_build(), OOT_MAIN_BUILD)) oot_companion_note_canvas(vt - base);
+    double a = aspect();
+    if (!a) return;
     pthread_once(&g_keep_once, keep_init);
-    uint64_t vt, base = (uint64_t)(uintptr_t)main_base();
-    memcpy(&vt, (void *)(cv - 0x1b8), 8);
     int bit = -1;
     for (int k = 0; k < 4; k++) if (base && vt == base + HUD_SCREEN[k]) bit = k;
     int whole = bit >= 0 && (g_keep >> bit & 1);

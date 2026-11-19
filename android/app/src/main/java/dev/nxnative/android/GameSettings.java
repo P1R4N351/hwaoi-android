@@ -483,6 +483,11 @@ final class GameSettings {
         { Profile mp = Profile.of(id); if (mp != null && mp.mods) ModsUi.row(a, g, options::add, again); }   // game.tsv mods 1: folders of replacement files over the RomFS
         if (LinkPlay.has(id))
             options.add(new Ui.Setting(a, "🔗", Tx.s(R.string.game_link_play), v -> LinkPlay.dialog(a, g, again)).value(LinkPlay.label(a, id)).chevron(a));
+        if ("0400486024DEC000".equals(id))
+            options.add(new Ui.Setting(a, "💡", Tx.s(R.string.game_stick_leds_bifrost), null)
+                    .toggle(a, Prefs.bifrost(a, id), (b, on) -> Prefs.bifrost(a, id, on))
+                    .says(Tx.s(R.string.game_stick_leds_bifrost_on),
+                          Tx.s(R.string.game_stick_leds_bifrost_off)));
         options.add(Covers.row(a, g, again));
         options.add(new Ui.Setting(a, "🌐", Tx.s(R.string.game_game_language), v -> language(a, g, again)).value(GameLanguage.label(Prefs.gameLang(a, id), phoneTag())).chevron(a));   // not a tester's knob: with the game's options, never folded
         if (prof != null && prof.timeOfDay)   // the one global setting (Prefs.timeOverride → DM_TIME), here for a game whose day/night cycle follows the user clock

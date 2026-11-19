@@ -1371,4 +1371,7 @@
     <string name="game_fast_fp16_shader_math">Szybkie obliczenia shaderów FP16</string>
     <string name="game_fp16_on_turnip_faster">16-bitowa połowiczna precyzja na Turnip: szybsze shadery, mniej ciepła</string>
     <string name="game_fp16_default_precision">Domyślna precyzja</string>
+    <string name="game_stick_leds_bifrost">Diody drążków (Bifrost)</string>
+    <string name="game_stick_leds_bifrost_on">Śledź serca, menu pauzy i Okarynę na AYN Thor (od uruchomienia)</string>
+    <string name="game_stick_leds_bifrost_off">Pozostaw diody drążków AYN Thor pod własną kontrolą Bifrost</string>
 </resources>

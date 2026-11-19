@@ -77,6 +77,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private File log;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private PadMotion padMotion;   // a gamepad's own gyroscope and accelerometer as its player's six-axis sensor (PadMotion), the phone's own sensors stay the host's
+    private BifrostBridge bifrost;
     private volatile Rumble rumble;   // the game's vibration on the controller's or the phone's vibrator
     private boolean input, started;
     private boolean clean;   // the saved clean picture: stats, log, tag, controls and the panel strip hidden together
@@ -523,6 +524,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         }
         if (prof != null && prof.vegetationDetail && !Prefs.fullVegetation(this, id)) env.add("DM_VK_VEGETATION=0");
         if (prof != null) env.addAll(prof.optionsEnv(optEnv -> Prefs.gameOption(this, id, optEnv)));
+        if ("0400486024DEC000".equals(id) && !Prefs.bifrost(this, id)) env.add("DM_BIFROST=0");
         Lsfg.env(this, env);   // frame generation: the user's Lossless.dll and the settings
         GameUpscaler.env(this, id, env);   // the Upscaler (Game settings, the in-game panel): the game's own upscaler and the present's scaling
         if (Prefs.drsGame(id)) { int[] drs = Prefs.DRS[Prefs.drs(this, id)]; env.add("DM_DRS=" + drs[0] + "," + drs[1]); }   // dynamic resolution range (Prefs.DRS)
@@ -1054,6 +1056,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
      * The game itself is left as it is: onStop has suspended it
      */
     @Override protected void onDestroy() {
+        if (bifrost != null) { bifrost.close(); bifrost = null; }
         if (layer != null) { layer.stop(); layer = null; }
         TextInput.gone(this);
         UserPicker.gone(this);
@@ -1209,6 +1212,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         order.start(now);   // best first: an external controller is player 1 before a phone's own gamepad-like device (PadOrder)
         Native.motionRotation(getDisplay().getRotation());
         if (resumedNow && !paused) { Native.motionStart(); padMotion.resume(); }   // the screen was resumed before the game started (onResume then did nothing): the sensors start here
+        if (bifrost == null) bifrost = BifrostBridge.create(this, titleId());
+        if (resumedNow && bifrost != null) bifrost.start();
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).setContentType(AudioAttributes.CONTENT_TYPE_UNKNOWN).build())
@@ -1364,10 +1369,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         Native.lifecycle(3);
         Native.motionRotation(getDisplay().getRotation());
         if (!paused) { Native.motionStart(); if (padMotion != null) padMotion.resume(); }   // paused: the sensors stay off (they would wake the host at their rate for a frozen game); unpause starts them
+        if (bifrost != null) bifrost.start();
     }
     private boolean resumedNow;
     @Override protected void onPause() {
         resumedNow = false;
+        if (bifrost != null) bifrost.stop();
         if (started) { Native.motionStop(); if (padMotion != null) padMotion.pause(); Native.lifecycle(0); }
         super.onPause();
     }

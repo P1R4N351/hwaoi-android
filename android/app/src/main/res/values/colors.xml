@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- The icon's background (deep green) behind the banana -->
-    <color name="ic_launcher_background">#FF1E5B3A</color>
+    <!-- The icon's background (deep forest twilight emerald) -->
+    <color name="ic_launcher_background">#FF0F3123</color>
 
     <!-- The launcher's palette (Ui.java, themes.xml): ripe banana on a light grey home, peel brown and the icon's leaf green. values-night has the dark set -->
     <color name="bn_bg">#FFECECEE</color>            <!-- the screen: light grey, as the Switch 2 home -->

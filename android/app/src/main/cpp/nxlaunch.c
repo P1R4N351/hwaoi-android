@@ -635,3 +635,32 @@ JNIEXPORT jstring JNICALL Java_dev_nxnative_android_Native_skipStatus(JNIEnv *en
     if (nxhost_skip_status) nxhost_skip_status(buf, sizeof buf);
     return (*env)->NewStringUTF(env, buf);
 }
+
+#pragma weak nxhost_companion_state
+int nxhost_companion_state(int64_t out[8]);
+#pragma weak nxhost_companion_set_page
+void nxhost_companion_set_page(int page);
+
+JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_companionState(JNIEnv *env, jclass cls, jlongArray out) {
+    (void)cls;
+    if (!out || !nxhost_companion_state || (*env)->GetArrayLength(env, out) < 8) return JNI_FALSE;
+    int64_t words[8] = {0};
+    int ok = nxhost_companion_state(words);
+    jlong tmp[8];
+    for (int i = 0; i < 8; i++) tmp[i] = (jlong)words[i];
+    (*env)->SetLongArrayRegion(env, out, 0, 8, tmp);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionSetPage(JNIEnv *env, jclass cls, jint page) {
+    (void)env; (void)cls;
+    if (nxhost_companion_set_page) nxhost_companion_set_page((int)page);
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_bifrostMode(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    const char *e = getenv("DM_BIFROST");
+    if (e && strcmp(e, "0") == 0) return 0;
+    if (e && strcmp(e, "2") == 0) return 2;
+    return 1;
+}

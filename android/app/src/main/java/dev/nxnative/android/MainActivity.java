@@ -409,7 +409,7 @@ public final class MainActivity extends Activity {
         selectedTile = null;
         LinearLayout top = Ui.row(this);   // the logo alone, small, at the left; the dock (the user, Add game, the wiki, Settings) in the top right corner
         ImageView logo = Ui.badge(this, 36);   // as big as the dock's buttons
-        logo.setContentDescription(Tx.s(R.string.home_banana_native));
+        logo.setContentDescription(Tx.s(R.string.app_name));
         logo.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         top.addView(logo);
         top.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
@@ -1108,7 +1108,7 @@ public final class MainActivity extends Activity {
         if (games.isEmpty() && !Ondevice.showing()) {   // no game: one line, the button has the focus
             gameBox.addView(emptyHint(), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
             noFocusTint(gameBox);
-            if (addFab != null) addFab.post(() -> { if (addFab.isAttachedToWindow() && !addFab.isInTouchMode() && getCurrentFocus() == null) addFab.requestFocus(); });
+            if (addFab != null) addFab.post(() -> { if (addFab.isAttachedToWindow() && (!addFab.isInTouchMode() || PadFocus.hasGamepad()) && getCurrentFocus() == null) addFab.requestFocus(); });
             hintUpdate();
             return;
         }

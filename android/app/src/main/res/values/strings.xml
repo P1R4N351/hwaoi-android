@@ -1440,4 +1440,7 @@
     <string name="game_fast_fp16_shader_math">Fast FP16 shader math</string>
     <string name="game_fp16_on_turnip_faster">16-bit half precision on Turnip: faster shader math, lower heat</string>
     <string name="game_fp16_default_precision">Default precision</string>
+    <string name="game_stick_leds_bifrost">Stick LEDs (Bifrost)</string>
+    <string name="game_stick_leds_bifrost_on">Follow hearts, pause subscreen, and Ocarina on AYN Thor (at launch)</string>
+    <string name="game_stick_leds_bifrost_off">Leave AYN Thor stick LEDs under Bifrost\'s own control</string>
 </resources>
