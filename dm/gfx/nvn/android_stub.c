@@ -21,7 +21,6 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { (void)enc; (void)reuse; if
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { (void)load; (void)store; (void)full_rw_passes; if (load) *load = 0; if (store) *store = 0; if (full_rw_passes) *full_rw_passes = 0; RED(__func__); }
 uint64_t mtl_ds_omit(void) { RED(__func__); return 0; }
 void mtl_mem_stat(unsigned long long a0, unsigned long long a1) { (void)a0; (void)a1; RED(__func__); }
-uint64_t mtl_pkg_edge_skips(void) { RED(__func__); return 0; }
 uint64_t mtl_pkg_miss(void) { RED(__func__); return 0; }
 int mtl_pso_prebuild_tool(void) { RED(__func__); return 0; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; RED(__func__); }

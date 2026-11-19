@@ -26,6 +26,8 @@
 #include "game_profile.h"
 #include "vka_texown.h"
 #include "vka_wbfollow.h"
+#include "vka_edge_unpin.h"
+#include <assert.h>
 #include "../nvn/nvn_tex.h"
 
 __attribute__((weak)) int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) { (void)mem; (void)size; (void)stride; return 0; }
@@ -183,7 +185,24 @@ static vka_img **g_live; static int g_nlive, g_livecap; static uint64_t g_live_g
 #include "vka_livemap.h"
 static vkl_index g_lvx;   // (under g_tmu)
 static void live_add(vka_img *im) { if (vkl_add(&g_live, &g_nlive, &g_livecap, &g_lvx, im)) g_live_gen++; }   // caller holds g_tmu
-static void live_del(vka_img *im) { if (vkl_del(g_live, &g_nlive, &g_lvx, im)) g_live_gen++; }                // caller holds g_tmu; nothing when im is not live
+enum { EDGE_HOT_CAP = 256 };
+static vka_img *g_edge_hot[EDGE_HOT_CAP]; static int g_nedge_hot;   // tracked images whose shared boundary pages stay writable (under g_tmu)
+static _Atomic uint64_t g_edge_skips, g_edge_unpins;
+uint64_t mtl_pkg_edge_skips(void) { return atomic_load_explicit(&g_edge_skips, memory_order_relaxed); }
+static void edge_hot_add(vka_img *im) {
+    if (!im || im->edge_ix || g_nedge_hot >= EDGE_HOT_CAP) return;
+    g_edge_hot[g_nedge_hot] = im;
+    im->edge_ix = ++g_nedge_hot;
+}
+static void edge_hot_del(vka_img *im) {
+    if (!im || !im->edge_ix) return;
+    int i = im->edge_ix - 1;
+    assert(i >= 0 && i < g_nedge_hot && g_edge_hot[i] == im);
+    vka_img *last = g_edge_hot[--g_nedge_hot];
+    if (i < g_nedge_hot) { g_edge_hot[i] = last; last->edge_ix = i + 1; }
+    im->edge_ix = 0;
+}
+static void live_del(vka_img *im) { edge_hot_del(im); if (vkl_del(g_live, &g_nlive, &g_lvx, im)) g_live_gen++; }   // caller holds g_tmu; nothing when im is not live
 static vka_img *live_first(const uint8_t *mem, int *k) { return vkl_first(g_live, g_nlive, &g_lvx, mem, k); }   // the live images whose storage starts at mem: the first, then live_next
 static vka_img *live_next(const vka_img *im, const uint8_t *mem, int *k) { return vkl_next(g_live, g_nlive, &g_lvx, im, mem, k); }
 static vksm g_cpuw;   // (under g_tmu) serials the CPU wrote before their image existed (a set: vksm with no images)
@@ -973,50 +992,73 @@ static uint8_t *unmapped_content(const tex_t *t) {
                                                               (unsigned long long)u, (unsigned long long)((t->L.size + 4095) >> 12), (const void *)t->mem);
     return c;
 }
-static uint64_t ft_hash(uintptr_t lo, uintptr_t hi) {
-    const uint8_t *p = (const uint8_t *)lo; size_t n = hi - lo, i = 0; uint64_t h = 0x9e3779b97f4a7c15ull ^ n, w;
-    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h ^= w * 0x87c37b91114253d5ull; h = ((h << 31) | (h >> 33)) * 0x4cf5ad432745937full; }
-    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
-    return h ^ (h >> 29);
+static size_t edge_pg_bytes(void) {
+    size_t pg = nvn_dirty_block_bytes();
+    return pg ? pg : (size_t)getpagesize();
+}
+static void img_protect_tracked(vka_img *im, const void *mem, size_t size) {
+    if (!mem || !size) return;
+    int allow = VKA_ENV("DM_VK_EDGE_UNPIN", 1) != 0;
+    if (!allow && im->edge_unpinned) { edge_hot_del(im); im->edge_unpinned = 0; im->edge_streaks = 0; }
+    if (im->edge_unpinned) {
+        vka_edge_geom g; vka_edge_split((uintptr_t)mem, size, edge_pg_bytes(), &g);
+        if (g.ie > g.ia) nvn_dirty_protect((const void *)g.ia, g.ie - g.ia);
+        return;
+    }
+    nvn_dirty_protect(mem, size);
 }
 static void img_edges_take(vka_img *im) {
     if (!im) return;
-    im->edged = 0;
-    if (im->vpool || !im->span || !im->mem) return;
+    im->edged = 0; im->edge_in_hashed = 0; im->edge_in_h = 0;
+    if (im->vpool || !im->span || !im->mem || !im->L.size) return;
     if (dm_guest_unmapped((uintptr_t)im->mem, im->L.size)) return;   // the edges are read in place: a page the guest has not mapped would fault
-    uintptr_t pg = nvn_dirty_block_bytes(); if (!pg) pg = (uintptr_t)getpagesize();
-    uintptr_t r[2][2], ia, ie;
-    uintptr_t a = (uintptr_t)im->mem, e = a + im->L.size;
-    ia = (a + pg - 1) & ~(pg - 1); ie = e & ~(pg - 1);
-    if (ie <= ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; }
-    else { r[0][0] = a; r[0][1] = ia; r[1][0] = ie; r[1][1] = e; }
-    for (int i = 0; i < 2; i++) im->edge_h[i] = r[i][1] > r[i][0] ? ft_hash(r[i][0], r[i][1]) : 0;
-    im->edged = !nvn_dirty_since_span(im->span, im->mem, im->L.size, im->stamp);
+    vka_edge_geom g; vka_edge_split((uintptr_t)im->mem, im->L.size, edge_pg_bytes(), &g);
+    vka_edge_snapshot(&g, im->edge_h);
+    if (vka_edge_can_hash_interior(&g, im->edge_unpinned)) {
+        im->edge_in_h = vka_edge_hash(g.ia, g.ie);
+        im->edge_in_hashed = 1;
+    }
+    if (im->edge_unpinned) im->edged = !(g.ie > g.ia && nvn_dirty_since_span(im->span, (const void *)g.ia, g.ie - g.ia, im->stamp));
+    else im->edged = !nvn_dirty_since_span(im->span, im->mem, im->L.size, im->stamp);
 }
 static int img_edges_clean(vka_img *im) {
-    if (!im || !im->edged || im->vpool || !im->span || !im->mem) return 0;
+    if (!im || !im->edged || im->vpool || !im->span || !im->mem || !im->L.size) return 0;
     if (dm_guest_unmapped((uintptr_t)im->mem, im->L.size)) return 0;
-    uintptr_t pg = nvn_dirty_block_bytes(); if (!pg) pg = (uintptr_t)getpagesize();
-    uintptr_t r[2][2], ia, ie;
-    uintptr_t a = (uintptr_t)im->mem, e = a + im->L.size;
-    ia = (a + pg - 1) & ~(pg - 1); ie = e & ~(pg - 1);
-    if (ie <= ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; ia = ie = 0; }
-    else { r[0][0] = a; r[0][1] = ia; r[1][0] = ie; r[1][1] = e; }
+    vka_edge_geom g; vka_edge_split((uintptr_t)im->mem, im->L.size, edge_pg_bytes(), &g);
+    int h0_bad = 0, h1_bad = 0;
+    int e_dirty = vka_edge_changed(&g, im->edge_h, &h0_bad, &h1_bad);
+    int in_dirty = (g.ie > g.ia && nvn_dirty_since_span(im->span, (const void *)g.ia, g.ie - g.ia, im->stamp));
+    if (in_dirty && !e_dirty && im->edge_in_hashed) {
+        int ep = (g.r[0][1] > g.r[0][0] && nvn_dirty_since_span(im->span, (const void *)g.r[0][0], g.r[0][1] - g.r[0][0], im->stamp)) ||
+                 (g.r[1][1] > g.r[1][0] && nvn_dirty_since_span(im->span, (const void *)g.r[1][0], g.r[1][1] - g.r[1][0], im->stamp));
+        if (vka_edge_interior_collateral(&g, im->edge_in_h, im->edge_in_hashed, ep)) in_dirty = 0;
+    }
     uint64_t st = nvn_dirty_now();
-    nvn_dirty_protect(im->mem, im->L.size);
-    int in_dirty = (ie > ia && nvn_dirty_since_span(im->span, (const void *)ia, ie - ia, im->stamp));
-    int h0_bad = (r[0][1] > r[0][0] && ft_hash(r[0][0], r[0][1]) != im->edge_h[0]);
-    int h1_bad = (r[1][1] > r[1][0] && ft_hash(r[1][0], r[1][1]) != im->edge_h[1]);
-    if (in_dirty || h0_bad || h1_bad) return 0;
+    if (in_dirty || e_dirty) {
+        im->edge_streaks = 0;
+        img_protect_tracked(im, im->mem, im->L.size);
+        return 0;
+    }
+    if (im->edge_streaks < 255) im->edge_streaks++;
+    if (!im->edge_unpinned && g.has_edges && im->edge_streaks >= VKA_EDGE_UNPIN_AFTER &&
+        VKA_ENV("DM_VK_EDGE_UNPIN", 1) != 0 && g_nedge_hot < EDGE_HOT_CAP) {
+        im->edge_unpinned = 1;
+        edge_hot_add(im);
+        uint64_t nu = atomic_fetch_add_explicit(&g_edge_unpins, 1, memory_order_relaxed) + 1;
+        if (nu <= 8) VLOG("texture serial %llu %ux%u format %#x (%zu B): shared boundary page(s) unpinned after %u neighbor writes (%llu unpinned)",
+                          (unsigned long long)im->serial, im->w, im->h, im->d.format, (size_t)im->L.size, im->edge_streaks, (unsigned long long)nu);
+    }
+    img_protect_tracked(im, im->mem, im->L.size);
     im->stamp = st;
     img_edges_take(im);
-    static uint64_t g_edge_skips;
-    if (++g_edge_skips <= 8) VLOG("texture serial %llu %ux%u format %#x: only shared pages written beside it, re-upload skipped (%llu so far)",
-                                  (unsigned long long)im->serial, im->w, im->h, im->d.format, (unsigned long long)g_edge_skips);
+    uint64_t sk = atomic_fetch_add_explicit(&g_edge_skips, 1, memory_order_relaxed) + 1;
+    if (sk <= 8) VLOG("texture serial %llu %ux%u format %#x: only shared pages written beside it, re-upload skipped (%llu so far)",
+                      (unsigned long long)im->serial, im->w, im->h, im->d.format, (unsigned long long)sk);
     return 1;
 }
 static void upload_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // stamp, protect, then read (nvn_mtl.m pkg_upload): a write during the copy is seen at the next check
-    im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
+    im->edge_streaks = 0;
+    im->stamp = nvn_dirty_now(); img_protect_tracked(im, t->mem, t->L.size);
     img_edges_take(im);
     if (vka_nan_on()) im->hash = mem_hash(t->mem, t->L.size);
     uint8_t *c = im->vpool ? NULL : gw_content(t->mem, t->L.size, &im->gw_seen);   // (a sparse pool's storage is read through its page table: upload_)
@@ -1039,7 +1081,8 @@ static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, 
     if (st < pitch) return 0;
     uint32_t r0 = (uint32_t)(lo / st), r1 = (uint32_t)((hi + st - 1) / st); if (r1 > by) r1 = by;
     if (r0 >= r1) r0 = 0, r1 = by;
-    im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
+    im->edge_streaks = 0;
+    im->stamp = nvn_dirty_now(); img_protect_tracked(im, t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
     vka_span s; if (!vka_scratch(pitch * (r1 - r0), 16, &s)) return 1;
     for (uint32_t y = r0; y < r1; y++) memcpy(s.ptr + (size_t)(y - r0) * pitch, t->mem + (size_t)y * st, pitch);
@@ -1061,7 +1104,8 @@ static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb,
     if (c) { free(c); return 0; }
     if ((c = unmapped_content(t))) { free(c); return 0; }
     im->gw_seen = seen;
-    im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
+    im->edge_streaks = 0;
+    im->stamp = nvn_dirty_now(); img_protect_tracked(im, t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
     uint64_t up = 0;
     uint8_t *bst = NULL; uint32_t bst_cap = 0;
@@ -2257,7 +2301,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
     if (!im->gpu_owned && im->m.size >= big_min()) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 64)   // large images: the first GPU write (DM_VK_BIGIMG_MB)
         VLOG("large image serial %llu %ux%u layers %u format %#x (%.1f MiB): first GPU write at frame %llu (%s:%d), sampled by %u draws before, %u other textures over its storage", (unsigned long long)im->serial,
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
-    im->gpu_owned = 1;
+    im->gpu_owned = 1; edge_hot_del(im); im->edge_unpinned = 0;
     im->last_fence = vka_fence_last();
     if (img_wb_kind(im)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32)   // which GPU writes a copied-back linear texture takes (the copy-back covers the whole image)
         VLOG("linear texture serial %llu %ux%u format %#x: GPU write at frame %llu (%s:%d)%s", (unsigned long long)im->serial, im->w, im->h, im->d.format,
@@ -2348,6 +2392,7 @@ void mtl_tex_write_region(const tex_t *t, unsigned level, unsigned layer0, const
     // texture prepare 65-79 ms; untracked 5,900 and 1 ms). Its protected pages fault once each and are not protected again. A game that also fills the texture with plain CPU
     // stores is not followed from here on: if one exists, this is where it shows (the texture stays as WriteTexels left it)
     if (im->track || im->mode == ST_TRACK) { im->track = 0; im->mode = ST_FILL; }
+    edge_hot_del(im); im->edge_unpinned = 0;
     im->wt = 1;
     const vka_fmt *f = &im->f;
     int nz = r->depth ? r->depth : 1;
@@ -3157,6 +3202,57 @@ VkSampler vka_samp_default(void) {
     return s;
 }
 
+static void upload_tracked_range(vka_img *im, VkCommandBuffer cb, size_t lo, size_t hi, int wbf, uint64_t waits, uint64_t *wbf_up) {
+    tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
+    if (wbf) {
+        uint64_t k = ++(*wbf_up);
+        if (k <= 4 || !(k & (k - 1)))
+            VLOG("texture serial %llu %ux%u format %#x: the CPU wrote it after its copy-back, its written part uploaded (%llu so far; %llu scans waited for a copy-back; DM_VK_WB_FOLLOW=0 turns this off)",
+                 (unsigned long long)im->serial, im->w, im->h, im->d.format, (unsigned long long)k, (unsigned long long)waits);
+    }
+    int rows = VKA_ENV("DM_VK_ROWS", 1);
+    if (rows && upload_rows_tracked(im, &t, cb, lo, hi)) return;
+    if (upload_bands_tracked(im, &t, cb, lo, hi, im->stamp)) {
+        if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x: the bands of its storage that changed re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format);
+        return;
+    }
+    upload_tracked(im, &t, cb);
+    if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x flags %#x target %d: its storage changed, re-uploaded",
+                           (unsigned long long)im->serial, im->w, im->h, im->d.format, im->d.flags, im->d.target);
+}
+static int prepare_one_unpinned(vka_img *im, VkCommandBuffer cb, int check_interior, int g_wbf_on,
+                                uint64_t done, int *g_wbf_wait, uint64_t *g_wbf_waits, uint64_t *g_wbf_up) {
+    if (!im || !im->edge_unpinned || !im->track || !im->mem || img_pool_dead(im) || im->vpool || im->vbind || im->vtrack) {
+        edge_hot_del(im); if (im) im->edge_unpinned = 0; return 0;
+    }
+    if (!wbf_follows(im->gpu_owned, img_wb_kind(im) && g_wbf_on, im->wb_pending, im->wb_fence, done)) {
+        if (g_wbf_on && im->gpu_owned && img_wb_kind(im) && (im->wb_pending || done < im->wb_fence)) {
+            *g_wbf_wait = 1; im->wbf_waiting = 1; (*g_wbf_waits)++;
+        }
+        return 0;
+    }
+    int wbf = im->gpu_owned;
+    if (!VKA_ENV("DM_VK_EDGE_UNPIN", 1)) {
+        edge_hot_del(im); im->edge_unpinned = 0; im->edge_streaks = 0;
+        im->stamp = nvn_dirty_now(); nvn_dirty_protect(im->mem, im->L.size);
+        img_edges_take(im);
+        return 1;
+    }
+    if (dm_guest_unmapped((uintptr_t)im->mem, im->L.size) || !im->span) {
+        edge_hot_del(im); im->edge_unpinned = 0; return 0;
+    }
+    vka_edge_geom g; vka_edge_split((uintptr_t)im->mem, im->L.size, edge_pg_bytes(), &g);
+    int h0_bad = 0, h1_bad = 0;
+    int e_dirty = vka_edge_changed(&g, im->edge_h, &h0_bad, &h1_bad);
+    int in_dirty = (check_interior && g.ie > g.ia) ? nvn_dirty_since_span(im->span, (const void *)g.ia, g.ie - g.ia, im->stamp) : 0;
+    if (!e_dirty && !in_dirty) return 0;
+    size_t in_lo = 0, in_hi = 0, lo = 0, hi = im->L.size;
+    if (in_dirty && !nvn_dirty_bounds_since(im->span, (const void *)g.ia, g.ie - g.ia, im->stamp, &in_lo, &in_hi)) in_dirty = 0;
+    if (!e_dirty && !in_dirty) return 0;
+    vka_edge_dirty_bounds(&g, (uintptr_t)im->mem, im->L.size, h0_bad, h1_bad, in_dirty, in_lo, in_hi, &lo, &hi);
+    upload_tracked_range(im, cb, lo, hi, wbf, *g_wbf_waits, g_wbf_up);
+    return 0;
+}
 void vka_tex_prepare(VkCommandBuffer cb) {
     bindless_init();
     nvn_pool_use(1);   // the re-uploads below read guest storage: no pool is finalized (and unmapped) under them. Taken before g_tmu, as write_tex does
@@ -3317,6 +3413,10 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             // A GPU-written image's content is the GPU's, except a linear one's once its copy-back has run: then the CPU's later writes to the storage are uploaded (vka_wbfollow.h:
             // Mario Tennis Fever clears its 8192x2048 R8 glyph cache on the GPU and rasterizes glyphs into it on the CPU; skipped, every text box was blank). While the copy-back
             // is queued or on the GPU the image waits, and the scan runs again at the next prepare even if the CPU writes nothing more (g_wbf_wait)
+            if (im->edge_unpinned) {
+                prepare_one_unpinned(im, cb, 1, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
+                continue;
+            }
             if (!wbf_follows(im->gpu_owned, img_wb_kind(im) && g_wbf_on, im->wb_pending, im->wb_fence, done)) {
                 if (g_wbf_on && im->gpu_owned && img_wb_kind(im) && (im->wb_pending || done < im->wb_fence)) { g_wbf_wait = 1; im->wbf_waiting = 1; g_wbf_waits++; }
                 continue;
@@ -3328,15 +3428,11 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             if (img_edges_clean(im)) continue;
             size_t lo, hi;
             if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
-            tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
-            if (wbf) { uint64_t k = ++g_wbf_up; if (k <= 4 || !(k & (k - 1))) VLOG("texture serial %llu %ux%u format %#x: the CPU wrote it after its copy-back, its written part uploaded (%llu so far; %llu scans waited for a copy-back; DM_VK_WB_FOLLOW=0 turns this off)",
-                                                                         (unsigned long long)im->serial, im->w, im->h, im->d.format, (unsigned long long)k, (unsigned long long)g_wbf_waits); }
-            int rows = VKA_ENV("DM_VK_ROWS", 1);
-            if (rows && upload_rows_tracked(im, &t, cb, lo, hi)) continue;
-            if (upload_bands_tracked(im, &t, cb, lo, hi, im->stamp)) { if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x: the bands of its storage that changed re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format); continue; }
-            upload_tracked(im, &t, cb);
-            if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x flags %#x target %d: its storage changed, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format, im->d.flags, im->d.target);
+            upload_tracked_range(im, cb, lo, hi, wbf, g_wbf_waits, &g_wbf_up);
         }
+    } else if (g_nedge_hot) {
+        for (int i = g_nedge_hot - 1; i >= 0; i--)
+            prepare_one_unpinned(g_edge_hot[i], cb, 0, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
     }
     nvn_pool_use(0);   // (write_tex takes it again for each ID, after letting g_tmu go: never twice on one thread)
     if (!g_set) { g_ntd = g_nsd = 0; if (g_tdflag) memset(g_tdflag, 0, 1 << 20); if (g_sdflag) memset(g_sdflag, 0, 4096 * 4); pthread_mutex_unlock(&g_tmu); return; }

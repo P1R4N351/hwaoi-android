@@ -57,6 +57,8 @@ t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_di
 	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c
 t_dirty_maps: t_dirty_maps.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../vk_android/vka_mapbudget.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_maps.c ../../host/crash.c
+t_edge_unpin: t_edge_unpin.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../vk_android/vka_edge_unpin.h $(GAME_H)
+	clang $(CFLAGS) -o $@ t_edge_unpin.c ../../host/crash.c
 t_dirty_mpfail: t_dirty_mpfail.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_mpfail.c ../../host/crash.c
 t_dirty_retire_race: t_dirty_retire_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
