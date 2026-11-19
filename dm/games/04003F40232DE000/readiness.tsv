@@ -1,5 +1,9 @@
 # What this game needs of an Android phone, for the launcher's readiness check (android/README.md "Readiness check"; dm/games/README.md "Readiness rows").
 # A status row also marks the game as supported on Android: gradle.properties' nxGames builds every such profile into the APK (dm/tools/tests/test_android_games.py).
 
-# In bring-up on Android: Switch 2 KTGL (NVN2, SDK 20.5.15), 0 mesh/task shaders, VP9 movies, flat 8 MB DATA.BIN save.
-status	bring-up
+# Verified on AYN Thor (16 GB, Turnip 27.0.0-devel): Switch 2 KTGL (NVN2, SDK 20.5.15), 0 mesh/task shaders, VP9 movies (libvpx), flat 8 MB DATA.BIN save.
+status	playable
+
+# Memory: 6.85 GiB PSS / 6.96 GiB RSS while running the first playable 3D field on a 16 GB AYN Thor (14.9 GiB totalMem), leaving 5.90 GiB MemAvailable.
+required	ram_gib	10	Memory: the game keeps about 7 GB resident while playing, which a phone with less than about 12 GB cannot give it
+degraded	ram_gib	14	Memory: verified on a 16 GB handheld only; with less, Android may stop the game when memory runs short

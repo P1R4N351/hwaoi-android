@@ -54,3 +54,16 @@ Run headless: `DM_WINDOW` set to anything, `0` too, opens a window, and a covere
 - Dedicated c1 constants as slices of a bank: about 10 fps in the first field.
 - [Barrier moves around warp shuffles](../../../docs/reference/shaders.md#barrier-moves-around-warp-shuffles): two pixel shaders left out of the build.
 - [LDC with the bank in its address register (`.IS`)](../../../docs/reference/shaders.md#ldc-with-the-bank-in-its-address-register-is): two shaders left out of the build.
+
+## Android (AYN Thor)
+
+Verified live on a 16 GB **AYN Thor** (`QCS8550` / `Adreno (TM) 740`, Android 13 SDK `33`, `14.9 GiB` / `15,621,188 kB` RAM) running **Turnip** `Mesa 27.0.0-devel (git-3e8621cc0e)` (`driver ID 18`, custom driver `Turnip_27.0.0-devel_cs-slabs_`, Vulkan `1.4.363`, `VK_EXT_map_memory_placed`, `VK_EXT_push_descriptor`) with `AoI-Native-0.1.0-dev.apk` (`8,590,504` B, SHA-256 `ada9cd5893c39b80a34e7899e784960c357a4f2dc92bd90f1575d46d`) and pre-baked shader library `dmsh_vk.lib` (`15,449` shaders / `25,591` SPIR-V modules, `478.7 MB`):
+
+- **Menus & NUP streaming:** Initial difficulty/language settings, confirmation, and autosave notice run at `59.8 fps` (`GPU busy p50/p90 1.7–1.9 ms`). Compressed NUP v1 `PKG[1]` `v196608` archives (`65`, `200`, `203`, `131`, `234 MiB`) decompress in `0.1–0.3 s` each; flat `8 MB` (`8,388,608` B) `DATA.BIN` save initializes cleanly under `saves/04003F40232DE000/`.
+- **Opening VP9 cutscene:** `libvpx v1.17.0` (`4` threads, `1920x1080`) decoded `2,363` packets into `2,359` frames (`8.17 ms/packet` average, `25.20 ms` max) at `59.7–59.8 fps` (`GPU busy p50/p90 2.2/4.3 ms`); movie pixel shader `3aafef4169955790` is included in `shader_seen.tsv`.
+- **Opening realtime cutscene & first playable 3D field:** Realtime cutscene peaked at `881` draws/frame (`46.6 fps`, `GPU busy p50/p90 20.0/21.3 ms`). In the first playable 3D forest field with Princess Zelda (`1920x1080`): `52.3–55.7 fps`, `300–357` draws/frame (`0` skipped draws in steady `ctl: stats`), `7` compute dispatches, `53` render passes, `6.0` submissions, `GPU 16.10–17.57 ms`, placed memory `1,440 MB`, images `868 MB` (`757` live). Pause menu (`Plus` / `Back B`): `59.8 fps`, `28` draws/frame, `GPU busy 5.1 ms`, `0` dropped frames.
+- **Pipelines & indirect `QUADS`:** `316` graphics + `14` compute pipelines built with `0` failed and `0` missing shaders. Non-indexed indirect `QUADS` compute conversion (`DM_VK_QUAD_IND=1`) is compiled in; `[vk] indirect quad draws` did not trigger during the opening forest walk (`0` indirect-quad skips).
+- **Audio:** AAudio `48000 Hz`, `2` channels (`OpenAudioOut` 6 ch) ran with `0` underruns across callbacks `4001–20000` (`0.0 ms` zero-padded) after `3` initial boot underruns (`60.0 ms`).
+- **Controls verified (`DM_CTL`):** `A` menu confirmation, `LUp`/`LRight` movement, `RLeft`/`RRight` camera rotation, `Plus` pause and `B` unpause verified via `1920x1080` swapchain screenshots.
+- **Memory footprint (frame `20812`, first field):** `TOTAL PSS: 7,183,483 kB` (`6.85 GiB`), `TOTAL RSS: 7,298,216 kB` (`6.96 GiB`), `MemAvailable: 6,183,676 kB` (`5.90 GiB` free), `SwapFree: 3,587,172 kB`, `0` `lmkd` events, `0` crashes.
+- **Untested on Android:** combat encounters / full missions (and whether non-indexed indirect `QUADS` triggers there) and mid-mission autosave write/reload.
