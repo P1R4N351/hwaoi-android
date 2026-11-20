@@ -1,5 +1,6 @@
 # One row for each row of docs/env_switches.tsv (dm/tools/advanced_switches.py writes and checks it; the columns are described there). The launcher shows the
 # friendly and advanced rows in Settings > Advanced and on each game's page; developer rows are behind "Show developer options"; internal rows are never shown.
+name	tier	area	label	try_if	type	choices	default	scope	warn	owner	profile_key	games	fixes	reason	live
 DMSH_VK_BATCH	developer	Packing			text			both							
 DMSH_VK_DELTA_FROM	developer	Diagnostics			text			both							
 DMSH_VK_KEEP	developer	Packing			text			both							
@@ -53,11 +54,13 @@ DM_DAV1D_FRAME_DELAY	developer	Diagnostics			text			both
 DM_DAV1D_THREADS	developer	Diagnostics			text			both							
 DM_DBG	developer	Diagnostics			text			both							
 DM_DBG_AU_FRAMES	internal	Diagnostics			text			both						Mac or iOS only	
+DM_DESWIZZLE_FAST	developer	Performance			text			both							
 DM_DETCLOCK	developer	Game			text			both							
 DM_DETCLOCK_PACE	developer	Performance			text			both							
 DM_DEVTOOLS	developer	Diagnostics			text			both							
 DM_DIRTY_BLOCK_AT	developer	Game			text			both							
 DM_DIRTY_BLOCK_KB	developer	Game			text			both							
+DM_DIRTY_FAST	developer	Performance			text			both							
 DM_DIRTY_FAULT_RUN_KB	developer	Game			text			both							
 DM_DISPLAY_NAME	internal	Game			text			both						Mac or iOS only	
 DM_DKB_PANES	developer	Diagnostics			text			both							
@@ -303,7 +306,7 @@ DM_OOT_SHADOW_RANGE	friendly	Graphics	Shadow range	the game is slow in a field o
 DM_OOT_TEXTURE_POOL_X2	developer	Memory			text			both							
 DM_OOT_WIDE_KEEP	developer	Diagnostics			text			both							
 DM_OPMODE	developer	Game			text			both							
-DM_OPUS_FAST	developer	Performance			text			both						
+DM_OPUS_FAST	developer	Performance			text			both							
 DM_OVERLAY	developer	Game			text			both							
 DM_PACKER_COMMIT	developer	Diagnostics			text			both							
 DM_PAD_DEADZONE	developer	Input			text			both							
@@ -586,7 +589,7 @@ DM_VK_KTGL_CACHE	developer	Performance			text			both
 DM_VK_LAYER	advanced	Graphics	Shaders while playing		toggle			game		Game settings > Shaders while playing					
 DM_VK_LAYER_DIR	internal	Graphics			text			both						set by the launcher	
 DM_VK_LAYER_DROP	developer	Graphics			text			both							
-DM_VK_LC_FAST	developer	Performance			text			both						
+DM_VK_LC_FAST	developer	Performance			text			both							
 DM_VK_LC_GLOBAL	developer	Graphics			text			both							
 DM_VK_LEVEL_SHARE	developer	Graphics			text			both							
 DM_VK_LOG	internal	Diagnostics			text			both						Mac or iOS only	
@@ -794,4 +797,3 @@ DM_XCODE_PROJECT_DIR	developer	Diagnostics			text			both
 DM_XV_FILE	developer	Diagnostics			text			both							
 DM_YIELD_BACKOFF	developer	Game			text			both							
 DM_ZBIC_LIB	developer	Diagnostics			text			both							
-name	tier	area	label	try_if	type	choices	default	scope	warn	owner	profile_key	games	fixes	reason	live

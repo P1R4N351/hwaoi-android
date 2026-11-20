@@ -3,6 +3,7 @@
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
+#include "nvn_dirty_fast.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <errno.h>
@@ -35,7 +36,7 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; uint8_t *ever; size_t cap; _Atomic int live, red; } range_t;   // red: a write protection in it failed (logged once)
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cmax; uint8_t *ever; size_t cap; _Atomic int live, red; _Atomic uint64_t latest; _Atomic uint32_t unprot; } range_t;   // red: a write protection in it failed (logged once)
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -94,8 +95,25 @@ static int busy_wait(range_t *r, uintptr_t p) {
 static int live_at(int i) { return atomic_load_explicit(&rg(i)->live, memory_order_acquire); }
 // The registered range that holds all of [a, a+len) (used for a texture's tracking / protection / dirty check)
 static range_t *find_span(uintptr_t a, size_t len) {
+    if (len > UINTPTR_MAX - a) return NULL;
+    uintptr_t e = a + len;
+    if (dirty_fast_on()) {
+        int slots[DIRTY_RIX_OUT], trusted = 0;
+        int m = dirty_rix_collect(a, 0u, e, 1, slots, DIRTY_RIX_OUT, &trusted);
+        for (int j = 0; j < m; j++) {
+            int si = slots[j];
+            range_t *r = rg(si);
+            if (live_at(si) && a >= __atomic_load_n(&r->base, __ATOMIC_RELAXED) &&
+                e <= __atomic_load_n(&r->end, __ATOMIC_RELAXED)) return r;
+        }
+        if (trusted) return NULL;
+    }
     int n = atomic_load(&g_nr);
-    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a + len <= r->end) return r; }
+    for (int i = 0; i < n; i++) {
+        range_t *r = rg(i);
+        if (live_at(i) && a >= __atomic_load_n(&r->base, __ATOMIC_RELAXED) &&
+            e <= __atomic_load_n(&r->end, __ATOMIC_RELAXED)) return r;
+    }
     return NULL;
 }
 // Pages p..q widened to their blocks, within the range
@@ -106,7 +124,12 @@ static void block_bounds(const range_t *r, uintptr_t *p, uintptr_t *q) {
     *p = (a - r->base) >> g_shift; *q = (b - r->base) >> g_shift;
 }
 static void stamp_page(range_t *r, uintptr_t p) {
-    atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
+    uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
+    uint64_t prev = atomic_load_explicit(&r->gen[p], memory_order_relaxed);
+    dirty_max_up(&r->latest, g);
+    if (r->cmax && dirty_w6_fault() != 4) dirty_max_up(&r->cmax[p >> 6], g);
+    atomic_store(&r->gen[p], g);
+    if (prev == GEN_UNPROT) atomic_fetch_sub_explicit(&r->unprot, 1u, memory_order_release);
     // Publish completion after the generation: a checker may have cached "clean" using the incremented clock before the generation store. Both fault and host-write paths
     // must invalidate that cached clock, as the page stays writable until the next upload protects it again.
     atomic_fetch_add(&g_now, 1);
@@ -144,19 +167,32 @@ static void fault_run(range_t *r, uintptr_t *p, uintptr_t *q) {
     while (e + 1 < np && e - *q < g_frun && atomic_load(&r->state[e + 1]) == PG_PROT) e++;
     *p = s; *q = e;
 }
+static int fault_range(int i, uintptr_t a) {
+    range_t *r = rg(i);
+    if (!live_at(i)) return 0;
+    uintptr_t rb = __atomic_load_n(&r->base, __ATOMIC_RELAXED), re = __atomic_load_n(&r->end, __ATOMIC_RELAXED);
+    if (a < rb || a >= re) return 0;
+    uintptr_t f = (a - rb) >> g_shift, p = f, q = f;
+    if (atomic_load(&r->state[f]) == PG_PROT) {   // (a page this range never protected releases nothing around it)
+        if (g_bmask) block_bounds(r, &p, &q);
+        fault_run(r, &p, &q);
+        release_pages(r, p, q, &g_faults);   // (the faulting page among them, in one mprotect with its run)
+    }
+    return release_page(r, f, &g_faults);   // its state now: NONE (released above or by another thread) claims it; still PROT tries the page alone
+}
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
-    uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
-    for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
-        { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) {
-            uintptr_t f = (a - r->base) >> g_shift, p = f, q = f;
-            if (atomic_load(&r->state[f]) == PG_PROT) {   // (a page this range never protected releases nothing around it)
-                if (g_bmask) block_bounds(r, &p, &q);
-                fault_run(r, &p, &q);
-                release_pages(r, p, q, &g_faults);   // (the faulting page among them, in one mprotect with its run)
-            }
-            ours |= release_page(r, f, &g_faults); } }   // its state now: NONE (released above or by another thread) claims it; still PROT tries the page alone
+    uintptr_t a = (uintptr_t)addr; int ours = 0;
+    if (dirty_fast_on() && a < UINTPTR_MAX) {
+        int slots[DIRTY_RIX_OUT], trusted = 0;
+        int m = dirty_rix_collect(a, a + 1u, a, 0, slots, DIRTY_RIX_OUT, &trusted);
+        for (int j = 0; j < m; j++) ours |= fault_range(slots[j], a);
+        if (trusted) return ours;
+        ours = 0;
+    }
+    int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) ours |= fault_range(i, a);   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
     return ours;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
@@ -182,17 +218,28 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (i <= q && st == PG_BUSY) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
     }
 }
+static void prep_range(int i, uintptr_t a, uintptr_t e) {
+    range_t *r = rg(i);
+    if (!live_at(i)) return;
+    uintptr_t rb = __atomic_load_n(&r->base, __ATOMIC_RELAXED), re = __atomic_load_n(&r->end, __ATOMIC_RELAXED);
+    if (e <= rb || a >= re) return;
+    uintptr_t lo = a > rb ? a : rb, hi = e < re ? e : re;
+    release_pages(r, (lo - rb) >> g_shift, (hi - 1 - rb) >> g_shift, &g_preps);
+}
 static void prep_write(void *addr, size_t len) {
-    uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
-    if (!len) return;
-    for (int i = 0; i < n; i++) {
-        range_t *r = rg(i);
-        if (!live_at(i) || e <= r->base || a >= r->end) continue;
-        uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end;
-        uintptr_t p = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift;
-        if (g_bmask) block_bounds(r, &p, &q);
-        release_pages(r, p, q, &g_preps);
+    uintptr_t a = (uintptr_t)addr;
+    if (!len || len > UINTPTR_MAX - a) return;
+    uintptr_t e = a + len;
+    if (dirty_fast_on()) {
+        int slots[DIRTY_RIX_OUT], trusted = 0;
+        int m = dirty_rix_collect(a, e, a, 0, slots, DIRTY_RIX_OUT, &trusted);
+        if (trusted) {
+            for (int j = 0; j < m; j++) prep_range(slots[j], a, e);
+            return;
+        }
     }
+    int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) prep_range(i, a, e);
 }
 
 // For the crash report (a write fault no hook claimed): every range, live or retired, that covers the address, with the page's state, generation and whether it was ever
@@ -241,29 +288,37 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     { int lv = atomic_fetch_add(&g_live, 1) + 1, pk = atomic_load(&g_live_peak); while (lv > pk && !atomic_compare_exchange_weak(&g_live_peak, &pk, lv)) {} }
     range_t *r = rg(slot);
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
-    size_t np = (end - base) >> g_shift;
+    size_t np = (end - base) >> g_shift, nc = (np + 63u) >> 6;
     _Atomic uint8_t *state = r->state;
-    _Atomic uint64_t *gen = r->gen;
+    _Atomic uint64_t *gen = r->gen, *cmax = r->cmax;
     uint8_t *ever = r->ever;
     if (r->cap < np) {
-        state = calloc(np, 1); gen = calloc(np, sizeof *gen); ever = calloc(np, 1);
-        if (!state || !gen || !ever) die("dirty-page table allocation failed (%zu pages)", np);
+        state = calloc(np, 1); gen = calloc(np, sizeof *gen); cmax = calloc(nc, sizeof *cmax); ever = calloc(np, 1);
+        if (!state || !gen || !cmax || !ever) die("dirty-page table allocation failed (%zu pages)", np);
         // The old array is not freed: the signal handler may still have a very brief stale reader; leak = 9 bytes per page.
         r->cap = np;
     } else {
-        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset(ever, 0, np);
+        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)cmax, 0, nc * sizeof *cmax); memset(ever, 0, np);
     }
-    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->ever = ever; atomic_store(&r->red, 0);
+    __atomic_store_n(&r->base, base, __ATOMIC_RELAXED); __atomic_store_n(&r->end, end, __ATOMIC_RELAXED); __atomic_store_n(&r->mem, (uintptr_t)mem, __ATOMIC_RELAXED);
+    r->state = state; r->gen = gen; r->cmax = cmax; r->ever = ever; atomic_store(&r->red, 0);
+    atomic_store_explicit(&r->latest, 0u, memory_order_relaxed); atomic_store_explicit(&r->unprot, 0u, memory_order_relaxed);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    dirty_rix_insert(slot, base, end);
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
 void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
-    range_t *r = NULL; int n = atomic_load(&g_nr);
-    for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    range_t *r = NULL; int n = atomic_load(&g_nr), rslot = -1;
+    for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) { r = rg(i); rslot = i; }   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
+    if (r) {
+        prep_write((void *)r->base, r->end - r->base);
+        atomic_store_explicit(&r->live, 0, memory_order_release);
+        int left = atomic_fetch_sub(&g_live, 1) - 1;
+        dirty_rix_remove(rslot, left);
+    }
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {
@@ -303,7 +358,7 @@ void nvn_dirty_protect(const void *addr, size_t len) {
                 int rerr = mp(ra, rn, PROT_READ | PROT_WRITE);
                 for (uintptr_t k = run; k < i; k++) {
                     int w = !rerr || !mp(r->base + (k << g_shift), g_pg, PROT_READ | PROT_WRITE);
-                    atomic_store(&r->gen[k], GEN_UNPROT); atomic_store(&r->state[k], w ? PG_NONE : PG_PROT); nstuck += !w;
+                    if (atomic_load_explicit(&r->gen[k], memory_order_relaxed) != GEN_UNPROT) { atomic_fetch_add_explicit(&r->unprot, 1u, memory_order_acq_rel); if (atomic_exchange_explicit(&r->gen[k], GEN_UNPROT, memory_order_acq_rel) == GEN_UNPROT) atomic_fetch_sub_explicit(&r->unprot, 1u, memory_order_release); } atomic_store(&r->state[k], w ? PG_NONE : PG_PROT); nstuck += !w;
                 }
                 atomic_fetch_add(&g_now, 1);
                 if (!nfail++) { fa = ra; fn = rn; ferr = err; }
@@ -365,9 +420,21 @@ uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
     range_t *r = (range_t *)span; uintptr_t a0 = (uintptr_t)addr;   // the kept handle still holds the span (a slot reused by another pool over the same memory is as good): no scan
-    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a0 < r->base || a0 + len > r->end) r = find_span(a0, len);
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || len > UINTPTR_MAX - a0 ||
+        a0 < __atomic_load_n(&r->base, __ATOMIC_RELAXED) || a0 + len > __atomic_load_n(&r->end, __ATOMIC_RELAXED)) r = find_span(a0, len);
     if (!r) return 1;   // When untracked, conservatively treat as dirty: better to upload more than to show stale content
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    if (dirty_fast_on() && !atomic_load_explicit(&r->unprot, memory_order_acquire)) {
+        if (atomic_load_explicit(&r->latest, memory_order_acquire) <= stamp) {
+            atomic_thread_fence(memory_order_acquire);
+            if (!atomic_load_explicit(&r->unprot, memory_order_relaxed)) return 0;
+        }
+        if (r->cmax) {
+            int d = dirty_since_cmax(r->gen, r->cmax, p, q, stamp);
+            atomic_thread_fence(memory_order_acquire);
+            if (!atomic_load_explicit(&r->unprot, memory_order_relaxed)) return d;
+        }
+    }
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
@@ -376,9 +443,27 @@ int nvn_dirty_bounds_since(const void *span, const void *addr, size_t len, uint6
     *lo = 0; *hi = len;
     if (!len) return 0;
     range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
-    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || len > UINTPTR_MAX - a ||
+        a < __atomic_load_n(&r->base, __ATOMIC_RELAXED) || a + len > __atomic_load_n(&r->end, __ATOMIC_RELAXED)) r = find_span(a, len);
     if (!r) return 1;
     uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift, f = UINTPTR_MAX, l = 0;
+    if (dirty_fast_on() && !atomic_load_explicit(&r->unprot, memory_order_acquire)) {
+        if (atomic_load_explicit(&r->latest, memory_order_acquire) <= stamp) {
+            atomic_thread_fence(memory_order_acquire);
+            if (!atomic_load_explicit(&r->unprot, memory_order_relaxed)) return 0;
+        }
+        if (r->cmax) {
+            int hit = dirty_bounds_cmax(r->gen, r->cmax, p, q, stamp, &f, &l);
+            atomic_thread_fence(memory_order_acquire);
+            if (!atomic_load_explicit(&r->unprot, memory_order_relaxed)) {
+                if (!hit) return 0;
+                uintptr_t b0 = r->base + (f << g_shift), b1 = r->base + ((l + 1) << g_shift);
+                *lo = b0 > a ? b0 - a : 0; *hi = b1 - a < len ? b1 - a : len;
+                return 1;
+            }
+            f = UINTPTR_MAX; l = 0;
+        }
+    }
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) { if (f == UINTPTR_MAX) f = i; l = i; }
     if (f == UINTPTR_MAX) return 0;
     uintptr_t b0 = r->base + (f << g_shift), b1 = r->base + ((l + 1) << g_shift);

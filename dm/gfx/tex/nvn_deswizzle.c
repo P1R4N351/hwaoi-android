@@ -6,6 +6,7 @@
 //   block = 1 GOB wide × 2^tileH GOBs high × 2^tileD GOBs deep, ordered y first then z within a block; blocks fill the level in x → y → z row-major order.
 // Level / layer start offsets and the actual block height and block depth of this level come from nvn_tex.c; here we only do intra-level addressing and copying.
 #include "nvn_deswizzle.h"
+#include "nvn_deswizzle_fast.h"
 #include <string.h>
 
 int nvn_gob_switch2;   // see nvn_deswizzle.h
@@ -45,37 +46,58 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
     return 0;
 }
 
+static void move_row_segs(uint8_t *bl_yb, uint8_t *row, uint64_t block, const uint16_t *kox,
+                          uint32_t j0, uint32_t nfull, uint32_t tail, int to_linear) {
+    if (to_linear) {
+        for (uint32_t j = j0; j < nfull; j++) memcpy(row + (j << 4), bl_yb + ((uint64_t)(j >> 2) * block) + kox[j & 3], 16);
+        if (tail) memcpy(row + (nfull << 4), bl_yb + ((uint64_t)(nfull >> 2) * block) + kox[nfull & 3], tail);
+    } else {
+        for (uint32_t j = j0; j < nfull; j++) memcpy(bl_yb + ((uint64_t)(j >> 2) * block) + kox[j & 3], row + (j << 4), 16);
+        if (tail) memcpy(bl_yb + ((uint64_t)(nfull >> 2) * block) + kox[nfull & 3], row + (nfull << 4), tail);
+    }
+}
+
+static void move_gob_strip(uint8_t *bl, uint64_t yb0, uint8_t *zlin, size_t pitch, uint64_t block,
+                           const uint16_t *kox, const uint16_t *koy, uint32_t n_gob_x, uint32_t nfull,
+                           uint32_t tail, int to_linear, int fault) {
+    for (uint32_t gx = 0; gx < n_gob_x; gx++) {
+        uint8_t *gob = bl + yb0 + (uint64_t)gx * block, *glin = zlin + ((size_t)gx << 6);
+        if (nvn_gob_switch2) deswz_gob_sw2(gob, glin, pitch, to_linear);
+        else deswz_gob_x1(gob, glin, pitch, to_linear, fault);
+    }
+    if ((nfull & 3u) || tail) {
+        if (fault == 2) return;
+        uint32_t j0 = n_gob_x << 2;
+        for (uint32_t yy = 0; yy < 8u; yy++)
+            move_row_segs(bl + yb0 + koy[yy], zlin + (size_t)yy * pitch, block, kox, j0, nfull, tail, to_linear);
+    }
+}
+
 static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch, int to_linear, uint32_t y0, uint32_t y1) {
     uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
     if (pitch < row_bytes) return -1;
     bl += base; uint32_t lb = nvn_tex_level_gobs(d, level) * 64;   // the row as laid out (padded in the tiled levels of a sparse texture or a packaged layout with width alignment)
     if (lb < row_bytes) lb = row_bytes;
-    // Hoist nvn_bl_offset's slice and row terms out of the segment loop. The block height and depth are powers of two,
-    // so their division / remainder become shifts and masks. At x = 16*j the block column is j >> 2, and the segment
-    // has one of four positions inside the GOB (x%64 = 0/16/32/48 -> 0/32/256/288); the y part depends only on y%8.
     static const uint16_t kox1[4] = {0, 32, 256, 288};                        // x%16 is always 0 here: segments start at multiples of 16
     static const uint16_t koy1[8] = {0, 16, 64, 80, 128, 144, 192, 208};      // (y%8/2)*64 + (y%2)*16
     static const uint16_t kox2[4] = {0, 64, 256, 320};                        // the Switch 2's order (gob_off): x%32/16 at 64
     static const uint16_t koy2[8] = {0, 16, 32, 48, 128, 144, 160, 176};      // (y%8/4)*128 + (y%4/2)*32 + (y%2)*16
     const uint16_t *kox = nvn_gob_switch2 ? kox2 : kox1, *koy = nvn_gob_switch2 ? koy2 : koy1;
-    uint32_t bh = 1u << th, bd = 1u << td;
+    uint32_t bh = 1u << th, bd = 1u << td, y_end = rows < y1 ? rows : y1;
     uint64_t block = 512ull * bh * bd, gobs_x = (uint64_t)(lb + 63) >> 6, blocks_y = ((uint64_t)rows + 8 * bh - 1) >> (3 + th);
+    uint32_t nfull = row_bytes >> 4, tail = row_bytes & 15, n_gob_x = row_bytes >> 6;
+    int fast = deswz_fast_on() && n_gob_x > 0, fault = deswz_w6_fault();
     for (uint32_t z = 0; z < slices; z++) {
         uint64_t zb = (uint64_t)(z >> td) * gobs_x * blocks_y * block + (uint64_t)(z & (bd - 1)) * bh * 512;
-        for (uint32_t y = y0; y < rows && y < y1; y++) {
-            uint64_t p = (uint64_t)(y >> (3 + th)) * gobs_x * block + (uint64_t)((y & (8 * bh - 1)) >> 3) * 512 + koy[y & 7];
+        for (uint32_t y = y0; y < y_end; y++) {
+            uint64_t yb0 = zb + (uint64_t)(y >> (3 + th)) * gobs_x * block + (uint64_t)((y & (8 * bh - 1)) >> 3) * 512;
             uint8_t *row = lin + ((size_t)z * rows + y) * pitch;
-            uint64_t yb = zb + p;   // the row's segments: block column (j >> 2) at yb + j>>2 times block + kox[j & 3]
-            uint32_t nfull = row_bytes >> 4, tail = row_bytes & 15;
-            // The full 16-byte segments take a constant-size copy (a memcpy of a runtime length is a call per segment);
-            // a row whose byte count is not divisible by 16 has a tail (e.g. R8 or RGB formats at an odd width).
-            if (to_linear) {
-                for (uint32_t j = 0; j < nfull; j++) memcpy(row + (j << 4), bl + yb + ((uint64_t)(j >> 2) * block) + kox[j & 3], 16);
-                if (tail) memcpy(row + (nfull << 4), bl + yb + ((uint64_t)(nfull >> 2) * block) + kox[nfull & 3], tail);
+            if (fast && !(y & 7u) && y + 8u <= y_end) {
+                move_gob_strip(bl, yb0, row, pitch, block, kox, koy, n_gob_x, nfull, tail, to_linear, fault);
+                y += 7u;
             } else {
-                for (uint32_t j = 0; j < nfull; j++) memcpy(bl + yb + ((uint64_t)(j >> 2) * block) + kox[j & 3], row + (j << 4), 16);
-                if (tail) memcpy(bl + yb + ((uint64_t)(nfull >> 2) * block) + kox[nfull & 3], row + (nfull << 4), tail);
+                move_row_segs(bl + yb0 + koy[y & 7], row, block, kox, 0, nfull, tail, to_linear);
             }
         }
     }
@@ -102,3 +124,10 @@ int nvn_deswizzle_bands(const nvn_texdesc *d, unsigned level, uint32_t *band_row
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
     return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0, 0, UINT32_MAX);
 }
+
+#ifdef W6_TEST_HOOKS
+void nvn_deswizzle_w6_set_fast(int on);
+void nvn_deswizzle_w6_set_fast(int on) {
+    atomic_store_explicit(&g_deswz_fast_cached, on ? 1 : -1, memory_order_relaxed);
+}
+#endif
