@@ -19,6 +19,7 @@
 #include "vka_dset_fast.h"
 #include "vka_vin_fast.h"
 #include "vka_walk_fast.h"
+#include "vka_state_fast.h"
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -96,66 +97,81 @@ void vka_dstate_reset(vka_dstate *d) {   // NVN's defaults (nvn_mtl.m state_rese
 static _Atomic uint64_t g_stamp;
 uint64_t vka_stamp(void) { return atomic_fetch_add_explicit(&g_stamp, 1, memory_order_relaxed) + 1; }
 int nvn_dpool_base(const void *pool, int tex);   // hle_nvn.c: where a descriptor pool's IDs start in the host table
+static void vka_state_op_scalar(vka_dstate *d, uint32_t op, const void *a, int fast) {
+    switch (op) {
+    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: {
+        int tex = op == OP_SET_TEX_POOL, b = nvn_dpool_base(((const p_set_pool *)a)->pool, tex);
+        if (tex) { if (!fast || d->b.tex_base != b) { d->b.tex_base = b; d->bind_gen++; } }
+        else if (!fast || d->b.samp_base != b) { d->b.samp_base = b; d->bind_gen++; }
+        break; }
+    case OP_STENCIL: { const p_stencil *b = a; int ch = !fast;
+        for (int f = 0; f < 2; f++) if (b->face & (1 << f)) {
+            uint32_t v = b->which == 0 ? (uint32_t)b->value_mask : b->which == 1 ? (uint32_t)b->mask : (uint32_t)b->ref;
+            uint32_t *dst = b->which == 0 ? &d->st_vmask[f] : b->which == 1 ? &d->st_wmask[f] : &d->st_ref[f];
+            if (*dst != v) { *dst = v; ch = 1; }
+        }
+        if (ch) d->bind_gen++;
+        break; }
+    case OP_POLY_OFFSET: if (!fast || memcmp(&d->po, a, sizeof d->po)) { d->po = *(const p_poly_offset *)a; d->bind_gen++; } break;
+    case OP_DEPTH_RANGE: { const p_depth_range *b = a; float nr[2] = {b->n, b->f};
+        if (!fast || memcmp(d->dr, nr, sizeof nr)) { memcpy(d->dr, nr, sizeof nr); d->bind_gen++; } break; }
+    case OP_DEPTH_CLAMP: { int on = ((const p_depth_clamp *)a)->on;
+        if (!fast || d->depth_clamp != on) { d->depth_clamp = on; d->bind_gen++; } break; }
+    case OP_VP_SWIZZLE: { const p_vp_swizzle *b = a;
+        if (b->first >= 0 && b->first + b->n <= 16 && b->n >= 0 && (!fast || memcmp(d->vp_sw[b->first], b->sw, 4 * (size_t)b->n))) {
+            memcpy(d->vp_sw[b->first], b->sw, 4 * (size_t)b->n); d->bind_gen++;
+        } break; }
+    case OP_BLEND_COLOR: { const float *c = ((const p_blend_color *)a)->rgba;
+        if (!fast || memcmp(d->blend_color, c, 16)) { memcpy(d->blend_color, c, 16); d->bind_gen++; } break; }
+    case OP_ALPHA_REF: { float r = ((const p_alpha_ref *)a)->ref;
+        if (!fast || memcmp(&d->alpha_ref, &r, 4)) { d->alpha_ref = r; d->bind_gen++; } break; }
+    case OP_PUSH_CONST: if (vka_state_apply_push(fast, &d->b, a)) { d->s_push = vka_stamp(); d->bind_gen++; } break;
+    case OP_TF_STATE: { int on = ((const p_tf_state *)a)->what == 0 || ((const p_tf_state *)a)->what == 3;
+        if (!fast || d->tf_on != on) { d->tf_on = on; d->bind_gen++; } break; }
+    case OP_PRIM_RESTART: if (!fast || memcmp(&d->restart, a, sizeof d->restart)) { d->restart = *(const p_prim_restart *)a; d->bind_gen++; } break;
+    case OP_RAST_DISCARD: { int on = ((const p_rast_discard *)a)->on;
+        if (!fast || d->rast_discard != on) { d->rast_discard = on; d->bind_gen++; } break; }
+    default: break;
+    }
+}
+
+static void vka_state_bind_tex(vka_dstate *d, uint32_t op, const void *a, int fast) {
+    p_bind_handles t1; const p_bind_handles *b = bind_rec(op, a, &t1);
+    if (b->n < 0 || b->n > 32) { VRED_ONCE("texture bind record with count %d: overwritten after recording", b->n); if (!fast) d->bind_gen++; return; }
+    uint64_t h[32]; memcpy(h, b->h, 8 * (size_t)b->n);
+    if (b->defer && b->src && b->n) {   // BindTexturesDeferred: the handles as memory holds them now (nvn_mtl.m bh_fresh); placed guest memory read directly, else word by word through the fault-safe read
+        uint32_t w[32];
+        if (vka_addr(b->src, 4u * (uint64_t)b->n, NULL, NULL, NULL)) { memcpy(w, (const void *)(uintptr_t)b->src, 4 * (size_t)b->n); for (int k = 0; k < b->n; k++) h[k] = w[k]; }
+        else if (!plat_mem_read(b->src, w, 4 * (size_t)b->n)) for (int k = 0; k < b->n; k++) h[k] = w[k];
+        else for (int k = 0; k < b->n; k++) if (!plat_mem_read(b->src + 4u * k, &w[k], 4)) h[k] = w[k];
+    }
+    if (vka_state_apply_tex(fast, &d->b, b->stage, b->first, b->n, h)) { d->s_tex[b->stage] = vka_stamp(); d->bind_gen++; }
+}
+
 int vka_state_op(vka_dstate *d, uint32_t op, const void *a) {
     if (!d->inited) vka_dstate_reset(d);
-    if (op != OP_BIND_UBO && op != OP_BIND_UBO_SMALL) { d->bind_gen++; }
+    int fast = vka_state_fast_on();
     switch (op) {
-    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: { int tex = op == OP_SET_TEX_POOL, b = nvn_dpool_base(((const p_set_pool *)a)->pool, tex); if (tex) d->b.tex_base = b; else d->b.samp_base = b; break; }
-    case OP_BIND_PROGRAM: { const p_bind_program *b = a;
-        if (b->stages & 0x20) d->cprog = b->prog;
-        for (int st = 0; st < VKA_NSTAGE; st++) if (st != 5 && (b->stages >> st & 1)) d->bst[st] = b->prog;   // NVN binds per stage (nvn_mtl.m bind_stages); 6 / 7: NVN2's task and mesh
-        break; }
-    case OP_BIND_STATE: {
-        const p_bind_state *b = a; blend_st bs;
-        switch (b->kind) {
-        case 0: memcpy(&bs, b->bytes, sizeof bs); d->blend[bs.target] = bs; break;
-        case 1: memcpy(&d->color, b->bytes, sizeof d->color); break;
-        case 2: memcpy(&d->chmask, b->bytes, sizeof d->chmask); break;
-        case 3: memcpy(&d->ms, b->bytes, sizeof d->ms); break;
-        case 4: memcpy(&d->poly, b->bytes, sizeof d->poly); break;
-        case 5: memcpy(&d->ds, b->bytes, sizeof d->ds); break;
-        }
-        break; }
-    case OP_BIND_VATTR: { const p_bind_vattr *b = a; d->s_vfmt = vka_stamp();
-        // The bind replaces the attribute state, as the Metal backend does (S.nattr = b->n): shader inputs past its count read the zero buffer (vin_build).
-        // Merging kept the attributes past the count from earlier binds, so such an input read another mesh's format and offset from this mesh's stream.
-        if (b->first >= 0 && b->first + b->n <= 16) {
-            if (g_vattr_clear) { memset(d->attr, 0, sizeof d->attr); d->nattr = 0; }
-            memcpy(&d->attr[b->first], b->st, 4 * (size_t)b->n); if (b->first + b->n > d->nattr) d->nattr = b->first + b->n;
-        }
-        break; }
-    case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; d->s_vfmt = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) { memcpy(&d->stream[b->first], b->st, 8 * (size_t)b->n); if (b->first + b->n > d->nstream) d->nstream = b->first + b->n; } break; }
-    case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(op, a, &tmp); d->s_vbuf = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) memcpy(&d->vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
-    case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) { d->ubo_dirty[b->stage] |= 1u << b->index; d->b.ubo[b->stage][b->index] = (vka_range){b->addr, b->size}; if (b->stage == 5) d->s_ubo5 = vka_stamp(); } break; }
-    case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) { d->b.ssbo[b->stage][b->index] = (vka_range){b->addr, b->size}; d->s_ssbo[b->stage] = vka_stamp(); } break; }
-    case OP_BIND_TEX: case OP_BIND_TEX1: { p_bind_handles t1; const p_bind_handles *b = bind_rec(op, a, &t1);
-        if (b->n < 0 || b->n > 32) { VRED_ONCE("texture bind record with count %d: overwritten after recording", b->n); break; }
-        uint64_t h[32]; memcpy(h, b->h, 8 * (size_t)b->n);
-        if (b->defer && b->src && b->n) {   // BindTexturesDeferred: the handles as memory holds them now (nvn_mtl.m bh_fresh); placed guest memory read directly, else word by word through the fault-safe read
-            uint32_t w[32];
-            if (vka_addr(b->src, 4u * (uint64_t)b->n, NULL, NULL, NULL)) { memcpy(w, (const void *)(uintptr_t)b->src, 4 * (size_t)b->n); for (int k = 0; k < b->n; k++) h[k] = w[k]; }
-            else if (!plat_mem_read(b->src, w, 4 * (size_t)b->n)) for (int k = 0; k < b->n; k++) h[k] = w[k];   // one read for the run (they are in the game's heap; profile p2: 3.4 % in process_vm_readv)
-            else for (int k = 0; k < b->n; k++) if (!plat_mem_read(b->src + 4u * k, &w[k], 4)) h[k] = w[k];   // a run across an unreadable page: word by word
-        }
-        if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->first >= 0 && b->first + b->n <= VKA_NTEX) { memcpy(&d->b.tex[b->stage][b->first], h, 8 * (size_t)b->n); d->s_tex[b->stage] = vka_stamp(); }
-        break; }
-    case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->first >= 0 && b->n >= 0 && b->first + b->n <= 128) { memcpy(&d->b.samp[b->stage][b->first], b->h, 8 * (size_t)b->n); d->s_tex[b->stage] = vka_stamp(); } break; }
-    case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->first >= 0 && b->n >= 0 && b->first + b->n <= 32) { memcpy(&d->b.img[b->stage][b->first], b->h, 8 * (size_t)b->n); d->s_tex[b->stage] = vka_stamp(); } break; }
-    case OP_STENCIL: { const p_stencil *b = a;
-        for (int f = 0; f < 2; f++) if (b->face & (1 << f)) { if (b->which == 0) d->st_vmask[f] = (uint32_t)b->value_mask; else if (b->which == 1) d->st_wmask[f] = (uint32_t)b->mask; else d->st_ref[f] = (uint32_t)b->ref; }
-        break; }
-    case OP_POLY_OFFSET: d->po = *(const p_poly_offset *)a; break;
-    case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(d->vp[b->first + i], b->v[i], 16); d->has_vp = 1; break; }
-    case OP_DEPTH_RANGE: { const p_depth_range *b = a; d->dr[0] = b->n; d->dr[1] = b->f; break; }
-    case OP_DEPTH_CLAMP: d->depth_clamp = ((const p_depth_clamp *)a)->on; break;
-    case OP_VP_SWIZZLE: { const p_vp_swizzle *b = a; if (b->first >= 0 && b->first + b->n <= 16) memcpy(d->vp_sw[b->first], b->sw, 4 * (size_t)b->n); break; }
-    case OP_BLEND_COLOR: memcpy(d->blend_color, ((const p_blend_color *)a)->rgba, 16); break;
-    case OP_ALPHA_REF: d->alpha_ref = ((const p_alpha_ref *)a)->ref; break;
-    case OP_PUSH_CONST: { const p_push_const *b = a; if ((uint32_t)b->offset + b->size <= DMSH_PUSH_SIZE) { memcpy(d->b.push[b->compute ? 1 : 0] + b->offset, b->data, b->size); d->s_push = vka_stamp(); } break; }
-    case OP_TF_BIND: break;
-    case OP_TF_STATE: { const p_tf_state *b = a; d->tf_on = b->what == 0 || b->what == 3; break; }
-    case OP_PRIM_RESTART: d->restart = *(const p_prim_restart *)a; break;
-    case OP_RAST_DISCARD: d->rast_discard = ((const p_rast_discard *)a)->on; break;
+    case OP_BIND_PROGRAM: if (vka_state_apply_program(fast, d->bst, &d->cprog, a)) d->bind_gen++; break;
+    case OP_BIND_STATE: if (vka_state_apply_bind_st(fast, a, d->blend, &d->color, &d->chmask, &d->ms, &d->poly, &d->ds)) d->bind_gen++; break;
+    case OP_BIND_VATTR: if (vka_state_apply_vattr(fast, g_vattr_clear, d->attr, &d->nattr, a)) { d->s_vfmt = vka_stamp(); d->bind_gen++; } break;
+    case OP_BIND_VSTREAM: if (vka_state_apply_vstream(fast, d->stream, &d->nstream, a)) { d->s_vfmt = vka_stamp(); d->bind_gen++; } break;
+    case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf t; const p_bind_vbuf *b = vbuf_rec(op, a, &t);
+        if (vka_state_apply_vbuf(fast, d->vbuf, b)) { d->s_vbuf = vka_stamp(); d->bind_gen++; } break; }
+    case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf t; const p_bind_buf *b = bind_buf_rec(op, a, &t);
+        if (vka_state_apply_ubo(fast, &d->b, d->ubo_dirty, b) && b->stage == 5) d->s_ubo5 = vka_stamp(); break; }
+    case OP_BIND_SSBO: { const p_bind_buf *b = a;
+        if (vka_state_apply_ssbo(fast, &d->b, b)) { d->s_ssbo[b->stage] = vka_stamp(); d->bind_gen++; } break; }
+    case OP_BIND_TEX: case OP_BIND_TEX1: vka_state_bind_tex(d, op, a, fast); break;
+    case OP_BIND_SAMP: { const p_bind_handles *b = a;
+        if (vka_state_apply_samp(fast, &d->b, b)) { d->s_tex[b->stage] = vka_stamp(); d->bind_gen++; } break; }
+    case OP_BIND_IMG: { const p_bind_handles *b = a;
+        if (vka_state_apply_img(fast, &d->b, b)) { d->s_tex[b->stage] = vka_stamp(); d->bind_gen++; } break; }
+    case OP_VIEWPORTS: if (vka_state_apply_viewports(fast, d->vp, &d->has_vp, a)) d->bind_gen++; break;
+    case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_STENCIL: case OP_POLY_OFFSET: case OP_DEPTH_RANGE:
+    case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_PUSH_CONST:
+    case OP_TF_STATE: case OP_PRIM_RESTART: case OP_RAST_DISCARD: vka_state_op_scalar(d, op, a, fast); break;
+    case OP_TF_BIND: if (!fast) d->bind_gen++; break;
     default: return 0;
     }
     return 1;

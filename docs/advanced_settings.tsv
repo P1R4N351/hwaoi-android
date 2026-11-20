@@ -728,6 +728,7 @@ DM_VK_SPEC_FOLD	developer	Graphics			text			both
 DM_VK_SPEC_MAPS_PCT	developer	Graphics			text			both							
 DM_VK_SPV_DIR	internal	Diagnostics			text			both						test harness	
 DM_VK_SPV_OVERRIDE	developer	Diagnostics			text			both							
+DM_VK_STATE_FAST	developer	Graphics			text			both							
 DM_VK_STATS	developer	Diagnostics			text			both							
 DM_VK_STORAGE_FIRST_USE	developer	Graphics			text			both							
 DM_VK_STRETCH	developer	Graphics			text			both							
