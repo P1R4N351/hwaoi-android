@@ -31,4 +31,4 @@ anywhere else. Download the APK only from [Releases](https://git.eden-emu.dev/mo
 anywhere else may be modified or malicious. Nobody connected to the project will ask you for money, keys, game files or
 account details. To reach the developer, use [issues](https://git.eden-emu.dev/moceure/BananaNative/issues).
 
-Licence and credits: [README](../../README.md#licence-and-credits).
+Licence and credits: [README](../UPSTREAM-BANANANATIVE.md#licence-and-credits).

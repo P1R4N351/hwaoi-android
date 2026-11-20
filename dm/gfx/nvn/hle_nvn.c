@@ -14,6 +14,7 @@
 #include "nvn_tex.h"
 #include "nvn_dpool.h"
 #include "../vk_android/vka_enc_fast.h"
+#include "nvn_hle_fast.h"
 #include "../tex/nvn_deswizzle.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
@@ -385,6 +386,8 @@ static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o); 
 typedef struct { const pool_t *p; uint64_t gen; } plive;
 static plive *g_pl; static uint32_t g_npl, g_cpl; static uint64_t g_plgen;   // open addressing, g_cpl a power of two; p == (void *)1: a deleted slot; g_npl: used slots, deleted ones included
 static pthread_mutex_t g_pl_mu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_pl_sync g_pl_sync = {0, 1u};
+static _Thread_local nvn_plive_memo4 t_plive_memo;
 static pthread_rwlock_t g_pl_use = PTHREAD_RWLOCK_INITIALIZER;
 void nvn_pool_use(int on) { if (on) pthread_rwlock_rdlock(&g_pl_use); else pthread_rwlock_unlock(&g_pl_use); }   // (never taken twice by one thread: a waiting writer would block the second)
 static uint32_t pl_hash(const pool_t *p) { uint64_t h = (uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull; return (uint32_t)(h >> 32); }
@@ -408,16 +411,24 @@ static void pl_put(const pool_t *p, uint64_t gen) {   // caller holds g_pl_mu
     if (!g_pl[i].p) g_npl++;   // (a deleted slot reused is counted already)
     g_pl[i] = (plive){p, gen};
 }
-void nvn_pool_note(const void *p) { pthread_mutex_lock(&g_pl_mu); pl_put((const pool_t *)p, ++g_plgen); pthread_mutex_unlock(&g_pl_mu); }   // a pool object the host made itself (the frame replayer)
-static void pl_del(const pool_t *p) { pthread_mutex_lock(&g_pl_mu); plive *e = pl_find(p); if (e) { e->p = (const pool_t *)1; e->gen = 0; atomic_fetch_add(&g_plfin, 1); } pthread_mutex_unlock(&g_pl_mu); }   // (the slot stays counted until a grow)
+void nvn_pool_note(const void *p) { pthread_mutex_lock(&g_pl_mu); nvn_pl_wbegin(&g_pl_sync); pl_put((const pool_t *)p, ++g_plgen); nvn_pl_wend(&g_pl_sync); pthread_mutex_unlock(&g_pl_mu); }   // a pool object the host made itself (the frame replayer)
+static void pl_del(const pool_t *p) { pthread_mutex_lock(&g_pl_mu); plive *e = pl_find(p); if (e) { nvn_pl_wbegin(&g_pl_sync); e->p = (const pool_t *)1; e->gen = 0; atomic_fetch_add(&g_plfin, 1); nvn_pl_wend(&g_pl_sync); } pthread_mutex_unlock(&g_pl_mu); }   // (the slot stays counted until a grow)
 // Whether pool is live: its Initialize serial (0: not live, or no pool), and under the table's lock its flags and whether it reads through a page table (nvn_sparse_pool)
 uint64_t nvn_pool_live(const void *pool, unsigned *flags, int *sparse) {
     if (flags) *flags = 0;
     if (sparse) *sparse = 0;
     if (!pool) return 0;
-    pthread_mutex_lock(&g_pl_mu); plive *e = pl_find((const pool_t *)pool); uint64_t g = e ? e->gen : 0;
-    if (g) { const pool_t *o = (const pool_t *)pool; if (flags) *flags = (unsigned)o->flags; if (sparse) *sparse = o->vp != NULL; }
-    pthread_mutex_unlock(&g_pl_mu); return g;
+    int fast = nvn_hle_fast_on();
+    uint64_t g = 0;
+    if (fast && nvn_plive_fast_get(&t_plive_memo, &g_pl_sync, (uintptr_t)pool, flags, sparse, &g)) return g;
+    uint32_t w0 = 0; uint64_t e0 = 0;
+    if (fast) nvn_pl_snap(&g_pl_sync, &w0, &e0);
+    unsigned fl = 0; int sp = 0;
+    pthread_mutex_lock(&g_pl_mu); plive *e = pl_find((const pool_t *)pool); g = e ? e->gen : 0;
+    if (g) { const pool_t *o = (const pool_t *)pool; fl = (unsigned)o->flags; sp = o->vp != NULL; if (flags) *flags = fl; if (sparse) *sparse = sp; }
+    pthread_mutex_unlock(&g_pl_mu);
+    if (fast && g) nvn_plive_fast_put(&t_plive_memo, &g_pl_sync, w0, e0, (uintptr_t)pool, g, fl, sp);
+    return g;
 }
 // ---------- Shader-code pools (DM_VK_PLACE_SHADER_POOLS, DM_VK_SHPOOL_LOG) ----------
 // From Anka Native (EddizEge's MIT fork, v0.2.2; android/NOTICE.md), with its default changed: off (0) on Android for every game, not a profile key.
@@ -454,6 +465,8 @@ typedef struct { const pool_t *p; uint64_t gen, size, nuse, buse; uint32_t flags
 static _Atomic uint64_t g_shp_lo[SHP_MAX], g_shp_hi[SHP_MAX];   // sorted by lo
 static shp_info g_shp[SHP_MAX];                                  // (under g_shp_mu)
 static _Atomic int g_shp_n; static _Atomic uint32_t g_shp_seq; static pthread_mutex_t g_shp_mu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_shp_summary g_shp_sum = {UINT64_MAX, 0, {0, 0, 0, 0}};
+static _Thread_local nvn_shp_neg_cache t_shp_neg;
 static uint64_t g_shk_n[SHK_N], g_shk_b[SHK_N]; static int g_shp_over;   // (under g_shp_mu)
 static int g_shp_place = -1, g_shp_log;   // DM_VK_PLACE_SHADER_POOLS, DM_VK_SHPOOL_LOG
 static int shp_on(void) {
@@ -475,6 +488,7 @@ static int shp_defer(void) { return shp_on() && !g_shp_place; }
 int nvn_shader_pools_deferred(void) { return shp_defer(); }   // vka_mem.c fb_kinds: shader-code pools stay unplaced for their address (the file-backed shader kind pays off)
 static int shp_lower(uint64_t a, int n) { int L = 0, H = n; while (L < H) { int m = (L + H) / 2; if (atomic_load_explicit(&g_shp_lo[m], memory_order_relaxed) < a) L = m + 1; else H = m; } return L; }   // first lo >= a
 static void shp_wbegin(void) { atomic_store_explicit(&g_shp_seq, atomic_load_explicit(&g_shp_seq, memory_order_relaxed) + 1, memory_order_relaxed); atomic_thread_fence(memory_order_release); }
+static void shp_sync_summary(void) { nvn_shp_summary_rebuild(&g_shp_sum, g_shp_lo, g_shp_hi, atomic_load_explicit(&g_shp_n, memory_order_relaxed)); }
 static void shp_wend(void) { atomic_store_explicit(&g_shp_seq, atomic_load_explicit(&g_shp_seq, memory_order_relaxed) + 1, memory_order_release); }
 static void shp_remove(int i) {   // caller holds g_shp_mu, inside shp_wbegin / shp_wend
     int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed);
@@ -486,13 +500,13 @@ static void shp_add(const pool_t *o, uint64_t gen) {   // nvnMemoryPoolInitializ
     pthread_mutex_lock(&g_shp_mu); shp_wbegin();
     int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed);
     for (int i = 0; i < n; i++) if (g_shp[i].p == o) { shp_remove(i); n--; break; }   // initialized again without a Finalize
-    if (n == SHP_MAX) { shp_wend(); int first = !g_shp_over++; pthread_mutex_unlock(&g_shp_mu);
+    if (n == SHP_MAX) { shp_sync_summary(); shp_wend(); int first = !g_shp_over++; pthread_mutex_unlock(&g_shp_mu);
         if (first) LOG("[RED] [nvn] shader-code pools: more than %d live: pool %p+%#llx and later ones are placed as before (not in the table)", SHP_MAX, (const void *)o->mem, (unsigned long long)o->size);
         return; }
     uint64_t lo = (uint64_t)(uintptr_t)o->mem; int i = shp_lower(lo, n);
     // (shp_find needs pools that do not overlap: one over a pool in the table stays out of it and is placed as before)
     if ((i > 0 && atomic_load_explicit(&g_shp_hi[i - 1], memory_order_relaxed) > lo) || (i < n && atomic_load_explicit(&g_shp_lo[i], memory_order_relaxed) < lo + o->size)) {
-        shp_wend(); static int told; int first = !told++; pthread_mutex_unlock(&g_shp_mu);
+        shp_sync_summary(); shp_wend(); static int told; int first = !told++; pthread_mutex_unlock(&g_shp_mu);
         if (first) LOG("[nvn] shader-code pools: pool %p+%#llx overlaps one in the table: it and later such pools are placed as before (not in the table)", (const void *)o->mem, (unsigned long long)o->size);
         return; }
     for (int k = n; k > i; k--) { atomic_store_explicit(&g_shp_lo[k], atomic_load_explicit(&g_shp_lo[k - 1], memory_order_relaxed), memory_order_relaxed);
@@ -500,25 +514,31 @@ static void shp_add(const pool_t *o, uint64_t gen) {   // nvnMemoryPoolInitializ
     atomic_store_explicit(&g_shp_lo[i], lo, memory_order_relaxed); atomic_store_explicit(&g_shp_hi[i], lo + o->size, memory_order_relaxed);
     g_shp[i] = (shp_info){o, gen, o->size, 0, 0, (uint32_t)o->flags, 0, 0};
     atomic_store_explicit(&g_shp_n, n + 1, memory_order_relaxed);
-    shp_wend(); pthread_mutex_unlock(&g_shp_mu);
+    shp_sync_summary(); shp_wend(); pthread_mutex_unlock(&g_shp_mu);
 }
 static void shp_del(const pool_t *o) {   // nvnMemoryPoolFinalize
     if (!atomic_load_explicit(&g_shp_n, memory_order_relaxed)) return;
     pthread_mutex_lock(&g_shp_mu);
     int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed);
-    for (int i = 0; i < n; i++) if (g_shp[i].p == o) { shp_wbegin(); shp_remove(i); shp_wend(); break; }
+    for (int i = 0; i < n; i++) if (g_shp[i].p == o) { shp_wbegin(); shp_remove(i); shp_sync_summary(); shp_wend(); break; }
     pthread_mutex_unlock(&g_shp_mu);
 }
 // The shader-code pool over [a, a+n) (n 0: one byte), its range in *lo, *hi: 1 = one. Without a lock: the sequence count says whether a writer changed the table meanwhile
 static int shp_find(uint64_t a, uint64_t n, uint64_t *lo, uint64_t *hi) {
+    if (nvn_hle_fast_on() && nvn_shp_fast_out(&g_shp_sum, &t_shp_neg, &g_shp_seq, a, n)) return 0;
     uint64_t e = a + (n ? n : 1); if (e < a) e = UINT64_MAX;
     for (;;) {
         uint32_t s = atomic_load_explicit(&g_shp_seq, memory_order_acquire);
         if (s & 1) { sched_yield(); continue; }
-        int c = atomic_load_explicit(&g_shp_n, memory_order_relaxed), i = shp_lower(e, c) - 1, hit = 0; uint64_t l = 0, h = 0;   // the last pool starting before e (pools do not overlap)
+        int c = atomic_load_explicit(&g_shp_n, memory_order_relaxed), idx = shp_lower(e, c), i = idx - 1, hit = 0; uint64_t l = 0, h = 0;   // the last pool starting before e (pools do not overlap)
         if (i >= 0) { l = atomic_load_explicit(&g_shp_lo[i], memory_order_relaxed); h = atomic_load_explicit(&g_shp_hi[i], memory_order_relaxed); hit = h > a; }
+        uint64_t next_lo = (idx >= 0 && idx < c && idx < SHP_MAX) ? atomic_load_explicit(&g_shp_lo[idx], memory_order_relaxed) : UINT64_MAX;
         atomic_thread_fence(memory_order_acquire);
-        if (atomic_load_explicit(&g_shp_seq, memory_order_relaxed) == s) { if (hit) { *lo = l; *hi = h; } return hit; }
+        if (atomic_load_explicit(&g_shp_seq, memory_order_relaxed) == s) {
+            if (hit) { *lo = l; *hi = h; }
+            else if (nvn_hle_fast_on()) nvn_shp_neg_put(&t_shp_neg, s, i >= 0 ? h : 0u, next_lo, a);
+            return hit;
+        }
     }
 }
 // Whether [a, a+n) lies in one live shader-code pool (the host reads program code there on the CPU: keys_hash, vka_shader.c shdump)
@@ -554,7 +574,16 @@ static void shp_bind_slow(int k, uint64_t a, uint64_t n) {
     uint64_t pa, pn;
     if (shp_use(k, a, n, &pa, &pn) == 2 && !g_shp_place) mtl_pool_need((const void *)(uintptr_t)pa, pn, "a command naming an address in a shader-code pool");
 }
-static inline void shp_bind(int k, uint64_t a, uint64_t n) { if (a && __builtin_expect(atomic_load_explicit(&g_shp_n, memory_order_relaxed) != 0, 0)) shp_bind_slow(k, a, n); }
+static inline void shp_bind(int k, uint64_t a, uint64_t n) {
+    if (!a) return;
+    if (nvn_hle_fast_on()) {
+        if (!atomic_load_explicit(&g_shp_n, memory_order_relaxed)) return;
+        if (nvn_shp_fast_out(&g_shp_sum, &t_shp_neg, &g_shp_seq, a, n)) return;
+        shp_bind_slow(k, a, n);
+        return;
+    }
+    if (__builtin_expect(atomic_load_explicit(&g_shp_n, memory_order_relaxed) != 0, 0)) shp_bind_slow(k, a, n);
+}
 static void shp_report(uint64_t presents) {
     if (!(presents == 60 || presents == 300 || (presents && presents % 1800 == 0))) return;
     { char fb[420]; if (dm_gfx_fileback_line(fb, sizeof fb)) LOG("[nvn] file-backed pools at present %llu: %s", (unsigned long long)presents, fb); }   // (DM_MEM_FILEBACK; the per-pool lines stop at 8, then every 64th)
@@ -576,7 +605,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     pthread_mutex_lock(&g_pl_mu);   // (a pool initialized again without a Finalize: readers see its new fields only with its new serial)
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
-    pl_put(o, ++g_plgen); uint64_t gen = g_plgen; pthread_mutex_unlock(&g_pl_mu);
+    nvn_pl_wbegin(&g_pl_sync); pl_put(o, ++g_plgen); nvn_pl_wend(&g_pl_sync); uint64_t gen = g_plgen; pthread_mutex_unlock(&g_pl_mu);
     if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (o->flags & NVN_MEMORY_POOL_FLAGS_SHADER_CODE) && shp_on()) shp_add(o, gen);   // (Shader-code pools)
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
     else if (o->mem) {
@@ -1293,6 +1322,18 @@ uint64_t dm_nvn_frame_count(void);
 typedef struct { uint8_t *mem; size_t n; uint64_t frame; int busy; uintptr_t org_lo, org_hi; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
 static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes;
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_hostseg_summary g_hostseg_sum = {0, 0, UINTPTR_MAX, 0, {0, 0, 0, 0}};
+static void hostseg_sync_summary(void) {
+    uint32_t busy = 0; uintptr_t min_lo = UINTPTR_MAX, max_hi = 0; uint64_t w[4] = {0, 0, 0, 0};
+    for (int i = 0; g_hostseg && i < g_nhostseg; i++) {
+        if (!g_hostseg[i].busy || g_hostseg[i].org_hi <= g_hostseg[i].org_lo) continue;
+        busy++;
+        if (g_hostseg[i].org_lo < min_lo) min_lo = g_hostseg[i].org_lo;
+        if (g_hostseg[i].org_hi > max_hi) max_hi = g_hostseg[i].org_hi;
+        nvn_hostseg_mark_chunks(w, g_hostseg[i].org_lo, g_hostseg[i].org_hi);
+    }
+    nvn_hostseg_summary_publish(&g_hostseg_sum, busy, min_lo, max_hi, w);
+}
 static size_t hostseg_size(const cmd_t *o, int empty_pool, size_t want) {
     if (empty_pool) return want && want <= HOSTSEG_SMALL && !o->recording ? HOSTSEG_SMALL : HOSTSEG_SZ;
     return want + 16 > HOSTSEG_SZ ? (want + 16 + 0xfff) & ~(size_t)0xfff : HOSTSEG_SZ;   // 16: room for the next JUMP (want holds OP_RESERVE already, this is slack for the alignment)
@@ -1311,6 +1352,7 @@ static uint8_t *hostseg_take(const cmd_t *o, size_t n) {
         if (g_nhostseg == g_caphostseg) { g_caphostseg = g_caphostseg ? g_caphostseg * 2 : 64; g_hostseg = realloc(g_hostseg, sizeof *g_hostseg * (size_t)g_caphostseg); }
         g_hostseg[g_nhostseg++] = (hostseg_t){ m, n, f, 1, lo, hi }; g_hostseg_bytes += n;
     }
+    if (m) hostseg_sync_summary();
     unsigned t = ++total; int ns = g_nhostseg; uint64_t bytes = g_hostseg_bytes;
     pthread_mutex_unlock(&g_hostseg_mu);
     if (!m) die("NVN command memory: the game's pool is empty and host-lent segments reached %u MB without being reclaimed by the game's blocks", HOSTSEG_CAP >> 20);
@@ -1319,8 +1361,12 @@ static uint8_t *hostseg_take(const cmd_t *o, size_t n) {
 }
 // The game gives out [lo, hi): segments whose recording's guest bytes overlap it are dead, reclaim them
 static void hostseg_release(uintptr_t lo, uintptr_t hi) {
+    if (hi <= lo) return;
+    if (nvn_hle_fast_on() && !nvn_hostseg_may_overlap(&g_hostseg_sum, lo, hi)) return;
     pthread_mutex_lock(&g_hostseg_mu);
-    for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) g_hostseg[i].busy = 0;
+    int changed = 0;
+    for (int i = 0; g_hostseg && i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) { g_hostseg[i].busy = 0; changed = 1; }
+    if (changed) hostseg_sync_summary();
     pthread_mutex_unlock(&g_hostseg_mu);
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
@@ -1531,7 +1577,7 @@ NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
     cmd_t *o = CB(c);
     if (vka_enc_fast_on() && n > 1 && n <= 16 && (unsigned)st < 6u && first >= 0 && first + n <= 16 &&
-        !cs_on() && !atomic_load_explicit(&g_shp_n, memory_order_relaxed) && o->recording == 1 && o->cur &&
+        !cs_on() && (!atomic_load_explicit(&g_shp_n, memory_order_relaxed) || nvn_hle_fast_on()) && o->recording == 1 && o->cur &&
         o->end >= o->cur && (size_t)(o->end - o->cur) >= (size_t)n * 24u + OP_RESERVE) {
         int all_small = 1; uint64_t pairs[32];
         for (int i = 0; i < n; i++) {
@@ -1539,6 +1585,9 @@ NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStag
             pairs[2 * i] = rg[i].address; pairs[2 * i + 1] = rg[i].size;
         }
         if (all_small) {
+            if (atomic_load_explicit(&g_shp_n, memory_order_relaxed)) {
+                for (int i = 0; i < n; i++) shp_bind(SHK_UBO, pairs[2 * i], pairs[2 * i + 1]);
+            }
             size_t tot = (size_t)n * 24u;
             vka_pack_ubo_small_batch(o->cur, OP_BIND_UBO_SMALL, (uint16_t)st, (uint16_t)first, n, pairs);
             o->cur += tot; o->used += tot; return;
@@ -1562,10 +1611,13 @@ NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
     cmd_t *o = CB(c);
     if (vka_enc_fast_on() && n > 1 && n <= 16 && first >= 0 && first + n <= 16 &&
-        !cs_on() && !atomic_load_explicit(&g_shp_n, memory_order_relaxed) && o->recording == 1 && o->cur &&
+        !cs_on() && (!atomic_load_explicit(&g_shp_n, memory_order_relaxed) || nvn_hle_fast_on()) && o->recording == 1 && o->cur &&
         o->end >= o->cur && (size_t)(o->end - o->cur) >= (size_t)n * 32u + OP_RESERVE) {
         uint64_t pairs[32];
         for (int i = 0; i < n; i++) { pairs[2 * i] = rg[i].address; pairs[2 * i + 1] = rg[i].size; }
+        if (atomic_load_explicit(&g_shp_n, memory_order_relaxed)) {
+            for (int i = 0; i < n; i++) shp_bind(SHK_SSBO, pairs[2 * i], pairs[2 * i + 1]);
+        }
         size_t tot = (size_t)n * 32u;
         vka_pack_ssbo_batch(o->cur, OP_BIND_SSBO, st, first, n, pairs);
         o->cur += tot; o->used += tot; return;
@@ -2743,7 +2795,7 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     pthread_mutex_lock(&g_vp_mu);
     if (g_nvp == g_cvp && !(g_vp = realloc(g_vp, (g_cvp = g_cvp ? 2 * g_cvp : 64) * sizeof *g_vp))) die("sparse pool table allocation failed");
     int at = g_nvp; while (at > 0 && g_vp[at - 1]->base > v->base) at--;   // (kept sorted by base: vpool_at's binary search)
-    memmove(&g_vp[at + 1], &g_vp[at], (size_t)(g_nvp - at) * sizeof *g_vp); g_vp[at] = v; g_nvp++; o->vp = v;
+    memmove(&g_vp[at + 1], &g_vp[at], (size_t)(g_nvp - at) * sizeof *g_vp); g_vp[at] = v; g_nvp++; nvn_pl_wbegin(&g_pl_sync); o->vp = v; nvn_pl_wend(&g_pl_sync);
     o->vmode = o->size > DM_GAME_APP_POOL ? 2 : 0;
     pthread_mutex_unlock(&g_vp_mu);
     if (o->vmode == 2) LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): sparse, own address range %p+%#llx, physical pages are remapped into it", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len);
@@ -2755,7 +2807,7 @@ static void vpool_drop(pool_t *o) {   // caller holds g_vp_mu
     munmap(v->base, v->len);
     for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
     for (int i = 0; i < g_nvp; i++) if (g_vp[i] == v) { memmove(&g_vp[i], &g_vp[i + 1], (size_t)(g_nvp - 1 - i) * sizeof *g_vp); g_nvp--; break; }
-    free(v->pt); free(v); o->vp = NULL;
+    free(v->pt); free(v); nvn_pl_wbegin(&g_pl_sync); o->vp = NULL; nvn_pl_wend(&g_pl_sync);
 }
 static void vpool_release(pool_t *o) { pthread_mutex_lock(&g_vp_mu); vpool_drop(o); pthread_mutex_unlock(&g_vp_mu); }
 // Mapped runs of a sparse pool: [lo, hi) sorted, disjoint, adjacent runs merged. Caller holds g_vp_mu

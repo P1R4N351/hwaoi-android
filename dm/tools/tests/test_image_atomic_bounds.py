@@ -108,7 +108,7 @@ def check_coordinate_guard(ops, expected):
     defs, blocks, predecessors, branches, pointers = {}, {}, {}, [], []
     current = None
     for op, args in ops:
-        if op in (43, 80, 124, 61, 104, 176, 155, 60): defs[args[1]] = (op, args)
+        if op in (43, 80, 124, 61, 104, 176, 155, 60, 128, 169): defs[args[1]] = (op, args)
         if op == 248:
             current = args[0]; blocks[current] = []; predecessors.setdefault(current, set())
         if current is not None: blocks[current].append((op, args))
@@ -121,7 +121,11 @@ def check_coordinate_guard(ops, expected):
     pointer_block, pointer = pointers[0]
     coord_id = pointer[3]
     op, coord = defs[coord_id]
-    if len(expected) == 1:  # Native texture-buffer indexing keeps a scalar coordinate.
+    if len(expected) == 1:  # Native texture-buffer indexing keeps a scalar coordinate (or biased OpSelect).
+        if op == 124:
+            op, sel = defs[coord[2]]
+            assert op == 169 and defs[sel[3]][0] == 124 and defs[sel[4]][0] == 128 and defs[sel[4]][1][2] == sel[3]
+            op, coord = defs[defs[sel[3]][1][2]]
         assert op == 43 and coord[2] == (expected[0] & 0xffffffff)
     else:
         assert op == 80
@@ -377,8 +381,9 @@ class Compiler(unittest.TestCase):
             for reduction in (False, True):
                 for size in range(8):
                     key = ('sured' if reduction else 'suatom') + '_size_' + str(size)
+                    discard = not (size == 2 and not reduction)
                     code = work / (key + '.bin')
-                    code.write_bytes(synthetic_shader(0, 0, reduction=reduction, size=size))
+                    code.write_bytes(synthetic_shader(0, 0, discard=discard, reduction=reduction, size=size))
                     jp = work / 'jobs.json'
                     jp.write_text(json.dumps([dict(key=key, stage='cs', code=str(code),
                         img={'0': dict(type='2darray', fmt='R32Uint')}, local=[1, 1, 1], debug=True)]))
@@ -390,7 +395,11 @@ class Compiler(unittest.TestCase):
                         msl = work / (key + '.metal')
                         cross(spv, msl)
                         self.compile_metal(msl, work, key)
-                    else:  # U64, S64, descriptor-sized64, float and half2.
+                    elif size == 2 and not reduction:  # Non-discarding U64 rejects cleanly.
+                        self.assertNotEqual(result.returncode, 0, key)
+                        self.assertIn('Metal 64-bit image atomics', result.stderr)
+                        self.assertFalse(spv.exists())
+                    else:  # U64 (Sured), S64, descriptor-sized64, float and half2.
                         self.assertNotEqual(result.returncode, 0, key)
                         self.assertIn('require a 32-bit integer source size', result.stderr)
                         self.assertFalse(spv.exists())

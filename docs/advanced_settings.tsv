@@ -224,6 +224,7 @@ DM_NVN_GEO_MESH	developer	Graphics			text			both
 DM_NVN_GPUPROF	internal	Diagnostics			text			both						Mac or iOS only	
 DM_NVN_GPU_TS	advanced	Performance	GPU timing		toggle			game		Game settings > GPU timing					
 DM_NVN_HILITE	developer	Diagnostics			text			both							
+DM_NVN_HLE_FAST	developer	Diagnostics			text			both							
 DM_NVN_INDLOG	developer	Diagnostics			text			both							
 DM_NVN_IXCLOG	developer	Diagnostics			text			both							
 DM_NVN_KEYDUMP	developer	Diagnostics			text			both							

@@ -47,10 +47,10 @@ t_transform_feedback: t_transform_feedback.m $(MTL_T_DEP)
 .PHONY: check_t_transform_feedback
 check_t_transform_feedback: t_transform_feedback
 	DM_TEST_TRANSFORM_FEEDBACK=$(CURDIR)/t_transform_feedback MTL_DEBUG_LAYER=1 python3 -m unittest test_transform_feedback.py
-t_gfx_suspend: t_gfx_suspend.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c $(GFX) $(GFX_H)
-	clang $(CFLAGS) -fobjc-arc -o $@ t_gfx_suspend.c ../../host/crash.c ../../host/hle_bigstack.c $(GFX) $(FW)
-t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c $(GFX) $(GFX_H)
-	clang $(CFLAGS) -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c $(GFX) $(FW)
+t_gfx_suspend: t_gfx_suspend.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gfx_suspend.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
+t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
@@ -104,7 +104,7 @@ t_shader_dset_w8: t_shader_dset_w8.c ../vk_android/vka_shader_fast.h ../vk_andro
 t_vin_fast_w9: t_vin_fast_w9.c ../vk_android/vka_vin_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW9_TEST_HOOKS -o $@ t_vin_fast_w9.c -lpthread
 t_walk_fast_w10: t_walk_fast_w10.c ../vk_android/vka_walk_fast.h ../vk_android/vka_bind.c ../vk_android/vka_bind.h
-	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW10_TEST_HOOKS -o $@ t_walk_fast_w10.c ../vk_android/vka_bind.c -lpthread
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW10_TEST_HOOKS -I../vk_android -o $@ t_walk_fast_w10.c ../vk_android/vka_bind.c -lpthread
 t_state_fast_w11: t_state_fast_w11.c ../vk_android/vka_state_fast.h ../nvn/nvn_hmap.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW11_TEST_HOOKS -I../nvn/include -o $@ t_state_fast_w11.c -lpthread
 t_dyn_fast_w12: t_dyn_fast_w12.c ../vk_android/vka_dyn_fast.h
@@ -121,6 +121,8 @@ t_scr_fast_w17: t_scr_fast_w17.c ../vk_android/vka_scr_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW17_TEST_HOOKS -o $@ t_scr_fast_w17.c -lpthread
 t_view_fast_w18: t_view_fast_w18.c ../vk_android/vka_view_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW18_TEST_HOOKS -o $@ t_view_fast_w18.c -lpthread
+t_hle_fast_w19: t_hle_fast_w19.c ../nvn/nvn_hle_fast.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW19_TEST_HOOKS -o $@ t_hle_fast_w19.c -lpthread
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thermal: t_thermal.c $(MTL_T_DEP)
