@@ -15,6 +15,8 @@
 #include <time.h>
 #include <math.h>
 #include "motion_fusion.h"
+#define HID_FAST_MOTION 1
+#include "hid_fast.h"
 #include "pad_join.h"
 
 enum { NPAD_NO1 = 0, NPAD_HANDHELD = 0x20 };
@@ -653,7 +655,10 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Every history entry is the newest sample, numbered by time. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
 // DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_SENS scales the phone's rotation rates (a controller's are real turns) and DM_MOTION_DEADZONE (degrees / s) zeroes the small ones (motion_shape); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
-typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
+typedef struct { pthread_mutex_t mu; motion_state st; _Atomic uint64_t last_ns; uint64_t received_ns, logged; } live_motion;
+static _Atomic uint32_t g_motion_active_mask;
+static hid_fast_motion_slot g_motion_fast[HID_FAST_MOTION_SLOTS];
+static int motion_slot_idx(int src, int p) { return src == 1 ? DM_PLAYERS * 2 : src == 2 ? DM_PLAYERS + p : p; }
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_phone_motion = {.mu = PTHREAD_MUTEX_INITIALIZER};
@@ -678,9 +683,11 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
     uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
     if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
-    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; }
-    if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
-    float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
+    int idx = motion_slot_idx(source, p);
+    uint64_t prev_ns = atomic_load_explicit(&m->last_ns, memory_order_relaxed);
+    if (!prev_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); prev_ns = 0; atomic_store_explicit(&m->last_ns, 0, memory_order_release); hid_fast_motion_clear_slot(&g_motion_fast[idx]); }
+    if (prev_ns && t <= prev_ns) { pthread_mutex_unlock(&m->mu); return; }
+    float dt = prev_ns && t > prev_ns ? (float)((double)(t - prev_ns) / 1e9) : 0;
     float rs[3] = {rot[0], rot[1], rot[2]};
     motion_shape(rs, source == 1 ? atomic_load(&g_motion_sens) : 1, g_motion_dz >= 0 ? g_motion_dz : source == 1 ? 0.5f * (float)M_PI / 180 : 0);
     motion_update(&m->st, source ? &identity : &g_motion_map, acc, rs, dt, g_motion_gain);
@@ -689,42 +696,86 @@ static void motion_set(int p, const float acc[3], const float rot[3], int source
         LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
             source == 1 ? "phone" : source == 2 ? "controller HID" : "controller", m->st.acc[0], m->st.acc[1], m->st.acc[2], m->st.gyro[0], m->st.gyro[1], m->st.gyro[2]);
     }
-    m->last_ns = t; m->received_ns = now;
+    atomic_store_explicit(&m->last_ns, t, memory_order_release); m->received_ns = now;
+    hid_fast_motion_write(&g_motion_fast[idx], &m->st, t, now);
+    atomic_fetch_or_explicit(&g_motion_active_mask, 1u << idx, memory_order_release);
     pthread_mutex_unlock(&m->mu);
 }
 void dm_motion_sens(float f) { pthread_once(&g_motion_once, motion_env); if (f > 0) atomic_store(&g_motion_sens, f); }   // live, from the in-game panel (after the env's value)
 void dm_motion_set(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 0, 0); }
 void dm_motion_set_switch(int p, const float acc[3], const float rot[3]) { motion_set(p, acc, rot, 1, 0); }
 void dm_motion_set_hid(int p, const float acc[3], const float rot[3], uint64_t t) { if (t) motion_set(p, acc, rot, 2, t); }
-void dm_motion_clear(int p) {
-    if (p < 0 || p >= DM_PLAYERS) return;
-    pthread_mutex_lock(&g_motion[p].mu); g_motion[p].last_ns = 0; pthread_mutex_unlock(&g_motion[p].mu);
-}
-void dm_motion_clear_hid(int p) {
-    if (p < 0 || p >= DM_PLAYERS) return;
-    pthread_mutex_lock(&g_hid_motion[p].mu); g_hid_motion[p].last_ns = 0; pthread_mutex_unlock(&g_hid_motion[p].mu);
-}
-static uint64_t motion_copy(live_motion *m, motion_state *out) {   // copies a source while it is fresh; returns its timestamp
-    uint64_t t;
+static void motion_clear_slot(live_motion *m, int idx) {
     pthread_mutex_lock(&m->mu);
-    t = m->last_ns && now_ns() - m->received_ns <= MOTION_STALE_NS ? m->last_ns : 0;
+    atomic_store_explicit(&m->last_ns, 0, memory_order_release);
+    if (dm_hid_w23_fault() != 1) {
+        hid_fast_motion_clear_slot(&g_motion_fast[idx]);
+        atomic_fetch_and_explicit(&g_motion_active_mask, ~(1u << idx), memory_order_release);
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+void dm_motion_clear(int p) { if (p >= 0 && p < DM_PLAYERS) motion_clear_slot(&g_motion[p], p); }
+void dm_motion_clear_hid(int p) { if (p >= 0 && p < DM_PLAYERS) motion_clear_slot(&g_hid_motion[p], DM_PLAYERS + p); }
+static uint64_t motion_copy_slot(live_motion *m, int idx, motion_state *out) {   // copies a source while it is fresh; returns its timestamp
+    uint64_t t, now = now_ns();
+    pthread_mutex_lock(&m->mu);
+    uint64_t cur = atomic_load_explicit(&m->last_ns, memory_order_relaxed);
+    t = cur && (m->received_ns > now || now - m->received_ns <= MOTION_STALE_NS) ? cur : 0;
     if (t) *out = m->st;
+    else if (idx >= 0 && cur && now > m->received_ns && now - m->received_ns > MOTION_STALE_NS && dm_hid_w23_fault() != 1) {
+        atomic_store_explicit(&m->last_ns, 0, memory_order_release);
+        hid_fast_motion_clear_slot(&g_motion_fast[idx]);
+        atomic_fetch_and_explicit(&g_motion_active_mask, ~(1u << idx), memory_order_release);
+    }
     pthread_mutex_unlock(&m->mu);
     return t;
+}
+static uint64_t motion_fast_slot(live_motion *m, int idx, uint64_t now, uint32_t act, motion_state *out) {
+    if (!(act >> idx & 1u)) return 0;
+    if (!atomic_load_explicit(&m->last_ns, memory_order_acquire)) {
+        if (dm_hid_w23_fault() != 1) {
+            pthread_mutex_lock(&m->mu);
+            if (!atomic_load_explicit(&m->last_ns, memory_order_relaxed)) {
+                hid_fast_motion_clear_slot(&g_motion_fast[idx]);
+                atomic_fetch_and_explicit(&g_motion_active_mask, ~(1u << idx), memory_order_release);
+            }
+            pthread_mutex_unlock(&m->mu);
+        }
+        return 0;
+    }
+    uint64_t ts = 0; int rc = hid_fast_motion_read(&g_motion_fast[idx], now, MOTION_STALE_NS, out, &ts);
+    if (rc > 0) return ts;
+    return motion_copy_slot(m, idx, out);
+}
+static int motion_live_fast(int p, motion_state *out) {
+    uint32_t act = atomic_load_explicit(&g_motion_active_mask, memory_order_acquire);
+    if (!p && g_phone_mode > 0) return (act & (1u << 16)) && motion_fast_slot(&g_phone_motion, 16, now_ns(), act, out) != 0;
+    uint32_t src = p ? 1u << p : 1u | merged_players();
+    uint32_t cand = src | (src << DM_PLAYERS) | (!p && g_phone_mode < 0 ? (1u << 16) : 0u);
+    if (!(act & cand)) return 0;
+    uint64_t now = now_ns(), newest = 0;
+    for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) {
+        motion_state st; uint64_t t = motion_fast_slot(&g_motion[i], i, now, act, &st);
+        if (!t) t = motion_fast_slot(&g_hid_motion[i], DM_PLAYERS + i, now, act, &st);
+        if (t > newest) { newest = t; *out = st; }
+    }
+    if (newest) return 1;
+    return !p && g_phone_mode < 0 && motion_fast_slot(&g_phone_motion, 16, now, act, out) != 0;
 }
 static int motion_live(int p, motion_state *out) {
     if (p < 0 || p >= DM_PLAYERS) return 0;
     pthread_once(&g_motion_once, motion_env);
-    if (!p && g_phone_mode > 0) return motion_copy(&g_phone_motion, out) != 0;
+    if (dm_hid_fast_on()) return motion_live_fast(p, out);
+    if (!p && g_phone_mode > 0) return motion_copy_slot(&g_phone_motion, -1, out) != 0;
     // Match the button path: in a one-player game, a controller in another slot also drives player 1.
     uint32_t src = p ? 1u << p : 1u | merged_players(); uint64_t newest = 0;
     for (int i = 0; i < DM_PLAYERS; i++) if (src >> i & 1) {
-        motion_state st; uint64_t t = motion_copy(&g_motion[i], &st);
-        if (!t) t = motion_copy(&g_hid_motion[i], &st);
+        motion_state st; uint64_t t = motion_copy_slot(&g_motion[i], -1, &st);
+        if (!t) t = motion_copy_slot(&g_hid_motion[i], -1, &st);
         if (t > newest) { newest = t; *out = st; }
     }
     if (newest) return 1;
-    return !p && g_phone_mode < 0 && motion_copy(&g_phone_motion, out);
+    return !p && g_phone_mode < 0 && motion_copy_slot(&g_phone_motion, -1, out);
 }
 static void six_sample_live(SixAxisState *s, int64_t samp, const motion_state *ms, int shakes) {
     memset(s, 0, sizeof *s);
@@ -758,7 +809,13 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
     int pl = player_of(h >> 8 & 0xff), shakes = pl == 0;
     motion_state ms;
-    if (motion_live(pl, &ms)) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
+    int live = motion_live(pl, &ms);
+    if (dm_hid_fast_on() && n > 1 && (!shakes || hid_fast_no_shake_window(samp, n, atomic_load(&g_shake_t0), atomic_load(&g_shake_end), SIX_PERIOD_NS))) {
+        if (live) six_sample_live(&out[0], samp, &ms, shakes); else six_sample(&out[0], samp, shakes);
+        for (int i = 1; i < n; i++) { out[i] = out[0]; out[i].sampling = samp - i; }
+        return n;
+    }
+    if (live) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
     for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
     return n;
 }
@@ -806,20 +863,21 @@ HLE_FORCE("_ZN2nn3hid44IsUnintendedHomeButtonInputProtectionEnabledERKj", "Home 
 #define RES_NPAD_IMU_ENABLED 0x2908cau   // what the SDK's EnableNpadImu answers while it is already on (sdk+0x6ca600)
 static pthread_mutex_t g_imu_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *g_imu_buf;
-static int g_imu_on;
+static _Atomic int g_imu_on;
 HLE_FORCE("_ZN2nn3hid13EnableNpadImuEPvm", "npad IMU on with the game's buffer; no hid service writes it", Result, h_hid_ImuEnable, void *buf, uint64_t size) {
     (void)size; pthread_mutex_lock(&g_imu_lock);
-    Result r = g_imu_on ? RES_NPAD_IMU_ENABLED : 0;
-    if (!r) { g_imu_buf = buf; g_imu_on = 1; }
+    Result r = atomic_load_explicit(&g_imu_on, memory_order_relaxed) ? RES_NPAD_IMU_ENABLED : 0;
+    if (!r) { g_imu_buf = buf; atomic_store_explicit(&g_imu_on, 1, memory_order_release); }
     pthread_mutex_unlock(&g_imu_lock);
     return r;
 }
 HLE_FORCE("_ZN2nn3hid14DisableNpadImuEv", "npad IMU off", Result, h_hid_ImuDisable, void) {
-    pthread_mutex_lock(&g_imu_lock); g_imu_buf = NULL; g_imu_on = 0; pthread_mutex_unlock(&g_imu_lock);
+    pthread_mutex_lock(&g_imu_lock); g_imu_buf = NULL; atomic_store_explicit(&g_imu_on, 0, memory_order_release); pthread_mutex_unlock(&g_imu_lock);
     return 0;
 }
 HLE_FORCE("_ZN2nn3hid16IsNpadImuEnabledEv", "npad IMU state as the host keeps it", int, h_hid_ImuIs, void) {
-    pthread_mutex_lock(&g_imu_lock); int on = g_imu_on; pthread_mutex_unlock(&g_imu_lock);
+    if (dm_hid_fast_on()) return atomic_load_explicit(&g_imu_on, memory_order_acquire);
+    pthread_mutex_lock(&g_imu_lock); int on = atomic_load_explicit(&g_imu_on, memory_order_relaxed); pthread_mutex_unlock(&g_imu_lock);
     return on;
 }
 // A six-axis handle as the SDK checks it: byte 1 the npad id (No1..No8, Other, Handheld, else 0x58aca), byte 2 the device index 0..2 (else 0xd6ca: VerifyValidSixAxisSensorHandle,
@@ -884,9 +942,13 @@ HLE_FORCE("_ZN2nn3hid17GetNpadImuSamplesEPNS0_13NpadImuSampleEiNS0_13NpadImuHand
     double fg = live ? IMU_DITHER_SCALE : 1;
     uint32_t device = imu_handle >> 8 & 0xffff;
     NpadImuSample *o = out;
+    SixAxisState base;
+    int same = dm_hid_fast_on() && (!shakes || hid_fast_no_shake_window(now, (int)k, atomic_load(&g_shake_t0), atomic_load(&g_shake_end), SIX_PERIOD_NS));
+    if (same) { if (live) six_sample_live(&base, now, &ms, shakes); else six_sample(&base, now, shakes); }
     for (int64_t i = 0; i < k; i++) {
         int64_t tick = now - k + 1 + i; SixAxisState s;
-        if (live) six_sample_live(&s, tick, &ms, shakes); else six_sample(&s, tick, shakes);
+        if (same) s = base;
+        else if (live) six_sample_live(&s, tick, &ms, shakes); else six_sample(&s, tick, shakes);
         o[i].sampling = tick + 1; o[i].delta_ns = SIX_PERIOD_NS;
         for (int c = 0; c < 3; c++) {
             double na = g_imu_noise_g > 0 ? fg * g_imu_noise_g * imu_gauss(tick, device, c) : 0, ng = g_imu_noise_dps > 0 ? fg * g_imu_noise_dps / 360 * imu_gauss(tick, device, 3 + c) : 0;
@@ -1023,9 +1085,9 @@ static uint32_t vib_targets(uint32_t h) { return vib_valid(h) & dm_haptics_avail
 static void vib_send(const uint32_t *handles, const dm_vibration *values, int n) {
     if (!handles || !values || n <= 0) return;
     dm_vibration_update updates[DM_PLAYERS * 2];
-    uint32_t used = 0; int unrouted = 0;
+    uint32_t used = 0, avail = dm_hid_fast_on() ? dm_haptics_available() : 0; int unrouted = 0;
     for (int i = 0; i < n; i++) {
-        uint32_t targets = vib_targets(handles[i]);
+        uint32_t targets = dm_hid_fast_on() ? (vib_valid(handles[i]) & avail) : vib_targets(handles[i]);
         if (!targets) unrouted++;
         for (int p = 0; p < DM_PLAYERS; p++) if (targets >> p & 1) {
             int m = handles[i] >> 16 & 1, k = p * 2 + m;
@@ -1034,7 +1096,7 @@ static void vib_send(const uint32_t *handles, const dm_vibration *values, int n)
     }
     int count = 0;
     for (int k = 0; k < DM_PLAYERS * 2; k++) if (used >> k & 1) updates[count++] = updates[k];
-    if (getenv("DM_RUMBLE_LOG")) {   // Count input values before deduplicating motors, including partially routed batches.
+    if (dm_hid_fast_on() ? dm_rumble_log_fast_on() : getenv("DM_RUMBLE_LOG") != NULL) {   // Count input values before deduplicating motors, including partially routed batches.
         static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
         static uint64_t sends, dropped, t0; static float peak; struct timespec ts;
         pthread_mutex_lock(&log_lock);   // SDK sends can arrive from several game threads.
@@ -1052,13 +1114,13 @@ HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "vibration permission: enabled a
 HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "vibration devices of the connected controller",
           int, h_hid_VibHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
     if (!h || !id || n <= 0 || !(style & style_of(*id)) || !dm_haptics_enabled()) {
-        if (getenv("DM_RUMBLE_LOG") && id) LOG("rumble: game asked for vibration handles of npad %u style %#x: none (connected style %#x, rumble %s)", *id, style, style_of(*id), dm_haptics_enabled() ? "on" : "off");
+        if ((dm_hid_fast_on() ? dm_rumble_log_fast_on() : getenv("DM_RUMBLE_LOG") != NULL) && id) LOG("rumble: game asked for vibration handles of npad %u style %#x: none (connected style %#x, rumble %s)", *id, style, style_of(*id), dm_haptics_enabled() ? "on" : "off");
         return 0;
     }
     uint32_t base = (*id << 8) | (*id == NPAD_HANDHELD ? 4u : 3u);
     int count = n < 2 ? n : 2;
     for (int i = 0; i < count; i++) h[i] = base | (uint32_t)i << 16;
-    if (getenv("DM_RUMBLE_LOG")) LOG("rumble: game asked for vibration handles of npad %u style %#x: %d, first %#x", *id, style, count, h[0]);
+    if (dm_hid_fast_on() ? dm_rumble_log_fast_on() : getenv("DM_RUMBLE_LOG") != NULL) LOG("rumble: game asked for vibration handles of npad %u style %#x: %d, first %#x", *id, style, count, h[0]);
     return count;
 }
 HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "vibration: initialize one channel", void, h_hid_InitVib, const uint32_t *h) {
