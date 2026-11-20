@@ -31,6 +31,7 @@
 #include "vka_gw_fast.h"
 #include "vka_view_fast.h"
 #include "../nvn/nvn_reg_fast.h"
+#include "vka_serial_fast.h"
 #include <assert.h>
 #include "../nvn/nvn_tex.h"
 
@@ -241,11 +242,17 @@ void vka_tex_alias_stats(char *b, size_t n) {
              by[0][0] / 1e6, cnt[0], by[0][1] / 1e6, by[1][0] / 1e6, cnt[1], by[1][1] / 1e6, by[2][0] / 1e6, cnt[2], by[2][1] / 1e6, gw / 1e6);
 }
 static _Atomic uint32_t g_tgen, *g_tver, *g_sver;   // the recording thread's view memo: see unref_locked
+static _Atomic uint32_t g_smap_gen = 1u, g_gpu_own_ever = 0u, g_gpu_own_gen = 1u;
+static _Thread_local vka_smap_memo4 t_smap_memo4;
+static _Thread_local vka_gpu_own_memo4 t_gpu_own_memo4;
+static _Thread_local vka_vkfmt_memo4 t_vkfmt_memo4;
 static _Atomic uint8_t *g_tisbuf;                   // per texture ID: registered as a buffer texture (vka_tex_id_is_buffer)
+static inline void serial_gens_bump(void) { atomic_fetch_add_explicit(&g_smap_gen, 1u, memory_order_release); atomic_fetch_add_explicit(&g_gpu_own_gen, 1u, memory_order_release); }
+static inline void gpu_own_note(int owned) { if (owned) atomic_store_explicit(&g_gpu_own_ever, 1u, memory_order_release); atomic_fetch_add_explicit(&g_gpu_own_gen, 1u, memory_order_release); }
 static smap_ent *map_get(uint64_t s) { return vksm_get(&g_smap, s); }
-static void map_put(uint64_t s, vka_img *im) { vksm_put(&g_smap, s, im); }   // (no memory for a new key: the texture has no entry, so its next lookup makes its image again; the old image goes when its refs do)
-static void map_del(uint64_t s) { if (vksm_del(&g_smap, s)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }   // a tombstone (never a valid serial)
-static void map_del_im(vka_img *im) { if (im && vksm_del_im(&g_smap, im)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }
+static void map_put(uint64_t s, vka_img *im) { vksm_put(&g_smap, s, im); serial_gens_bump(); }   // (no memory for a new key: the texture has no entry, so its next lookup makes its image again; the old image goes when its refs do)
+static void map_del(uint64_t s) { if (vksm_del(&g_smap, s)) { atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); serial_gens_bump(); } }   // a tombstone (never a valid serial)
+static void map_del_im(vka_img *im) { if (im && vksm_del_im(&g_smap, im)) { atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); serial_gens_bump(); } }
 static int cpuw_take(uint64_t s, int add) {   // add: insert; else: remove and say whether it was there
     if (add) { vksm_put(&g_cpuw, s, NULL); return 0; }
     return vksm_del(&g_cpuw, s);
@@ -283,6 +290,7 @@ static vka_img *g_big[64]; static int g_nbig;   // large images (DM_VK_BIGIMG_MB
 static vka_img *g_lrz_prev;   // the depth image of the last pass that had one (vka_lrz_touch), under g_tmu
 static void unref_locked(vka_img *im) {
     atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
+    serial_gens_bump();
     if (--im->refs) return;
     if (g_lrz_prev == im) g_lrz_prev = NULL;   // (vka_lrz_touch)
     map_del_im(im);
@@ -1983,7 +1991,7 @@ static vka_img *level_child(const tex_t *t, const vka_fmt *f) {
             c->serial = t->serial; c->mem = t->mem; c->d = t->d; c->L = t->L;
             c->img = p->img; c->f = p->f; c->usage = p->usage; c->aspect = p->aspect; c->cflags = p->cflags; c->nvf = p->nvf; memcpy(c->vf, p->vf, sizeof c->vf); c->fl = p->fl;
             c->w = p->w; c->h = p->h; c->depth = p->depth; c->layers = p->layers; c->levels = p->levels; c->samples = p->samples;
-            c->refs = 1; c->inited = 1; c->gpu_owned = p->gpu_owned; c->mode = p->mode; c->pool = p->pool; c->pgen = p->pgen; c->pfin = p->pfin;
+            c->refs = 1; c->inited = 1; c->gpu_owned = p->gpu_owned; if (c->gpu_owned) gpu_own_note(1); c->mode = p->mode; c->pool = p->pool; c->pgen = p->pgen; c->pfin = p->pfin;
             c->par = p; c->lvk = k; p->refs++; p->nkids++;
             static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16)
                 VLOG("texture serial %llu %ux%u format %#x (%u levels) over level %u of serial %llu's storage (%ux%u, %u levels): that level of its image, not an image of its own (DM_VK_LEVEL_SHARE=0: its own)",
@@ -1994,34 +2002,19 @@ static vka_img *level_child(const tex_t *t, const vka_fmt *f) {
     return NULL;
 }
 
-vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
-    if (!t || !t->serial || !vka_ok()) return NULL;
-    pthread_mutex_lock(&g_tmu);
-    smap_ent *e = map_get(t->serial);
-    if (e) {
-        vka_img *im = e->im;
-        if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
-        uint64_t vep = im && !im->is_video && im->mem ? dm_codec_video_epoch() : 0;
-        if (vep && im->vep != vep) {   // (checked again only after a video pool came or went: "Live images" above)
-            uint32_t vs = 0; im->vep = vep;
-            if (dm_codec_is_video_mem(im->mem, im->L.size, &vs)) {
-                im->is_video = 1;
-                im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
-                if (!im->d.stride) im->d.stride = vs ? vs : 7680;
-                im->track = 1;
-                im->gpu_owned = 0;
-                for (int id = 1; id < g_ntreg; id++) {
-                    if (g_treg[id].t.serial == t->serial) {
-                        g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
-                        if (!g_treg[id].t.d.stride) g_treg[id].t.d.stride = im->d.stride;
-                    }
-                }
-                VLOG("texture serial %llu: late video pool detection, marked linear (stride %u)", (unsigned long long)im->serial, im->d.stride);
-            }
-        }
-        pthread_mutex_unlock(&g_tmu);
-        return im;
-    }
+static vka_img *tex_get_fast_hit(uint64_t serial) {
+    if (!vka_serial_fast_on()) return NULL;
+    uint32_t sgen = atomic_load_explicit(&g_smap_gen, memory_order_acquire);
+    uint64_t vep = dm_codec_video_epoch();
+    uintptr_t im_u = 0;
+    if (!vka_smap_memo4_get(&t_smap_memo4, serial, sgen, vep, &im_u)) return NULL;
+    if (atomic_load_explicit(&g_smap_gen, memory_order_acquire) != sgen) return NULL;
+    vka_img *im = (vka_img *)im_u;
+    __atomic_store_n(&im->last_frame, vka_frame(), __ATOMIC_RELAXED);
+    __atomic_store_n(&im->last_fence, vka_fence_last(), __ATOMIC_RELAXED);
+    return im;
+}
+static vka_img *tex_get_create_locked(const tex_t *t, VkCommandBuffer cb, int *throttle) {
     tex_t t_mod = *t;
     uint32_t vs = 0;
     if (dm_codec_is_video_mem(t->mem, t->L.size, &vs)) {
@@ -2029,12 +2022,8 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
         if (!t_mod.d.stride) t_mod.d.stride = vs ? vs : 7680;
         t = &t_mod;
     }
-    vka_fmt f; vka_img *im = NULL; int throttle = 0;
+    vka_fmt f; vka_img *im = NULL;
     if (vka_fmt_of(t->d.format, &f)) {
-        // An image whose pool was finalized (img_pool_dead) holds that pool's content. One the GPU drew is taken over by a new texture of the same storage and shape (the GPU
-        // draws it again, and a large depth buffer is not made twice), but not one whose content came from the storage: the new pool's storage is the new texture's content,
-        // and its pages were never protected for that image, so its tracking would not see the CPU's writes there and it kept the old pool's texels (tiles of the scene
-        // before; docs/reference/nvn-objects.md "An image of a finalized pool taken over with its old content")
         int lk; for (vka_img *o = t->mem ? live_first(t->mem, &lk) : NULL; o && !im; o = live_next(o, t->mem, &lk)) if (same_shape(o, t, &f, 1) && !(o->base && sparse_gpu(t, &f)) && (!img_pool_dead(o) || o->gpu_owned)) {
             im = o; im->refs++;
             int revived = im->pdead;
@@ -2046,9 +2035,7 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
         if (!im) im = level_child(t, &f);   // (a texture over mip levels of a live image: that image)
         if (im && !im->par) big_share(im, t);   // (another texture object of the same storage and shape: DM_VK_BIGIMG_MB diagnostic)
         uint32_t vmin = 0, base = sparse_sampled(t, &f) ? sparse_base(t->pool, t->mem, &t->d, &t->L, &vmin) : 0;
-        int mode = 0;
-        int soft = 0;
-        uint64_t t_new = 0;
+        int mode = 0, soft = 0; uint64_t t_new = 0;
         if (!im) {
             t_new = now_ns();
             vka_tex_prune_locked();
@@ -2060,19 +2047,48 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
             if (im && soft) soft_note(im, t);   // (a soft texture: from level 1, "Soft textures" above)
         }
         if (im && !im->inited) {
-            im->vmin = vmin;
-            live_add(im);
-            big_note(im, t);
-            // Its first content through the upload batch when cb is the replay's (vka_dev.c "Upload batches"): staging that retires on the batch's own completion
+            im->vmin = vmin; live_add(im); big_note(im, t);
             VkCommandBuffer ucb = !ds_here(im, cb) && cb && cb == vka_rp_cb() && vka_up_on() ? vka_up_begin() : VK_NULL_HANDLE;
             img_first_use(im, t, ucb ? ucb : cb, mode);
-            if (ucb) { vka_up_point(vka_up_cur(ucb)); vka_up_end(); }   // (an upload of many pieces, upload_mt, checks the batch budget only here)
-            throttle = ucb != VK_NULL_HANDLE;
+            if (ucb) { vka_up_point(vka_up_cur(ucb)); vka_up_end(); }
+            *throttle = ucb != VK_NULL_HANDLE;
         }
         if (t_new) { atomic_fetch_add_explicit(&g_new_ns, now_ns() - t_new, memory_order_relaxed); atomic_fetch_add_explicit(&g_new_n, 1, memory_order_relaxed); }
     }
-    if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
+    if (im) { __atomic_store_n(&im->last_frame, vka_frame(), __ATOMIC_RELAXED); __atomic_store_n(&im->last_fence, vka_fence_last(), __ATOMIC_RELAXED); }
     map_put(t->serial, im);
+    return im;
+}
+static void tex_late_video_locked(vka_img *im, uint64_t serial) {
+    uint32_t vs = 0;
+    if (!dm_codec_is_video_mem(im->mem, im->L.size, &vs)) return;
+    im->is_video = 1; im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+    if (!im->d.stride) im->d.stride = vs ? vs : 7680;
+    im->track = 1; im->gpu_owned = 0; gpu_own_note(0);
+    for (int id = 1; id < g_ntreg; id++) if (g_treg[id].t.serial == serial) {
+        g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+        if (!g_treg[id].t.d.stride) g_treg[id].t.d.stride = im->d.stride;
+    }
+    VLOG("texture serial %llu: late video pool detection, marked linear (stride %u)", (unsigned long long)im->serial, im->d.stride);
+}
+vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
+    if (!t || !t->serial || !vka_ok()) return NULL;
+    vka_img *fhit = tex_get_fast_hit(t->serial);
+    if (fhit) return fhit;
+    pthread_mutex_lock(&g_tmu);
+    smap_ent *e = map_get(t->serial);
+    if (e) {
+        vka_img *im = e->im;
+        if (im) { __atomic_store_n(&im->last_frame, vka_frame(), __ATOMIC_RELAXED); __atomic_store_n(&im->last_fence, vka_fence_last(), __ATOMIC_RELAXED); }
+        uint64_t vep = im && !im->is_video && im->mem ? dm_codec_video_epoch() : 0;
+        if (vep && im->vep != vep) { im->vep = vep; tex_late_video_locked(im, t->serial); }
+        if (im && vka_serial_fast_on()) vka_smap_memo4_put(&t_smap_memo4, t->serial, atomic_load_explicit(&g_smap_gen, memory_order_relaxed), dm_codec_video_epoch(), (uintptr_t)im);
+        pthread_mutex_unlock(&g_tmu);
+        return im;
+    }
+    int throttle = 0;
+    vka_img *im = tex_get_create_locked(t, cb, &throttle);
+    if (im && vka_serial_fast_on()) vka_smap_memo4_put(&t_smap_memo4, t->serial, atomic_load_explicit(&g_smap_gen, memory_order_relaxed), dm_codec_video_epoch(), (uintptr_t)im);
     pthread_mutex_unlock(&g_tmu);
     if (throttle) vka_up_throttle();
     return im;
@@ -2347,7 +2363,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
     if (!im->gpu_owned && im->m.size >= big_min()) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 64)   // large images: the first GPU write (DM_VK_BIGIMG_MB)
         VLOG("large image serial %llu %ux%u layers %u format %#x (%.1f MiB): first GPU write at frame %llu (%s:%d), sampled by %u draws before, %u other textures over its storage", (unsigned long long)im->serial,
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
-    im->gpu_owned = 1; edge_hot_del(im); im->edge_unpinned = 0;
+    int was_go = im->gpu_owned; im->gpu_owned = 1; if (!was_go) gpu_own_note(1); edge_hot_del(im); im->edge_unpinned = 0;
     im->last_fence = vka_fence_last();
     if (img_wb_kind(im)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32)   // which GPU writes a copied-back linear texture takes (the copy-back covers the whole image)
         VLOG("linear texture serial %llu %ux%u format %#x: GPU write at frame %llu (%s:%d)%s", (unsigned long long)im->serial, im->w, im->h, im->d.format,
@@ -2378,7 +2394,18 @@ void vka_tex_writeback(VkCommandBuffer cb) {
     pthread_mutex_unlock(&g_tmu);
 }
 int mtl_tex_gpu_owned(uint64_t serial) {   // hle_nvn.c nvn_ft_poll: the GPU has written the image (render target, copy or clear destination)
-    pthread_mutex_lock(&g_tmu); smap_ent *e = map_get(serial); int r = e && e->im && (e->im->gpu_owned || (e->im->par && e->im->par->gpu_owned)); pthread_mutex_unlock(&g_tmu); return r;
+    int fast = vka_serial_fast_on();
+    if (fast) {
+        if (!atomic_load_explicit(&g_gpu_own_ever, memory_order_acquire)) return 0;
+        uint32_t ogen = atomic_load_explicit(&g_gpu_own_gen, memory_order_acquire);
+        uint8_t own = 0;
+        if (vka_gpu_own_memo4_get(&t_gpu_own_memo4, serial, ogen, &own) && atomic_load_explicit(&g_gpu_own_gen, memory_order_acquire) == ogen) return (int)own;
+    }
+    pthread_mutex_lock(&g_tmu);
+    smap_ent *e = map_get(serial); int r = e && e->im && (e->im->gpu_owned || (e->im->par && e->im->par->gpu_owned));
+    if (fast && serial) vka_gpu_own_memo4_put(&t_gpu_own_memo4, serial, atomic_load_explicit(&g_gpu_own_gen, memory_order_relaxed), (uint8_t)(r != 0));
+    pthread_mutex_unlock(&g_tmu);
+    return r;
 }
 unsigned mtl_cpu_tex_count(void) {   // live images whose content follows their storage
     pthread_mutex_lock(&g_tmu); unsigned n = 0; for (int i = 0; i < g_nlive; i++) n += g_live[i]->track && !g_live[i]->gpu_owned; pthread_mutex_unlock(&g_tmu); return n;
@@ -3082,11 +3109,22 @@ static VkFormat class_twin(VkFormat v, int cls) {
 // The Vulkan format texture ID id is viewed in (its texture view's, else its own), UNDEFINED for none. Not its image's: textures of one memory and shape share an image made in
 // the first one's format, so an image's own format can be another texture's (Ocarina of Time's RGB9E5 upscaler input lives in a B10G11R11 image; vka_draw.c NDSR)
 VkFormat vka_tex_id_vkfmt(int id) {
+    int fast = id > 0 && id < (1 << 20) && g_tver && vka_serial_fast_on();
+    uint32_t ver = fast ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0u;
+    if (fast && ver) {
+        uint32_t fu = 0;
+        if (vka_vkfmt_memo4_get(&t_vkfmt_memo4, (uint32_t)id, ver, &fu) && atomic_load_explicit(&g_tver[id], memory_order_acquire) == ver)
+            return (VkFormat)fu;
+    }
     pthread_mutex_lock(&g_tmu);
     VkFormat r = VK_FORMAT_UNDEFINED;
     if (id > 0 && id < g_ntreg && g_treg[id].t.serial) {
         const treg_ent *e = &g_treg[id]; vka_fmt f;
         if (vka_fmt_of(e->has_v && e->v.set_format ? e->v.format : e->t.d.format, &f)) r = f.vk;
+    }
+    if (fast) {
+        uint32_t vnow = atomic_load_explicit(&g_tver[id], memory_order_acquire);
+        if (vnow) vka_vkfmt_memo4_put(&t_vkfmt_memo4, (uint32_t)id, vnow, (uint32_t)r);
     }
     pthread_mutex_unlock(&g_tmu);
     return r;
@@ -3486,7 +3524,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
                     im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
                     if (!im->d.stride) im->d.stride = vs;
                     im->track = 1;
-                    im->gpu_owned = 0;
+                    im->gpu_owned = 0; gpu_own_note(0);
                     for (int id = 1; id < g_ntreg; id++) {
                         if (g_treg[id].t.serial == im->serial) {
                             g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;

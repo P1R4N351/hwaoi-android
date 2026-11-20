@@ -113,16 +113,28 @@ static vka_lreq *program(const vka_keyset *done, const uint64_t *keys, const cha
     return r;
 }
 // The caller's unmarking (vka_shader.c req_unwritten): the keys and pairs handed back
-static vka_keyset *g_unmark_keys, *g_unmark_pairs; static int g_nunw, g_unw_err;
+static pthread_mutex_t g_unw_mu = PTHREAD_MUTEX_INITIALIZER;
+static vka_keyset *g_unmark_keys, *g_unmark_pairs; static int g_nunw, g_unw_err, g_ask_marked;
 static void unwritten(void *ctx, int pair, uint64_t a, uint64_t b, int err) {
-    (void)ctx; g_nunw++; g_unw_err = err;
+    (void)ctx;
+    pthread_mutex_lock(&g_unw_mu);
+    g_nunw++; g_unw_err = err;
     if (pair) { if (g_unmark_pairs) vka_keyset_del(g_unmark_pairs, vka_lreq_pair_id(a, b)); }
     else if (g_unmark_keys) vka_keyset_del(g_unmark_keys, a);
+    pthread_mutex_unlock(&g_unw_mu);
 }
 static int ask(vka_lrq *q, const char *root, vka_keyset *done, const uint64_t *keys, const char *const *stage, unsigned n) {   // (layer_request) the stages queued
+    pthread_mutex_lock(&g_unw_mu);
     vka_lreq *r = program(done, keys, stage, n); unsigned ns = r->ns; uint64_t ks[VKA_LREQ_STAGES];
     for (unsigned i = 0; i < ns; i++) ks[i] = r->st[i].key;
-    if (ns && vka_lrq_push(q, root, r)) { for (unsigned i = 0; i < ns; i++) vka_keyset_add(done, ks[i]); return (int)ns; }
+    g_ask_marked = 0;
+    if (ns && vka_lrq_push(q, root, r)) {
+        for (unsigned i = 0; i < ns; i++) vka_keyset_add(done, ks[i]);
+        g_ask_marked = vka_keyset_has(done, ks[0]);
+        pthread_mutex_unlock(&g_unw_mu);
+        return (int)ns;
+    }
+    pthread_mutex_unlock(&g_unw_mu);
     vka_lreq_free(r); return ns ? -1 : 0;
 }
 
@@ -172,19 +184,26 @@ static void test_requests(void) {
     vka_lrq_drain(&q4);
     CHECK(q4.written == 0, "written under a file: %llu", q4.written);
     // A stage the writer cannot write is handed back with its errno, so the caller unmarks it and asks again
-    static vka_keyset done5; static vka_lrq q5 = VKA_LRQ_INIT; q5.unwritten = unwritten; g_unmark_keys = &done5; g_nunw = 0;
-    CHECK(ask(&q5, bad, &done5, p4, s4, 1) == 1 && vka_keyset_has(&done5, p4[0]), "queued and marked");
+    static vka_keyset done5; static vka_lrq q5 = VKA_LRQ_INIT;
+    pthread_mutex_lock(&g_unw_mu); q5.unwritten = unwritten; g_unmark_keys = &done5; g_nunw = 0; g_unw_err = 0; pthread_mutex_unlock(&g_unw_mu);
+    CHECK(ask(&q5, bad, &done5, p4, s4, 1) == 1 && g_ask_marked, "queued and marked");
     vka_lrq_drain(&q5);
-    CHECK(g_nunw == 1 && g_unw_err == ENOTDIR && !vka_keyset_has(&done5, p4[0]) && q5.failed == 1, "an unwritten stage handed back (%d calls, errno %d, failed %llu)", g_nunw, g_unw_err, q5.failed);
+    pthread_mutex_lock(&g_unw_mu);
+    int nunw5 = g_nunw, unw_err5 = g_unw_err, has5 = vka_keyset_has(&done5, p4[0]);
+    g_unmark_keys = NULL;
+    pthread_mutex_unlock(&g_unw_mu);
+    CHECK(nunw5 == 1 && unw_err5 == ENOTDIR && !has5 && q5.failed == 1, "an unwritten stage handed back (%d calls, errno %d, failed %llu)", nunw5, unw_err5, q5.failed);
     // The folder removed while the game runs (Storage): made again at the next request
-    static vka_keyset done6; static vka_lrq q6 = VKA_LRQ_INIT; q6.unwritten = unwritten; g_unmark_keys = &done6; g_nunw = 0;
+    static vka_keyset done6; static vka_lrq q6 = VKA_LRQ_INIT;
+    pthread_mutex_lock(&g_unw_mu); q6.unwritten = unwritten; g_unmark_keys = &done6; g_nunw = 0; pthread_mutex_unlock(&g_unw_mu);
     char lr6[700]; snprintf(lr6, sizeof lr6, "%s/pack/layer6", root);
     const uint64_t p6[1] = {0x6666000000000006ull}; const uint64_t p7[1] = {0x7777000000000007ull};
     CHECK(ask(&q6, lr6, &done6, p6, s4, 1) == 1, "queued (layer6)"); vka_lrq_drain(&q6);
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", lr6); if (system(cmd)) {}
     CHECK(ask(&q6, lr6, &done6, p7, s4, 1) == 1, "queued after the folder went"); vka_lrq_drain(&q6);
+    pthread_mutex_lock(&g_unw_mu); int nunw6 = g_nunw; g_unmark_keys = NULL; pthread_mutex_unlock(&g_unw_mu);
     snprintf(f, sizeof f, "%s/req/%016llx.ctl", lr6, (unsigned long long)p7[0]);
-    CHECK(fsize(f) == 0xd8 && g_nunw == 0 && q6.written == 2, "the folder made again (%ld bytes, %d unwritten, %llu written)", fsize(f), g_nunw, q6.written);
+    CHECK(fsize(f) == 0xd8 && nunw6 == 0 && q6.written == 2, "the folder made again (%ld bytes, %d unwritten, %llu written)", fsize(f), nunw6, q6.written);
     // Pairs: a program whose stages were all asked for before still records a new pair (a pairs-only request); a pair is appended once, across runs too; a last line an
     // earlier stop cut short is ended before the next pair
     static vka_lrq q7 = VKA_LRQ_INIT; q7.unwritten = unwritten;
@@ -200,10 +219,18 @@ static void test_requests(void) {
     pt = slurp(f);
     CHECK(pt && !strcmp(pt, "6666000000000006\t7777000000000007\n6666000000000006\t88\n7777000000000007\t6666000000000006\n"), "a later run: %s", pt ? pt : "(none)"); free(pt);
     // A pair that cannot be appended is handed back
-    static vka_keyset pairs9; static vka_lrq q9 = VKA_LRQ_INIT; q9.unwritten = unwritten; g_unmark_pairs = &pairs9; g_nunw = 0;
+    static vka_keyset pairs9; static vka_lrq q9 = VKA_LRQ_INIT;
+    pthread_mutex_lock(&g_unw_mu);
+    q9.unwritten = unwritten; g_unmark_pairs = &pairs9; g_nunw = 0;
     vka_keyset_add(&pairs9, vka_lreq_pair_id(p6[0], p7[0]));
-    r = calloc(1, sizeof *r); vka_lreq_pair(r, p6[0], p7[0]); vka_lrq_push(&q9, bad, r); vka_lrq_drain(&q9);
-    CHECK(g_nunw == 1 && !vka_keyset_has(&pairs9, vka_lreq_pair_id(p6[0], p7[0])), "an unwritten pair handed back (%d)", g_nunw);
+    r = calloc(1, sizeof *r); vka_lreq_pair(r, p6[0], p7[0]); vka_lrq_push(&q9, bad, r);
+    pthread_mutex_unlock(&g_unw_mu);
+    vka_lrq_drain(&q9);
+    pthread_mutex_lock(&g_unw_mu);
+    int nunw9 = g_nunw, has9 = vka_keyset_has(&pairs9, vka_lreq_pair_id(p6[0], p7[0]));
+    g_unmark_pairs = NULL;
+    pthread_mutex_unlock(&g_unw_mu);
+    CHECK(nunw9 == 1 && !has9, "an unwritten pair handed back (%d)", nunw9);
     CHECK(vka_lreq_pair_id(1, 2) != vka_lreq_pair_id(2, 1) && vka_lreq_pair_id(0, 0), "pair ids");
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) {}
 }

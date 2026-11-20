@@ -702,7 +702,7 @@ DM_VK_RC_QUERY_MEM	developer	Diagnostics			text			both
 DM_VK_RD_SPLIT	developer	Graphics			text			both							
 DM_VK_RD_TOUCH	developer	Graphics			text			both							
 DM_VK_READTEXELS	developer	Graphics			text			both							
-DM_VK_REG_FAST	developer	Diagnostics			text			both						
+DM_VK_REG_FAST	developer	Diagnostics			text			both							
 DM_VK_REMAP_SPV	internal	Diagnostics			text			both						test harness	
 DM_VK_REPLAY_NICE	developer	Graphics			text			both							
 DM_VK_ROWS	developer	Graphics			text			both							
@@ -715,6 +715,7 @@ DM_VK_SB_PEEK_FROM	developer	Diagnostics			text			both
 DM_VK_SB_PEEK_LINES	developer	Diagnostics			text			both							
 DM_VK_SB_WATCH	developer	Diagnostics			text			both							
 DM_VK_SCR_FAST	developer	Graphics			text			both							
+DM_VK_SERIAL_FAST	developer	Graphics			text			both							
 DM_VK_SET_NULLS	developer	Diagnostics			text			both							
 DM_VK_SHADER_FAST	developer	Graphics			text			both							
 DM_VK_SHADER_STATS	developer	Diagnostics			text			both							
