@@ -30,6 +30,7 @@
 #include "vka_tex_fast.h"
 #include "vka_gw_fast.h"
 #include "vka_view_fast.h"
+#include "../nvn/nvn_reg_fast.h"
 #include <assert.h>
 #include "../nvn/nvn_tex.h"
 
@@ -2506,7 +2507,9 @@ static VkDescriptorSetLayout g_dsl; static VkDescriptorPool g_dpool; static VkDe
 static uint32_t g_ntex_slots, g_nsamp_slots, g_nimg_slots;
 typedef struct { samp_par p; VkSampler s; } samp_ent; static samp_ent *g_samp; static int g_nsamp;
 static VkSampler *g_sres; static int g_nsres;   // the sampler of each registered ID, found once per registration (sampler_of searches every distinct sampler)
+static uint8_t *g_sreg_ok;
 static VkImageView g_null_view;
+static vkps g_sv[3];   // bindings 0 (sampled) and 2 (images) (vka_poolslot.h)
 
 // ---------- Texture pool reads (DM_VK_POOL_FB) ----------
 // A shader whose texture handle the translator could not trace to a slot reads the pool (set 1 binding 0) at an ID the host never sees: agl / gsys lit materials read their
@@ -2686,10 +2689,22 @@ static void dirty(int **list, int *n, int *cap, uint8_t **flag, int nslots, int 
     (*list)[(*n)++] = id;
 }
 static void treg(int id, const tex_t *t, const view_t *v, int img) {
-    if (id < 0 || id >= (1 << 20)) return;
+    if (id < 0 || id >= (1 << 20) || !t) return;
     pthread_mutex_lock(&g_tmu);
     if (id >= g_ntreg) { int n = g_ntreg ? g_ntreg : 1024; while (n <= id) n *= 2; g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
-    treg_ent *e = &g_treg[id]; e->t = *t; e->has_v = v != NULL; if (v) e->v = *v; e->img = (uint8_t)img; e->pgen = nvn_pool_live(t->pool, NULL, NULL);
+    treg_ent *e = &g_treg[id];
+    uint64_t pgen = nvn_pool_live(t->pool, NULL, NULL);
+    if (nvn_reg_fast_on() && nvn_treg_same(e->t.serial, t->serial, e->pgen, pgen, e->img, (uint8_t)img, e->has_v, (uint8_t)(v != NULL), (const uint8_t *)&e->t, (const uint8_t *)t, sizeof *t, (const uint8_t *)&e->v, (const uint8_t *)v, sizeof *v)) {
+        int b = img ? 2 : 0;
+        smap_ent *se = map_get(t->serial);
+        int slot_ready = (g_tdflag && g_tdflag[id]) ||
+            ((uint32_t)id < g_sv[b].n && g_sv[b].e[id].v != NULL && g_sv[b].e[id].serial == t->serial && se != NULL && se->im != NULL) ||
+            (!VKA_ENV("DM_VK_EAGER_TEX", 0) && !(g_pfb_st && (g_pfb_st[id] & PFB_WANT)) && !se && (uint32_t)id < g_sv[b].n && g_sv[b].e[id].v == (const void *)g_null_view);
+        if (!slot_ready) dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
+        pthread_mutex_unlock(&g_tmu);
+        return;
+    }
+    e->t = *t; e->has_v = v != NULL; if (v) e->v = *v; e->img = (uint8_t)img; e->pgen = pgen;
     dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
     if (!g_tver) g_tver = calloc(1 << 20, sizeof *g_tver);
     if (g_tver) atomic_fetch_add_explicit(&g_tver[id], 1, memory_order_release);
@@ -2706,11 +2721,16 @@ uint32_t vka_tex_id_tver(int id) {
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { treg(id, t, v, 0); }
 void mtl_reg_image(int id, const tex_t *t, const view_t *v) { treg(id, t, v, 1); }
 void mtl_reg_samp(int id, const samp_par *p) {
-    if (id < 0 || id >= 4096 * 4) return;
+    if (id < 0 || id >= 4096 * 4 || !p) return;
     pthread_mutex_lock(&g_tmu);
+    if (!g_sreg_ok) g_sreg_ok = calloc(4096 * 4, 1);
+    if (id < g_nsreg && g_sreg_ok && nvn_reg_fast_on() && nvn_sreg_same(g_sreg_ok[id], (const uint8_t *)&g_sreg[id], (const uint8_t *)p, sizeof *p)) {
+        pthread_mutex_unlock(&g_tmu);
+        return;
+    }
     if (id >= g_nsreg) { int n = g_nsreg ? g_nsreg : 256; while (n <= id) n *= 2; g_sreg = realloc(g_sreg, (size_t)n * sizeof *g_sreg); memset(g_sreg + g_nsreg, 0, (size_t)(n - g_nsreg) * sizeof *g_sreg); g_nsreg = n; }
     if (id < g_nsres) g_sres[id] = VK_NULL_HANDLE;
-    g_sreg[id] = *p; dirty(&g_sdirty, &g_nsd, &g_sdcap, &g_sdflag, 4096 * 4, id);
+    g_sreg[id] = *p; if (g_sreg_ok) g_sreg_ok[id] = 1; dirty(&g_sdirty, &g_nsd, &g_sdcap, &g_sdflag, 4096 * 4, id);
     if (!g_sver) g_sver = calloc(4096 * 4, sizeof *g_sver);
     if (g_sver) atomic_fetch_add_explicit(&g_sver[id], 1, memory_order_release);
     pthread_mutex_unlock(&g_tmu);
@@ -2933,7 +2953,7 @@ static void write_tex(int id, VkCommandBuffer cb, VkWriteDescriptorSet *w, VkDes
 // type, format and range: what write_tex writes at a submission's start), written only when it changes (a first image, an image made again); a binding's own view goes
 // only into that draw's descriptors. g_sv: the view each slot was last written with and its image's serial (under g_tmu; a view handle may be reused once its image is
 // gone, a serial never is). DM_VK_POOL_SLOT_BIND=1 (live) writes the binding's view as before
-static vkps g_sv[3];   // bindings 0 (sampled) and 2 (images) (vka_poolslot.h)
+// g_sv[3] declared above for treg slot-readiness elision
 static uint64_t g_slot_bindw;   // slots written with a binding's own view (DM_VK_POOL_SLOT_BIND=1)
 void vka_tex_slot_counts(uint64_t *writes, uint64_t *changes) { pthread_mutex_lock(&g_tmu); *writes = g_sv[0].writes + g_sv[2].writes; *changes = g_sv[0].changes + g_sv[2].changes; pthread_mutex_unlock(&g_tmu); }
 // Slot id of binding b will hold v: 1 = write it (another view than it holds, or not known yet), 0 = it holds v already. why: 1 a binding, 2 a submission's start
@@ -3532,7 +3552,9 @@ void vka_tex_prepare(VkCommandBuffer cb) {
     for (int k = 0; k < g_nsd; k++) {
         int id = g_sdirty[k]; g_sdflag[id] = 0;
         if (id >= (int)g_nsamp_slots) { VRED_ONCE("sampler ID %d beyond the table (%u)", id, g_nsamp_slots); continue; }
-        VkSampler s = sampler_of(&g_sreg[id]); if (!s) continue;
+        VkSampler s = (id < g_nsres && g_sres[id]) ? g_sres[id] : sampler_of(&g_sreg[id]);
+        if (!s) continue;
+        if (id < g_nsres && !g_sres[id]) g_sres[id] = s;
         ii[nw] = (VkDescriptorImageInfo){s, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         w[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_set, .dstBinding = 1, .dstArrayElement = (uint32_t)id, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw]};
         if (++nw == BATCH) { vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL); nw = 0; }

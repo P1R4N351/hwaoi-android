@@ -15,6 +15,7 @@
 #include "nvn_dpool.h"
 #include "../vk_android/vka_enc_fast.h"
 #include "nvn_hle_fast.h"
+#include "nvn_reg_fast.h"
 #include "../tex/nvn_deswizzle.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
@@ -783,6 +784,14 @@ NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNt
 // when its pages change). Off by default: in another game a flushed range could cover an image a shader writes, whose GPU content the upload would replace
 typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; } flush_tex;   // stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
+static nvn_ft_summary g_ft_sum = {0, 0, UINTPTR_MAX, 0, 0, {0, 0, 0, 0}, {0, 0, 0, 0}};
+static void ft_sum_sync_locked(void) {
+    if (!g_nft || g_nft <= 64u) {
+        nvn_ft_sum_wbegin(&g_ft_sum);
+        for (size_t i = 0; i < g_nft; i++) nvn_ft_sum_witem(&g_ft_sum, (uintptr_t)g_ft[i].mem, (uintptr_t)(g_ft[i].mem + g_ft[i].size), g_ft[i].t.serial);
+        nvn_ft_sum_wend(&g_ft_sum, g_nft);
+    } else nvn_ft_sum_set_count(&g_ft_sum, g_nft);
+}
 static void ft_add(const tex_t *t) {
     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
     // A sparse pool's addresses are no memory the CPU writes or flushes, and no range nvn_dirty tracks, so they read as dirty at once: every texture in one, a render target too, came out CPU-written at its first
@@ -793,12 +802,14 @@ static void ft_add(const tex_t *t) {
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
     uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     g_ft[g_nft++] = (flush_tex){t->mem, t->L.size, *t, st, nvn_dirty_span(t->mem, t->L.size)};
+    nvn_ft_sum_add(&g_ft_sum, (uintptr_t)t->mem, (uintptr_t)(t->mem + t->L.size), t->serial, g_nft);
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_del(uint64_t serial) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return;
+    if (nvn_reg_fast_on() && nvn_ft_sum_no_serial(&g_ft_sum, serial)) return;
     pthread_mutex_lock(&g_ft_mu);
-    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
+    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; ft_sum_sync_locked(); break; }
     pthread_mutex_unlock(&g_ft_mu);
 }
 // Profile tex_dirty_upload: Tears of the Kingdom fills some textures from the CPU after creating them and publishes them with no NVN flush at all (os::FlushDataCache runs
@@ -806,9 +817,10 @@ static void ft_del(uint64_t serial) {
 // ft_add write-protects a registered texture's pages, and on its first resolution (tex_mtl, submit thread) a write since then makes it CPU-written like a flushed one
 int nvn_ft_written(const tex_t *t) {
     if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
+    if (nvn_reg_fast_on() && nvn_ft_sum_no_serial(&g_ft_sum, t->serial)) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
-        if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+        if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) { r = 1; g_ft[i] = g_ft[--g_nft]; ft_sum_sync_locked(); }
         break; }
     pthread_mutex_unlock(&g_ft_mu);
     if (r) mtl_tex_cpu_written(t);
@@ -816,6 +828,7 @@ int nvn_ft_written(const tex_t *t) {
 }
 int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its storage holds whatever the CPU has written (nvn_tex_mirror_b2t / nvn_tex_mirror_t2t)
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return 0;
+    if (nvn_reg_fast_on() && nvn_ft_sum_no_serial(&g_ft_sum, serial)) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { r = 1; break; }
     pthread_mutex_unlock(&g_ft_mu);
@@ -831,6 +844,7 @@ int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its 
 enum { FT_POLL_BYTES = 128 << 20 };
 void nvn_ft_poll(void) {
     if (!DM_GAME_TEX_DIRTY_UPLOAD) return;
+    if (nvn_reg_fast_on() && nvn_ft_sum_empty(&g_ft_sum)) return;
     static uint64_t gen; static size_t cur, left;
     static tex_t *hit; static size_t chit; size_t nhit = 0;
     uint64_t now = nvn_dirty_now(), scanned = 0;
@@ -844,14 +858,19 @@ void nvn_ft_poll(void) {
             hit[nhit++] = g_ft[cur].t; g_ft[cur] = g_ft[--g_nft];
         } else cur++;
     }
+    if (nhit) ft_sum_sync_locked();
     pthread_mutex_unlock(&g_ft_mu);
     for (size_t i = 0; i < nhit; i++) if (!mtl_tex_gpu_owned(hit[i].serial)) mtl_tex_cpu_written(&hit[i]);   // outside g_ft_mu: the ownership check takes the replay's serial table lock
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
+    uintptr_t lo = (uintptr_t)a, hi = n > UINTPTR_MAX - lo ? UINTPTR_MAX : lo + (uintptr_t)n;
+    if (nvn_reg_fast_on() && nvn_ft_sum_disjoint(&g_ft_sum, lo, hi)) return;
     pthread_mutex_lock(&g_ft_mu);
+    int removed = 0;
     for (size_t i = 0; i < g_nft;)
-        if (g_ft[i].mem < a + n && a < g_ft[i].mem + g_ft[i].size) { mtl_tex_cpu_written(&g_ft[i].t); g_ft[i] = g_ft[--g_nft]; } else i++;
+        if (g_ft[i].mem < a + n && a < g_ft[i].mem + g_ft[i].size) { mtl_tex_cpu_written(&g_ft[i].t); g_ft[i] = g_ft[--g_nft]; removed = 1; } else i++;
+    if (removed) ft_sum_sync_locked();
     pthread_mutex_unlock(&g_ft_mu);
 }
 // Flushed ranges (every game): what the CPU published with nvnMemoryPoolFlushMappedRange, as disjoint [lo, hi) spans sorted by start (touching spans merge), dropped with their pool.
@@ -861,6 +880,9 @@ static void ft_flush(const uint8_t *a, uint64_t n) {
 // brownish grey instead of blue (GitHub issue #52). Textures the CPU keeps writing after their first use still need the profile's tex_flush_upload / tex_dirty_upload
 typedef struct { const uint8_t *lo, *hi; } fl_span;
 static fl_span *g_fl; static size_t g_nfl, g_cfl; static pthread_mutex_t g_fl_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_fl_drop_seq = 2u;
+static nvn_fl_summary g_fl_sum = {0, 0, UINTPTR_MAX, 0, 0, {0, 0, 0, 0}};
+static _Thread_local nvn_fl_cov_memo4 t_fl_cov;
 static size_t fl_find(const uint8_t *a, int touch) {   // the first span that ends after a (touch: or at a); g_fl_mu held
     size_t l = 0, h = g_nfl;
     while (l < h) { size_t m = (l + h) / 2; if (g_fl[m].hi < a || (!touch && g_fl[m].hi == a)) l = m + 1; else h = m; }
@@ -869,20 +891,32 @@ static size_t fl_find(const uint8_t *a, int touch) {   // the first span that en
 static void fl_add(const uint8_t *a, uint64_t n) {
     if (!a || !n) return;
     const uint8_t *b = a + n;
+    uintptr_t qlo = (uintptr_t)a, qhi = (uintptr_t)b;
+    int fast = nvn_reg_fast_on();
+    if (fast) {
+        uint64_t d0 = atomic_load_explicit(&g_fl_drop_seq, memory_order_acquire);
+        if (!(d0 & 1u) && nvn_fl_cov_contains(&t_fl_cov, d0, qlo, qhi) && atomic_load_explicit(&g_fl_drop_seq, memory_order_acquire) == d0) return;
+    }
     pthread_mutex_lock(&g_fl_mu);
     size_t i = fl_find(a, 1), j = i;
-    if (i < g_nfl && g_fl[i].lo <= a && b <= g_fl[i].hi) { pthread_mutex_unlock(&g_fl_mu); return; }   // already covered (a buffer flushed every frame)
-    while (j < g_nfl && g_fl[j].lo <= b) { if (g_fl[j].lo < a) a = g_fl[j].lo; if (g_fl[j].hi > b) b = g_fl[j].hi; j++; }   // spans i .. j-1 overlap or touch [a, b): merged into one
+    if (i < g_nfl && g_fl[i].lo <= a && b <= g_fl[i].hi) {
+        if (fast) nvn_fl_cov_put(&t_fl_cov, atomic_load_explicit(&g_fl_drop_seq, memory_order_relaxed), qlo, (uintptr_t)g_fl[i].lo, (uintptr_t)g_fl[i].hi);
+        pthread_mutex_unlock(&g_fl_mu); return;
+    }
+    while (j < g_nfl && g_fl[j].lo <= b) { if (g_fl[j].lo < a) a = g_fl[j].lo; if (g_fl[j].hi > b) b = g_fl[j].hi; j++; }
     if (i == j) {
         if (g_nfl == g_cfl && !(g_fl = realloc(g_fl, (g_cfl = g_cfl ? 2 * g_cfl : 256) * sizeof *g_fl))) die("flushed range allocation failed");
         memmove(g_fl + i + 1, g_fl + i, (g_nfl - i) * sizeof *g_fl); g_nfl++;
     } else if (j > i + 1) { memmove(g_fl + i + 1, g_fl + j, (g_nfl - j) * sizeof *g_fl); g_nfl -= j - i - 1; }
     g_fl[i] = (fl_span){a, b};
+    nvn_fl_sum_note_add(&g_fl_sum, (uintptr_t)a, (uintptr_t)b, g_nfl);
+    if (fast) nvn_fl_cov_put(&t_fl_cov, atomic_load_explicit(&g_fl_drop_seq, memory_order_relaxed), qlo, (uintptr_t)a, (uintptr_t)b);
     pthread_mutex_unlock(&g_fl_mu);
 }
 static void fl_drop(const uint8_t *a, uint64_t n) {   // a pool goes: its part of every span (spans of neighbouring pools may have merged with it)
     const uint8_t *b = a + n;
     pthread_mutex_lock(&g_fl_mu);
+    atomic_fetch_add_explicit(&g_fl_drop_seq, 1u, memory_order_acq_rel);
     for (size_t i = fl_find(a, 0); i < g_nfl && g_fl[i].lo < b;) {
         fl_span s = g_fl[i];
         if (s.lo < a && s.hi > b) {   // the pool lies inside the span: split it
@@ -894,12 +928,25 @@ static void fl_drop(const uint8_t *a, uint64_t n) {   // a pool goes: its part o
         else if (s.hi > b) { g_fl[i].lo = b; break; }
         else { memmove(g_fl + i, g_fl + i + 1, (g_nfl - i - 1) * sizeof *g_fl); g_nfl--; }
     }
+    nvn_fl_sum_wbegin(&g_fl_sum);
+    for (size_t k = 0; k < g_nfl; k++) nvn_fl_sum_wadd(&g_fl_sum, (uintptr_t)g_fl[k].lo, (uintptr_t)g_fl[k].hi);
+    nvn_fl_sum_wend(&g_fl_sum, g_nfl);
+    atomic_fetch_add_explicit(&g_fl_drop_seq, 1u, memory_order_acq_rel);
     pthread_mutex_unlock(&g_fl_mu);
 }
 int nvn_flushed(const void *p, uint64_t n) {   // whether the CPU flushed any of [p, p + n)
     const uint8_t *a = p;
+    if (!a) return 0;
+    int fast = n && nvn_reg_fast_on();
+    uintptr_t lo = (uintptr_t)a, hi = n > UINTPTR_MAX - lo ? UINTPTR_MAX : lo + (uintptr_t)n;
+    if (fast) {
+        if (nvn_fl_sum_disjoint(&g_fl_sum, lo, hi)) return 0;
+        uint64_t d0 = atomic_load_explicit(&g_fl_drop_seq, memory_order_acquire);
+        if (!(d0 & 1u) && nvn_fl_cov_overlaps(&t_fl_cov, d0, lo, hi) && atomic_load_explicit(&g_fl_drop_seq, memory_order_acquire) == d0) return 1;
+    }
     pthread_mutex_lock(&g_fl_mu);
     size_t i = fl_find(a, 0); int r = i < g_nfl && g_fl[i].lo < a + n;
+    if (fast && r) nvn_fl_cov_put(&t_fl_cov, atomic_load_explicit(&g_fl_drop_seq, memory_order_relaxed), lo, (uintptr_t)g_fl[i].lo, (uintptr_t)g_fl[i].hi);
     pthread_mutex_unlock(&g_fl_mu);
     return r;
 }
