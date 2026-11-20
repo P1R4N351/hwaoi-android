@@ -74,7 +74,7 @@ void vka_dstate_reset(vka_dstate *d) {   // NVN's defaults (nvn_mtl.m state_rese
     d->poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
     d->ds = (ds_st){0, 1, NVN_DEPTH_FUNC_LESS, 0, NVN_STENCIL_FUNC_ALWAYS, NVN_STENCIL_FUNC_ALWAYS, 1, 1, 1, 1, 1, 1};
     d->st_vmask[0] = d->st_vmask[1] = d->st_wmask[0] = d->st_wmask[1] = 0xff; d->dr[1] = 1; d->b.samples = 1;
-    d->s_vfmt = vka_stamp(); d->s_vbuf = vka_stamp(); d->s_push = vka_stamp();
+    d->s_vfmt = vka_stamp(); d->s_vbuf = vka_stamp(); d->s_ubo5 = vka_stamp(); d->s_push = vka_stamp();
     for (int st = 0; st < VKA_NSTAGE; st++) { d->s_ssbo[st] = vka_stamp(); d->s_tex[st] = vka_stamp(); }
 }
 static _Atomic uint64_t g_stamp;
@@ -110,7 +110,7 @@ int vka_state_op(vka_dstate *d, uint32_t op, const void *a) {
         break; }
     case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; d->s_vfmt = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) { memcpy(&d->stream[b->first], b->st, 8 * (size_t)b->n); if (b->first + b->n > d->nstream) d->nstream = b->first + b->n; } break; }
     case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(op, a, &tmp); d->s_vbuf = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) memcpy(&d->vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
-    case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) { d->ubo_dirty[b->stage] |= 1u << b->index; d->b.ubo[b->stage][b->index] = (vka_range){b->addr, b->size}; } break; }
+    case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) { d->ubo_dirty[b->stage] |= 1u << b->index; d->b.ubo[b->stage][b->index] = (vka_range){b->addr, b->size}; if (b->stage == 5) d->s_ubo5 = vka_stamp(); } break; }
     case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) { d->b.ssbo[b->stage][b->index] = (vka_range){b->addr, b->size}; d->s_ssbo[b->stage] = vka_stamp(); } break; }
     case OP_BIND_TEX: case OP_BIND_TEX1: { p_bind_handles t1; const p_bind_handles *b = bind_rec(op, a, &t1);
         if (b->n < 0 || b->n > 32) { VRED_ONCE("texture bind record with count %d: overwritten after recording", b->n); break; }
@@ -1211,29 +1211,35 @@ static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
 // Graphics stages only: an indirect dispatch's counts are copied into its c0 by the GPU (vka_dispatch). A span lives until the submission's fence (vka_scratch_retire at
 // its commit), so the memo is forgotten at each submission's start (vka_draw_sub_begin)
 typedef struct { VkBuffer buf; VkDeviceSize off; } c0_at;
-static struct { int valid; vka_span s; uint64_t k[3]; uint8_t b[DMSH_DRV_SIZE]; } g_dm[VKA_NSTAGE][3];   // k: what the bytes were filled from (drv_key)
+static struct { int valid; vka_span s; uint64_t k[4]; uint8_t b[DMSH_DRV_SIZE]; } g_dm[VKA_NSTAGE][3];   // k: what the bytes were filled from (drv_key)
 static struct { int valid; uint64_t gen; vka_span s; } g_gm;
 static struct { int valid; uint32_t ref; vka_span s; } g_sm_ref;   // the support buffer with the alpha test's reference (stage_writes)
 static int g_drv_memo = 1, g_drv_stamp = 1; static uint64_t g_dm_hit, g_dm_miss, g_dm_stamp;
 static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_gm.valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); g_drv_stamp = VKA_ENV("DM_VK_DRV_STAMP", 1); }
-// What a graphics stage's segment is filled from (vka_bind.c vka_drv_fill), as stamps and values: c0 from the stage's storage buffers, the base instance and the sample
-// count; c2 from the stage's texture, sampler and image handles (and the pools' bases when the shader reads the pools); the push bank from the pushed constants. The same
-// key as the memo's: the same bytes, so the draw binds the memo's span without filling the segment and comparing it (DM_VK_DRV_STAMP, live from the next submission,
-// default 1; 0: filled and compared every draw, as before). A c2 fill and compare is ~0.3 us a stage on the Mac (its 2.5 KB, 300 handle words)
-static void drv_key(const vka_dstate *d, int st, int bi_, int pool, uint64_t k[3]) {
-    if (bi_ == 0) { k[0] = d->s_ssbo[st]; k[1] = d->b.base_instance; k[2] = d->b.samples; }
-    else if (bi_ == 1) { k[0] = d->s_tex[st]; k[1] = pool ? (uint64_t)(uint32_t)d->b.tex_base | (uint64_t)(uint32_t)d->b.samp_base << 32 : 0; k[2] = (uint64_t)(pool != 0); }
-    else { k[0] = d->s_push; k[1] = k[2] = 0; }
+// What a stage's segment is filled from (vka_bind.c vka_drv_fill), as stamps and values: c0 from storage buffers + (for compute, stage-5 UBOs + dispatch grid/nvn2; for graphics, base_instance + samples);
+// c2 from texture/sampler/image handles (+ pool bases); push bank from pushed constants. Indirect compute dispatches (c0 != NULL) copy GPU counts into c0 so they keep a dedicated scratch span for c0 while still memoizing c2 and push.
+static void drv_key(const vka_dstate *d, int st, int bi_, int pool, uint64_t k[4]) {
+    if (bi_ == 0 && st == 5) {
+        k[0] = d->s_ssbo[5]; k[1] = d->s_ubo5;
+        k[2] = (uint64_t)d->b.dispatch[0] | ((uint64_t)d->b.dispatch[1] << 32);
+        k[3] = (uint64_t)d->b.dispatch[2] | ((uint64_t)(d->b.nvn2 != 0) << 32);
+    } else if (bi_ == 0) {
+        k[0] = d->s_ssbo[st]; k[1] = d->b.base_instance; k[2] = d->b.samples; k[3] = 0;
+    } else if (bi_ == 1) {
+        k[0] = d->s_tex[st]; k[1] = pool ? (uint64_t)(uint32_t)d->b.tex_base | (uint64_t)(uint32_t)d->b.samp_base << 32 : 0; k[2] = (uint64_t)(pool != 0); k[3] = 0;
+    } else {
+        k[0] = d->s_push; k[1] = k[2] = k[3] = 0;
+    }
 }
 static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptorBufferInfo *bi, c0_at *c0) {
     size_t sz = vka_drv_size(bank); vka_span s;
     // One memo slot per segment kind: c0, c2 and the push bank. Any other driver bank (an all-zero c17-style read of DMSH_DRV_SIZE bytes) takes the fill below: sharing
     // the push bank's slot, an all-zero push block matched it and the 0x100-byte span was bound with a 0xA00-byte range (other draws' scratch, or past the buffer)
     int bi_ = bank == 0 ? 0 : bank == 2 ? 1 : bank == DMSH_PUSH_BANK ? 2 : -1;
-    if (g_drv_memo && bi_ >= 0 && st != 5 && sz <= DMSH_DRV_SIZE) {
+    if (g_drv_memo && bi_ >= 0 && !(bank == 0 && c0 != NULL) && sz <= DMSH_DRV_SIZE) {
         static uint8_t tmp[DMSH_DRV_SIZE];
         typeof(g_dm[0][0]) *m = &g_dm[st][bi_];
-        uint64_t key[3]; drv_key(d, st, bi_, pool, key);
+        uint64_t key[4]; drv_key(d, st, bi_, pool, key);
         if (g_drv_stamp && m->valid && !memcmp(m->k, key, sizeof key)) { g_dm_hit++; g_dm_stamp++; *bi = (VkDescriptorBufferInfo){m->s.buf, m->s.off, sz}; return 1; }
         vka_drv_fill(&d->b, st, bank, pool, tmp);
         if (m->valid && !memcmp(m->b, tmp, sz)) { memcpy(m->k, key, sizeof key); g_dm_hit++; *bi = (VkDescriptorBufferInfo){m->s.buf, m->s.off, sz}; return 1; }
@@ -3254,7 +3260,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
   ndsr_net:
     for (int i = 0; i < g_wk.n[5]; i++) if (g_wk.r[5][i].what == VKA_R_TEX && g_wk.r[5][i].tid && vka_tbuf_pending(g_wk.r[5][i].tid, g_wk.r[5][i].dim))
         vka_tbuf_refresh(g_wk.r[5][i].tid, g_wk.r[5][i].dim, g_cb);   // buffer textures read as images: their copies (vka_tbuf.c; no pass is open)
-    if (!bind_sets(d, sh, &lay, VK_PIPELINE_BIND_POINT_COMPUTE, &c0)) { g_skipped++; return; }
+    if (!bind_sets(d, sh, &lay, VK_PIPELINE_BIND_POINT_COMPUTE, dp->ind ? &c0 : NULL)) { g_skipped++; return; }
     if (dp->ind && c0.buf) {   // the group counts the GPU wrote, into c0's dispatch words before the dispatch reads them (nvn_mtl.m g_c0_dim_buf); NVN2 reads them at c0 + 4 too
         vka_disp_settle(g_cb);   // (a copy: after the dispatches before it, as before; "Dispatch order")
         VkBufferCopy c[2] = {{io, c0.off + DMSH_C0_DISPATCH, 12}, {io, c0.off + DMSH_C0_DISPATCH_NVN2, 12}};

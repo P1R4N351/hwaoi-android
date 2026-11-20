@@ -519,7 +519,7 @@ typedef struct {
     uint32_t ubo_dirty[VKA_NSTAGE];    // uniform buffer slots bound since the open run's last draw, a bit per slot
     // Stamps (vka_stamp: unique across every queue's state) of what a state record last changed, so a draw can tell an input it derived from is unchanged without comparing
     // it: the vertex attribute formats and streams, the vertex buffers, each stage's storage buffers, its texture / sampler / image handles, the pushed constants
-    uint64_t s_vfmt, s_vbuf, s_ssbo[VKA_NSTAGE], s_tex[VKA_NSTAGE], s_push;
+    uint64_t s_vfmt, s_vbuf, s_ubo5, s_ssbo[VKA_NSTAGE], s_tex[VKA_NSTAGE], s_push;
 } vka_dstate;
 uint64_t vka_stamp(void);   // a new stamp, never 0 and never given twice
 void vka_dstate_reset(vka_dstate *d);

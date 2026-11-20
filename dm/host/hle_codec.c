@@ -3,7 +3,8 @@
 // Basis: both are implementations of nn::codec::IOpusDecoder, with the 10 vtable slots identical one by one in order and signature (destructor×2, GetWorkBufferSize, IsInitialized,
 // Initialize, Finalize, GetSampleRate, GetChannelCount, Reset, DecodeInterleaved); the game allocates 0x40 bytes and the software object is 0x30 bytes.
 #include "hle.h"
-#include <stdatomic.h>
+#include "hle_codec_fast.h"
+#include <stdlib.h>
 
 HLE_FORCE("_ZN2nn5codec19HardwareOpusDecoderC1Ei", "hwopus service; replaced by the SDK software OpusDecoder (same IOpusDecoder virtual interface)",
           void, h_codec_HwOpusCtor, void *self, int option) {
@@ -22,7 +23,15 @@ HLE_FORCE("_ZN2nn5codec19HardwareOpusDecoderC1Ei", "hwopus service; replaced by 
 // here changes what a decoder does; the counts are atomics, the line is taken by whichever thread passes the 10 s mark first
 static _Atomic uint64_t g_op_dec, g_op_fail, g_op_zero, g_op_enq, g_op_refused, g_op_samples, g_op_resets, g_op_fins, g_op_inits, g_op_next_ns;
 static _Atomic int g_op_peak, g_op_io_peak, g_op_live;
-static int opus_pcm_peak(const int16_t *p, size_t n) { int pk = 0; for (size_t i = 0; i < n; i++) { int v = p[i] < 0 ? -p[i] : p[i]; if (v > pk) pk = v; } return pk; }
+static int opus_fast_on(void) {
+    static _Atomic int v = -1;
+    int x = atomic_load_explicit(&v, memory_order_relaxed);
+    if (x < 0) { const char *e = getenv("DM_OPUS_FAST"); x = !(e && e[0] == '0' && !e[1]); atomic_store_explicit(&v, x, memory_order_relaxed); }
+    return x;
+}
+static dm_opus_cache g_opus_c_cache = { .wmu = PTHREAD_MUTEX_INITIALIZER };
+static dm_opus_cache g_opus_mgr_cache = { .wmu = PTHREAD_MUTEX_INITIALIZER };
+static int opus_pcm_peak(const int16_t *p, size_t n) { return opus_fast_on() ? dm_opus_pcm_peak_fast(p, n) : dm_opus_pcm_peak_scalar(p, n); }
 static void opus_note_pcm(const int16_t *p, size_t n) {   // one decoded frame: all-zero frames and the loudest sample of the window
     int pk = opus_pcm_peak(p, n); if (!pk) atomic_fetch_add(&g_op_zero, 1);
     int old = atomic_load(&g_op_peak); while (pk > old && !atomic_compare_exchange_weak(&g_op_peak, &old, pk)) {}
@@ -47,7 +56,21 @@ static void opus_event(const char *what, const char *iface, int live_delta) {   
     if (c < 32) LOG("[codec] Opus decoder %s at %.1f s (%s interface, %d decoders alive)%s", what, dm_rel_s(), iface, live, c == 31 ? "; not logged from here on" : "");
 }
 static void *opus_fn(const char *name) { void *f = guest_sym(name); if (!f) die("sdk lacks %s", name); return f; }
-static void *opus_soft(const void *hw) { void *s = objmap_get(hw); if (!s) die("Opus decoder %p was not initialized by the host", hw); return s; }
+static void *opus_fn_cached(_Atomic(void *) *slot, const char *name) {
+    void *f = atomic_load_explicit(slot, memory_order_acquire);
+    if (!f) { f = opus_fn(name); atomic_store_explicit(slot, f, memory_order_release); }
+    return f;
+}
+static void *opus_soft_ch(const void *hw, int *ch_out) {
+    int fast = opus_fast_on();
+    void *s = fast ? dm_opus_cache_get(&g_opus_c_cache, (uintptr_t)hw, ch_out) : NULL;
+    if (s) return s;
+    s = objmap_get(hw);
+    if (!s) die("Opus decoder %p was not initialized by the host", hw);
+    if (ch_out) *ch_out = 0;
+    return s;
+}
+static void *opus_soft(const void *hw) { return opus_soft_ch(hw, NULL); }
 HLE_FORCE("_ZN2nn5codec36GetHardwareOpusDecoderWorkBufferSizeEiii", "hwopus service; work buffer computed for the software decoder", size_t, h_codec_HwOpusWorkSize, int rate, int ch, int option) {
     (void)option; size_t (*f)(int, int) = opus_fn("_ZN2nn5codec28GetOpusDecoderWorkBufferSizeEii"); return f(rate, ch);
 }
@@ -60,34 +83,43 @@ HLE_FORCE("_ZN2nn5codec29InitializeHardwareOpusDecoderEPNS0_23HardwareOpusDecode
           void *hw, int rate, int ch, void *buf, size_t size, int option) {
     (void)option; int (*f)(void *, int, int, void *, size_t) = opus_fn("_ZN2nn5codec21InitializeOpusDecoderEPNS0_15OpusDecoderTypeEiiPvm");
     void *s = objmap_get(hw); if (!s) { s = calloc(1, SOFT_OPUS_STATE); objmap_put(hw, s); }
-    int r = f(s, rate, ch, buf, size); if (!r) opus_event("initialized", "older", 1);
+    int r = f(s, rate, ch, buf, size);
+    if (!r) { opus_event("initialized", "older", 1); dm_opus_cache_put(&g_opus_c_cache, (uintptr_t)hw, s, ch); }
     return r;
 }
 static int opus_mgr_dec_fini(void *gd); static int opus_mgr_dec_reset(void *gd);   // a decoder of a manager (below)
 HLE_FORCE("_ZN2nn5codec27FinalizeHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", "hwopus service; software OpusDecoder", void, h_codec_HwOpusFini, void *hw) {
     if (opus_mgr_dec_fini(hw)) return;
-    void (*f)(void *) = opus_fn("_ZN2nn5codec19FinalizeOpusDecoderEPNS0_15OpusDecoderTypeE");
+    static _Atomic(void *) fn_slot;
+    void (*f)(void *) = opus_fn_cached(&fn_slot, "_ZN2nn5codec19FinalizeOpusDecoderEPNS0_15OpusDecoderTypeE");
+    dm_opus_cache_del(&g_opus_c_cache, (uintptr_t)hw);
     void *s = objmap_del(hw); if (s) { f(s); free(s); opus_event("finalized", "older", -1); }
 }
 HLE_FORCE("_ZN2nn5codec32GetHardwareOpusDecoderSampleRateEPKNS0_23HardwareOpusDecoderTypeE", "hwopus service; software OpusDecoder", int, h_codec_HwOpusRate, const void *hw) {
-    int (*f)(const void *) = opus_fn("_ZN2nn5codec24GetOpusDecoderSampleRateEPKNS0_15OpusDecoderTypeE"); return f(opus_soft(hw));
+    static _Atomic(void *) fn_slot;
+    int (*f)(const void *) = opus_fn_cached(&fn_slot, "_ZN2nn5codec24GetOpusDecoderSampleRateEPKNS0_15OpusDecoderTypeE"); return f(opus_soft(hw));
 }
 HLE_FORCE("_ZN2nn5codec34GetHardwareOpusDecoderChannelCountEPKNS0_23HardwareOpusDecoderTypeE", "hwopus service; software OpusDecoder", int, h_codec_HwOpusCh, const void *hw) {
-    int (*f)(const void *) = opus_fn("_ZN2nn5codec26GetOpusDecoderChannelCountEPKNS0_15OpusDecoderTypeE"); return f(opus_soft(hw));
+    static _Atomic(void *) fn_slot;
+    int ch = 0; void *soft = opus_soft_ch(hw, &ch);
+    if (opus_fast_on() && ch > 0) return ch;
+    int (*f)(const void *) = opus_fn_cached(&fn_slot, "_ZN2nn5codec26GetOpusDecoderChannelCountEPKNS0_15OpusDecoderTypeE"); return f(soft);
 }
 HLE_FORCE("_ZN2nn5codec24ResetHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", "hwopus service; software OpusDecoder", void, h_codec_HwOpusReset, void *hw) {
     if (opus_mgr_dec_reset(hw)) return;
-    void (*f)(void *) = opus_fn("_ZN2nn5codec16ResetOpusDecoderEPNS0_15OpusDecoderTypeE"); f(opus_soft(hw)); opus_event("reset", "older", 0);
+    static _Atomic(void *) fn_slot;
+    void (*f)(void *) = opus_fn_cached(&fn_slot, "_ZN2nn5codec16ResetOpusDecoderEPNS0_15OpusDecoderTypeE"); f(opus_soft(hw)); opus_event("reset", "older", 0);
 }
 HLE_FORCE("_ZN2nn5codec33DecodeOpusInterleavedWithHardwareEPNS0_23HardwareOpusDecoderTypeEPmPiPsmPKvm", "hwopus service; software OpusDecoder", int, h_codec_HwOpusDecode,
           void *hw, size_t *consumed, int *samples, int16_t *out, size_t out_size, const void *in, size_t in_size) {
-    int (*f)(void *, size_t *, int *, int16_t *, size_t, const void *, size_t) = opus_fn("_ZN2nn5codec21DecodeOpusInterleavedEPNS0_15OpusDecoderTypeEPmPiPsmPKvm");
-    void *soft = opus_soft(hw);
+    static _Atomic(void *) dec_slot, ch_slot;
+    int (*f)(void *, size_t *, int *, int16_t *, size_t, const void *, size_t) = opus_fn_cached(&dec_slot, "_ZN2nn5codec21DecodeOpusInterleavedEPNS0_15OpusDecoderTypeEPmPiPsmPKvm");
+    int ch = 0; void *soft = opus_soft_ch(hw, &ch);
     int r = f(soft, consumed, samples, out, out_size, in, in_size);
     atomic_fetch_add(&g_op_dec, 1);
     if (r) { atomic_fetch_add(&g_op_fail, 1); static int nred; if (nred++ < 4) LOG("[RED] codec: Opus decode of a %zu-byte packet failed (%#x)", in_size, r); }
     else if (samples && *samples > 0) {
-        int (*chf)(const void *) = opus_fn("_ZN2nn5codec26GetOpusDecoderChannelCountEPKNS0_15OpusDecoderTypeE"); int ch = chf(soft);
+        if (ch <= 0) { int (*chf)(const void *) = opus_fn_cached(&ch_slot, "_ZN2nn5codec26GetOpusDecoderChannelCountEPKNS0_15OpusDecoderTypeE"); ch = chf(soft); }
         size_t n = (size_t)*samples * (size_t)(ch > 0 ? ch : 1); if (n * 2 > out_size) n = out_size / 2;
         atomic_fetch_add(&g_op_samples, (uint64_t)*samples); opus_note_pcm(out, n);
     }
@@ -119,10 +151,14 @@ HLE_FORCE("_ZN2nn5codec40InitializeHardwareOpusMultiStreamDecoderEPNS0_34Hardwar
           int, h_codec_HwOpusMsInit, void *hw, int rate, int ch, int streams, int stereo, const uint8_t *mapping, void *buf, size_t size, int option) {
     (void)option; int (*f)(void *, int, int, int, int, const uint8_t *, void *, size_t) = opus_fn("_ZN2nn5codec32InitializeOpusMultiStreamDecoderEPNS0_26OpusMultiStreamDecoderTypeEiiiiPKhPvm");
     void *s = objmap_get(hw); if (!s) { s = calloc(1, SOFT_OPUS_STATE); objmap_put(hw, s); }
-    return f(s, rate, ch, streams, stereo, mapping, buf, size);
+    int r = f(s, rate, ch, streams, stereo, mapping, buf, size);
+    if (!r) dm_opus_cache_put(&g_opus_c_cache, (uintptr_t)hw, s, ch);
+    return r;
 }
 HLE_FORCE("_ZN2nn5codec38FinalizeHardwareOpusMultiStreamDecoderEPNS0_34HardwareOpusMultiStreamDecoderTypeE", "hwopus service; software OpusMultiStreamDecoder", void, h_codec_HwOpusMsFini, void *hw) {
-    void (*f)(void *) = opus_fn("_ZN2nn5codec30FinalizeOpusMultiStreamDecoderEPNS0_26OpusMultiStreamDecoderTypeE");
+    static _Atomic(void *) fn_slot;
+    void (*f)(void *) = opus_fn_cached(&fn_slot, "_ZN2nn5codec30FinalizeOpusMultiStreamDecoderEPNS0_26OpusMultiStreamDecoderTypeE");
+    dm_opus_cache_del(&g_opus_c_cache, (uintptr_t)hw);
     void *s = objmap_del(hw); if (s) { f(s); free(s); }
 }
 HLE_FORCE("_ZN2nn5codec43GetHardwareOpusMultiStreamDecoderSampleRateEPKNS0_34HardwareOpusMultiStreamDecoderTypeE", "hwopus service; software OpusMultiStreamDecoder", int, h_codec_HwOpusMsRate, const void *hw) {
@@ -142,7 +178,8 @@ HLE_FORCE("_ZN2nn5codec35ResetHardwareOpusMultiStreamDecoderEPNS0_34HardwareOpus
 }
 HLE_FORCE("_ZN2nn5codec44DecodeOpusMultiStreamInterleavedWithHardwareEPNS0_34HardwareOpusMultiStreamDecoderTypeEPmPiPsmPKvm", "hwopus service; software OpusMultiStreamDecoder", int, h_codec_HwOpusMsDecode,
           void *hw, size_t *consumed, int *samples, int16_t *out, size_t out_size, const void *in, size_t in_size) {
-    int (*f)(void *, size_t *, int *, int16_t *, size_t, const void *, size_t) = opus_fn("_ZN2nn5codec32DecodeOpusMultiStreamInterleavedEPNS0_26OpusMultiStreamDecoderTypeEPmPiPsmPKvm");
+    static _Atomic(void *) fn_slot;
+    int (*f)(void *, size_t *, int *, int16_t *, size_t, const void *, size_t) = opus_fn_cached(&fn_slot, "_ZN2nn5codec32DecodeOpusMultiStreamInterleavedEPNS0_26OpusMultiStreamDecoderTypeEPmPiPsmPKvm");
     return f(opus_soft(hw), consumed, samples, out, out_size, in, in_size);
 }
 // The hardware's decode time of the last frame (nn::TimeSpan); the software decoder runs inline on the caller's thread, so none is reported
@@ -162,7 +199,7 @@ HLE_FORCE("_ZN2nn5codec47GetHardwareOpusMultiStreamDecoderProcessingTimeEPKNS0_3
 typedef struct opus_req { struct opus_req *next; size_t n; int samples; uint8_t data[]; } opus_req;   // a waiting packet, then (decoded) its PCM
 typedef struct opus_mgr opus_mgr;
 typedef struct opus_dec { const void *gd; struct opus_dec *next_all; opus_mgr *m; void *soft; void *work; int ch; opus_req *wait, *wait_tail, *done, *done_tail; int nwait, ndone; } opus_dec;
-struct opus_mgr { pthread_mutex_t lock; void *event; int io_total, io_used, ndec, cap; opus_dec **dec; };
+struct opus_mgr { pthread_mutex_t lock; void *event; int io_total, io_used, ndec, cap, nfree; opus_dec **dec; opus_req *free_req; };
 static opus_mgr *opus_mgr_of(const void *gm) { opus_mgr *m = *(opus_mgr *const *)gm; if (!m) die("Opus decoder manager %p was not initialized by the host", gm); return m; }
 // A manager's decoders are listed here by the game's object, apart from objmap: FinalizeHardwareOpusDecoder and ResetHardwareOpusDecoder serve both interfaces, and objmap's
 // entry of a decoder of the older interface is the software OpusDecoderType itself (work buffer at +0 and +8, its size at +0x10), which read as an opus_dec looked like one with
@@ -170,9 +207,14 @@ static opus_mgr *opus_mgr_of(const void *gm) { opus_mgr *m = *(opus_mgr *const *
 static pthread_mutex_t g_mdec_lock = PTHREAD_MUTEX_INITIALIZER;
 static opus_dec *g_mdecs;
 static opus_dec *opus_mdec_find(const void *gd, int take) {
+    if (!take && opus_fast_on()) {
+        opus_dec *hit = dm_opus_cache_get(&g_opus_mgr_cache, (uintptr_t)gd, NULL);
+        if (hit) return hit;
+    }
     pthread_mutex_lock(&g_mdec_lock);
     opus_dec **pp = &g_mdecs; while (*pp && (*pp)->gd != gd) pp = &(*pp)->next_all;
-    opus_dec *d = *pp; if (d && take) *pp = d->next_all;
+    opus_dec *d = *pp;
+    if (d && take) { *pp = d->next_all; dm_opus_cache_del(&g_opus_mgr_cache, (uintptr_t)gd); }
     pthread_mutex_unlock(&g_mdec_lock);
     return d;
 }
@@ -197,6 +239,7 @@ HLE_FORCE("_ZN2nn5codec36InitializeHardwareOpusDecoderManagerEPNS0_30HardwareOpu
 HLE_FORCE("_ZN2nn5codec34FinalizeHardwareOpusDecoderManagerEPNS0_30HardwareOpusDecoderManagerTypeE", "hwopus service; host manager state", void, h_codec_HwOpusMgrFini, void *gm) {
     opus_mgr *m = *(opus_mgr **)gm; if (!m) return;
     for (int i = 0; i < m->ndec; i++) if (m->dec[i]) m->dec[i]->m = NULL;
+    opus_free_list(m->free_req); m->free_req = NULL; m->nfree = 0;
     *(opus_mgr **)gm = NULL; pthread_mutex_destroy(&m->lock); free(m->dec); free(m);
 }
 HLE_FORCE("_ZN2nn5codec46GetHardwareOpusDecoderManagerFreeIoBufferCountEPKNS0_30HardwareOpusDecoderManagerTypeE", "hwopus service; host manager state", int, h_codec_HwOpusMgrFreeIo, const void *gm) {
@@ -219,13 +262,22 @@ HLE_FORCE("_ZN2nn5codec29InitializeHardwareOpusDecoderEPNS0_23HardwareOpusDecode
     m->dec[m->ndec++] = d;
     pthread_mutex_unlock(&m->lock);
     if (opus_mdec_find(gd, 0)) die("Opus decoder %p initialized twice without Finalize", gd);
-    pthread_mutex_lock(&g_mdec_lock); d->next_all = g_mdecs; g_mdecs = d; pthread_mutex_unlock(&g_mdec_lock);
+    pthread_mutex_lock(&g_mdec_lock); d->next_all = g_mdecs; g_mdecs = d; dm_opus_cache_put(&g_opus_mgr_cache, (uintptr_t)gd, d, ch); pthread_mutex_unlock(&g_mdec_lock);
     opus_event("initialized", "manager", 1);
     return 0;
 }
+static void opus_recycle_list(opus_mgr *m, opus_req *r) {
+    int cap = m->io_total + 4;
+    while (r) {
+        opus_req *n = r->next;
+        if (opus_fast_on() && m->nfree < cap) { r->next = m->free_req; m->free_req = r; m->nfree++; }
+        else free(r);
+        r = n;
+    }
+}
 static void opus_dec_clear(opus_dec *d) {   // under the manager's lock: every request of the decoder dropped, its I/O buffers back to the pool
-    if (d->m) d->m->io_used -= d->nwait + d->ndone;
-    opus_free_list(d->wait); opus_free_list(d->done);
+    if (d->m) { d->m->io_used -= d->nwait + d->ndone; opus_recycle_list(d->m, d->wait); opus_recycle_list(d->m, d->done); }
+    else { opus_free_list(d->wait); opus_free_list(d->done); }
     d->wait = d->wait_tail = d->done = d->done_tail = NULL; d->nwait = d->ndone = 0;
 }
 // FinalizeHardwareOpusDecoder and ResetHardwareOpusDecoder are the hooks above (the older C interface): both look for a manager's decoder first; 0 = not one, the older interface's
@@ -257,10 +309,13 @@ HLE_FORCE("_ZN2nn5codec36EnqueueOpusDataToHardwareOpusDecoderEPNS0_23HardwareOpu
     if (consumed) *consumed = 0;
     if (!m) return 0x3a6f;   // the manager was finalized
     if (in_size < 8 || in_size > OPUS_MAX_PACKET) { LOG("[RED] codec: Opus packet of %zu bytes enqueued", in_size); return 0x3a6f; }
-    opus_req *r = malloc(sizeof *r + (in_size > OPUS_MAX_PCM ? in_size : OPUS_MAX_PCM)); if (!r) die("Opus request malloc");
-    r->next = NULL; r->n = in_size; r->samples = 0; memcpy(r->data, in, in_size);
+    int fast = opus_fast_on();
     pthread_mutex_lock(&m->lock);
-    if (m->io_used >= m->io_total) { pthread_mutex_unlock(&m->lock); free(r); atomic_fetch_add(&g_op_refused, 1); return 0x3a6f; }   // no free I/O buffer: the game checks the count first (main+0xad2ec4)
+    if (m->io_used >= m->io_total) { pthread_mutex_unlock(&m->lock); atomic_fetch_add(&g_op_refused, 1); return 0x3a6f; }   // no free I/O buffer: the game checks the count first (main+0xad2ec4)
+    opus_req *r = (fast && m->free_req) ? m->free_req : NULL;
+    if (r) { m->free_req = r->next; m->nfree--; }
+    else { r = malloc(sizeof *r + (in_size > OPUS_MAX_PCM ? in_size : OPUS_MAX_PCM)); if (!r) { pthread_mutex_unlock(&m->lock); die("Opus request malloc"); } }
+    r->next = NULL; r->n = in_size; r->samples = 0; memcpy(r->data, in, in_size);
     m->io_used++; d->nwait++;
     { int pk = atomic_load(&g_op_io_peak); while (m->io_used > pk && !atomic_compare_exchange_weak(&g_op_io_peak, &pk, m->io_used)) {} }
     atomic_fetch_add(&g_op_enq, 1);
@@ -273,7 +328,8 @@ HLE_FORCE("_ZN2nn5codec36EnqueueOpusDataToHardwareOpusDecoderEPNS0_23HardwareOpu
 HLE_FORCE("_ZN2nn5codec34ExecuteHardwareOpusDecoderDecodingEPNS0_30HardwareOpusDecoderManagerTypeE", "hwopus service; the software OpusDecoder decodes the waiting packets here",
           int, h_codec_HwOpusExecute, void *gm) {
     opus_mgr *m = opus_mgr_of(gm);
-    int (*dec)(void *, size_t *, int *, int16_t *, size_t, const void *, size_t) = opus_fn("_ZN2nn5codec21DecodeOpusInterleavedEPNS0_15OpusDecoderTypeEPmPiPsmPKvm");
+    static _Atomic(void *) dec_slot;
+    int (*dec)(void *, size_t *, int *, int16_t *, size_t, const void *, size_t) = opus_fn_cached(&dec_slot, "_ZN2nn5codec21DecodeOpusInterleavedEPNS0_15OpusDecoderTypeEPmPiPsmPKvm");
     int any = 0;
     pthread_mutex_lock(&m->lock);
     for (int i = 0; i < m->ndec; i++) {
@@ -308,9 +364,16 @@ HLE_FORCE("_ZN2nn5codec48DequeuePcmInterleavedDataFromHardwareOpusDecoderEPNS0_2
     if (!r) { pthread_mutex_unlock(&m->lock); return 0x3a6f; }   // nothing completed: the game dequeues only as many as the completed count (main+0xad31ac)
     if (r->n > out_size) { pthread_mutex_unlock(&m->lock); LOG("[RED] codec: a %zu-byte Opus frame for a %zu-byte buffer", r->n, out_size); return 0x3a6f; }
     d->done = r->next; if (!d->done) d->done_tail = NULL; d->ndone--; m->io_used--;
-    pthread_mutex_unlock(&m->lock);
-    memcpy(out, r->data, r->n); if (samples) *samples = r->samples;
-    free(r);
+    size_t rn = r->n; int rs = r->samples;
+    if (opus_fast_on() && m->nfree < m->io_total + 4) {
+        memcpy(out, r->data, rn); if (samples) *samples = rs;
+        r->next = m->free_req; m->free_req = r; m->nfree++;
+        pthread_mutex_unlock(&m->lock);
+    } else {
+        pthread_mutex_unlock(&m->lock);
+        memcpy(out, r->data, rn); if (samples) *samples = rs;
+        free(r);
+    }
     return 0;
 }
 static int opus_count(const void *gd, int which) {

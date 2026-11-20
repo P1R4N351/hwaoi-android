@@ -46,6 +46,8 @@
 static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
 typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs, fd_alias; } seg_t;
+#define VKA_MEM_SEG_DEFINED 1
+#include "vka_mem_lc.h"
 static seg_t *g_sg; static int g_nsg, g_sgcap;   // sorted by lo, disjoint
 // Bumped (under g_rw for writing) whenever a segment comes or goes: the replay's per-thread lookup cache (vka_addr, vka_addr_run) holds while it stands
 static _Atomic uint64_t g_sg_gen = 1;
@@ -771,13 +773,14 @@ int vka_mem_release(uintptr_t lo, uintptr_t hi) {
 // The segments this thread found, by address block (the draws look up their vertex and uniform buffers, ~10 lookups a draw): valid while g_sg_gen stands.
 // A segment is unplaced only after the last fence reserved has completed (unplace), so one still in a cache that the generation has not caught yet is not freed under
 // a submission that uses it
-enum { NLC = 1024 };   // direct-mapped by 64 KiB block of the address: the level's ~8,000 draws read buffers in ~1,000 segments
-typedef struct { uint64_t gen; seg_t s[NLC]; } lcache;
+enum { NLC = 1024 };   // legacy direct-mapped table (DM_VK_LC_FAST=0 fallback)
+typedef struct { uint64_t gen; seg_t s[NLC]; vka_lc4 fast; } lcache;
 static __thread lcache *t_lc;
 // The recording thread's cache outside TLS: a __thread variable of a dlopen'ed library is reached through the dynamic TLS descriptor resolver at every access, and the
 // lookups run ~10 times a draw (profile p2: the lookup 8 % of the replay thread, the resolver in it). The first thread that records a submission (vka_mem_rec_thread) owns it
 // for the life of the process; any other thread keeps its own TLS cache, so the global one is only ever touched by its owner (DM_VK_LC_GLOBAL=0: TLS for every thread)
 static lcache g_rlc; static _Atomic(void *) g_rlc_tp;
+static int lc_fast_on(void) { static int v = -1; if (v < 0) v = VKA_ENV("DM_VK_LC_FAST", 1) != 0; return v; }
 void vka_mem_rec_thread(void) {
     void *tp = __builtin_thread_pointer(), *none = NULL;
     if (!atomic_load_explicit(&g_rlc_tp, memory_order_relaxed) && VKA_ENV("DM_VK_LC_GLOBAL", 1)) atomic_compare_exchange_strong(&g_rlc_tp, &none, tp);
@@ -787,7 +790,9 @@ static const seg_t *lookup(uintptr_t a, seg_t *tmp) {   // the segment holding a
     if (__builtin_thread_pointer() == atomic_load_explicit(&g_rlc_tp, memory_order_relaxed)) c = &g_rlc;
     else { c = t_lc; if (!c) c = t_lc = calloc(1, sizeof *c); }
     uint64_t gen = atomic_load_explicit(&g_sg_gen, memory_order_acquire);
-    seg_t *e = c ? &c->s[(a >> 16) & (NLC - 1)] : NULL;
+    int fast = lc_fast_on();
+    if (c && fast) { const seg_t *hit = vka_lc4_get(&c->fast, gen, a); if (hit) return hit; }
+    seg_t *e = (c && !fast) ? &c->s[(a >> 16) & (NLC - 1)] : NULL;
     if (e && c->gen == gen && a >= e->lo && a < e->hi) return e;
     if (pthread_rwlock_tryrdlock(&g_rw)) {   // contended: a table edit (or, under DM_VK_MEM_LOCK_WHOLE, a placement) holds it
         uint64_t t0 = mono_ns(); pthread_rwlock_rdlock(&g_rw);
@@ -797,7 +802,8 @@ static const seg_t *lookup(uintptr_t a, seg_t *tmp) {   // the segment holding a
     int i = sg_find(a); const seg_t *r = NULL;
     if (i >= 0 && a < g_sg[i].hi) {
         *tmp = g_sg[i]; r = tmp;
-        if (c) { if (c->gen != gen) { memset(c->s, 0, sizeof c->s); c->gen = gen; } *e = g_sg[i]; }
+        if (c && fast) vka_lc4_put(&c->fast, gen, a, &g_sg[i]);
+        else if (c) { if (c->gen != gen) { memset(c->s, 0, sizeof c->s); c->gen = gen; } *e = g_sg[i]; }
     }
     pthread_rwlock_unlock(&g_rw);
     return r;

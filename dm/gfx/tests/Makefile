@@ -93,6 +93,8 @@ t_ktgl_cache: t_ktgl_cache.c ../vk_android/vka_ktgl_cache.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
 t_pso_cache: t_pso_cache.c ../vk_android/vka_pso_cache.h ../vk_android/vka_gkey.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $<
+t_vka_lc: t_vka_lc.c ../vk_android/vka_mem_lc.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $< -lpthread
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thermal: t_thermal.c $(MTL_T_DEP)
