@@ -3,6 +3,7 @@
 //       iOS defaults to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
 // The contents of AudioOut / AudioOutBuffer / AudioOutParameter are read and written only through the interfaces below; the host defines its own internal layout and only writes the front part of the structs (AudioOut: the SDK's own fields, au_info).
 #include "hle.h"
+#include "hle_audio_fast.h"
 #if PLAT_APPLE
 #include <AudioToolbox/AudioToolbox.h>
 typedef AudioUnit au_t; typedef OSStatus au_status_t;
@@ -122,7 +123,8 @@ static uint64_t pull_x(aout *a, uint8_t *dst, uint64_t n, int pad) {   // pad 0 
     uint32_t vb = atomic_load_explicit(&a->vol, memory_order_relaxed);
     if (vb != 0x3f800000u) {   // the output's volume (SetAudioOutVolume), as the audout session applies it to the PCM16 it plays; saturating
         float v; memcpy(&v, &vb, 4);
-        for (uint64_t i = 0; i < ns; i++) { float x = s16[i] * v; s16[i] = (int16_t)(x > 32767.f ? 32767.f : x < -32768.f ? -32768.f : x); }
+        if (dm_audio_fast_on()) dm_audout_scale_s16(s16, ns, v);
+        else for (uint64_t i = 0; i < ns; i++) { float x = s16[i] * v; s16[i] = (int16_t)(x > 32767.f ? 32767.f : x < -32768.f ? -32768.f : x); }
     }
     if (released) {
         if (a->event) notify_release(a);   // the notify thread only signals the guest's event: outputs without one (the host's renderer output, games that poll) need no wake-up
@@ -145,13 +147,18 @@ static uint64_t pull_device_x(aout *a, uint8_t *dst, uint64_t bytes, int pad) { 
         uint64_t n = frames < BLOCK ? frames : BLOCK;
         uint64_t got = pull_x(a, (uint8_t *)scratch, n * 6 * sizeof *scratch, pad) / (6 * sizeof *scratch);   // frames taken
         const int short_ = got < n; n = got;   // fewer than asked: nothing more is queued (pad 0), these are the last frames made
-        for (uint64_t i = 0; i < n; i++) {
-            const int16_t *p = scratch + 6 * i;
-            int64_t c = (int64_t)p[2] * CC + (int64_t)p[3] * CL;
-            int64_t l = ((int64_t)p[0] * CF + c + (int64_t)p[4] * CB) >> 15;
-            int64_t r = ((int64_t)p[1] * CF + c + (int64_t)p[5] * CB) >> 15;
-            *out++ = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
-            *out++ = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+        if (dm_audio_fast_on()) {
+            dm_audout_downmix_6to2_s16(out, scratch, n);
+            out += n * 2;
+        } else {
+            for (uint64_t i = 0; i < n; i++) {
+                const int16_t *p = scratch + 6 * i;
+                int64_t c = (int64_t)p[2] * CC + (int64_t)p[3] * CL;
+                int64_t l = ((int64_t)p[0] * CF + c + (int64_t)p[4] * CB) >> 15;
+                int64_t r = ((int64_t)p[1] * CF + c + (int64_t)p[5] * CB) >> 15;
+                *out++ = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+                *out++ = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+            }
         }
         frames -= n; done += n;
         if (short_) break;

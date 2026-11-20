@@ -21,6 +21,7 @@ DM_APP_POOL_MB	developer	Diagnostics			text			both
 DM_APP_VERSION	developer	Game			text			both							
 DM_AUDIO	internal	Audio			text			both						Mac or iOS only	
 DM_AUDIO_DUMP	developer	Diagnostics			text			both							
+DM_AUDIO_FAST	developer	Performance			text			both							
 DM_AUDIO_FEED	developer	Audio			text			both							
 DM_AUDIO_MUTE	internal	Audio			text			both						Mac or iOS only	
 DM_AUDIO_STALL_MS	developer	Diagnostics			text			both							

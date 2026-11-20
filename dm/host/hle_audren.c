@@ -12,6 +12,7 @@
 // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
 //   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
 #include "hle.h"
+#include "hle_audio_fast.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -402,19 +403,27 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
             // Channel order front-left front-right center LFE back-left back-right; 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
             enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
             static int32_t st[FRAME_MAX * 2];   // the stereo downmix before clamping (capture runs under g_render_mu)
-            for (uint32_t s = 0; s < samples; s++) {
-                int32_t l, r;
-                if (k >= 6) { int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
-                              l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15); }
-                else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
-                st[2 * s] = l; st[2 * s + 1] = r;
-            }
-            uint32_t nout = rate == 48000 ? samples : up_3_2(st, samples, st);
-            uint64_t loud = 0; int32_t peak = 0;
-            for (uint32_t s = 0; s < 2 * nout; s++) {
-                int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-                dst[s] = (int16_t)v; loud |= (uint64_t)v;
-                int32_t av = v < 0 ? -v : v; if (av > peak) peak = av;
+            uint32_t nout = samples; uint64_t loud = 0; int32_t peak = 0;
+            if (rate == 48000 && dm_audio_fast_on()) {
+                dm_audren_downmix_48k(dst, ch, k, samples, &loud, &peak);
+            } else {
+                for (uint32_t s = 0; s < samples; s++) {
+                    int32_t l, r;
+                    if (k >= 6) { int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
+                                  l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15); }
+                    else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
+                    st[2 * s] = l; st[2 * s + 1] = r;
+                }
+                nout = rate == 48000 ? samples : up_3_2(st, samples, st);
+                if (dm_audio_fast_on()) {
+                    dm_audren_clamp_peak(dst, st, 2 * nout, &loud, &peak);
+                } else {
+                    for (uint32_t s = 0; s < 2 * nout; s++) {
+                        int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+                        dst[s] = (int16_t)v; loud |= (uint64_t)v;
+                        int32_t av = v < 0 ? -v : v; if (av > peak) peak = av;
+                    }
+                }
             }
             atomic_fetch_add(&g_frames, 1); if (loud) atomic_fetch_add(&g_nonsilent, 1);
             // The window since the last line (this runs under g_render_mu): a short run still gets lines (the first second, the fifth, then every 15 s), and the window
