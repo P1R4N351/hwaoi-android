@@ -11,6 +11,7 @@
 #include "vka_fd_alias.h"
 #include "vka_tlsig.h"
 #include "vka_auto.h"
+#include "vka_scr_fast.h"
 _Static_assert(VKA_DRV_QCOM == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && VKA_DRV_TURNIP == VK_DRIVER_ID_MESA_TURNIP, "vka_auto.h driver IDs");
 
 // One "[auto] KEY=value because driver_id=N (name)" line for each automatic default by driver this device takes (vka_auto.h), once per run at device creation; a switch
@@ -894,6 +895,8 @@ static sblk *g_open[2], *g_busy;
 static _Atomic uint64_t g_scratch_bytes; static _Atomic uint32_t g_scratch_n;
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
 _Thread_local int vka_scr_up;
+static _Atomic uint64_t g_scr0_ep = 1;
+static _Thread_local vka_scr_tlab g_scr0_tlab;
 static VkSemaphore g_utl;   // the upload timeline: value n = upload batch n has completed
 static VkDeviceSize g_ubytes;   // staging taken by the open upload batch (under g_smu)
 static uint64_t up_done(void) {   // the upload timeline's value (every batch counts as done after a GPU hang)
@@ -942,10 +945,20 @@ static void sblk_trim(uint64_t done, uint64_t udone) {
 }
 int vka_scratch(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
     if (!align) align = 16;
-    int c = vka_scr_up ? 1 : 0;
+    int c = vka_scr_up ? 1 : 0, fast = !c && vka_scr_fast_on();
+    if (fast && n <= VKA_SCR_TLAB_MAX_REQ) {
+        uint64_t ep = atomic_load_explicit(&g_scr0_ep, memory_order_acquire), bu = 0, off = 0; uint8_t *ptr = NULL;
+        if (vka_scr_tlab_try(&g_scr0_tlab, ep, (uint64_t)n, (uint64_t)align, &bu, &ptr, &off)) {
+            *out = (vka_span){(VkBuffer)(uintptr_t)bu, ptr, (VkDeviceSize)off}; return 1;
+        }
+    }
     pthread_mutex_lock(&g_smu);
     sblk *b = g_open[c];
-    VkDeviceSize o = b ? (b->used + align - 1) / align * align : 0;
+    uint64_t ep0 = atomic_load_explicit(&g_scr0_ep, memory_order_relaxed);
+    if (fast && g_scr0_tlab.ep == ep0 && b && g_scr0_tlab.blk_tag == (void *)b && b->used == (VkDeviceSize)g_scr0_tlab.end) {
+        b->used = (VkDeviceSize)g_scr0_tlab.cur; g_scr0_tlab.ep = 0;
+    }
+    VkDeviceSize o = b ? (vka_scr_fast_on() ? (VkDeviceSize)vka_scr_align_up((uint64_t)b->used, (uint64_t)align) : (b->used + align - 1) / align * align) : 0;
     if (!b || o + n > b->size) {
         // Best fit among the idle blocks (a 144 MiB block kept for a 1 KB request stays alive), then the idle ones beyond the budget freed
         uint64_t done = vka_done(), udone = up_done(); sblk **best = NULL;
@@ -956,6 +969,13 @@ int vka_scratch(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
         if (!b) { pthread_mutex_unlock(&g_smu); return 0; }
         b->used = 0; b->up = c; b->next = g_open[c]; g_open[c] = b; o = 0;
     }
+    if (fast && n <= VKA_SCR_TLAB_MAX_REQ) {
+        VkDeviceSize tend = o + VKA_SCR_TLAB_CHUNK;
+        if (tend < o + n) tend = o + n; if (tend > b->size) tend = b->size;
+        b->used = tend; *out = (vka_span){b->buf, b->ptr + o, o};
+        vka_scr_tlab_fill(&g_scr0_tlab, ep0, (uint64_t)(uintptr_t)b->buf, b->ptr, b, (uint64_t)(o + n), (uint64_t)tend);
+        pthread_mutex_unlock(&g_smu); return 1;
+    }
     b->used = o + n; *out = (vka_span){b->buf, b->ptr + o, o};
     if (c) g_ubytes += n;
     pthread_mutex_unlock(&g_smu);
@@ -963,6 +983,12 @@ int vka_scratch(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
 }
 static void retire(int c, uint64_t value) {
     pthread_mutex_lock(&g_smu);
+    if (c == 0) {
+        uint64_t ep0 = atomic_load_explicit(&g_scr0_ep, memory_order_relaxed);
+        if (g_scr0_tlab.ep == ep0 && g_open[0] && g_scr0_tlab.blk_tag == (void *)g_open[0] && g_open[0]->used == (VkDeviceSize)g_scr0_tlab.end)
+            g_open[0]->used = (VkDeviceSize)g_scr0_tlab.cur;
+        g_scr0_tlab.ep = 0; atomic_fetch_add_explicit(&g_scr0_ep, 1u, memory_order_release);
+    }
     while (g_open[c]) { sblk *b = g_open[c]; g_open[c] = b->next; b->fence = value; b->next = g_busy; g_busy = b; }
     if (c) { g_ubytes = 0; sblk_trim(vka_done(), up_done()); }   // (the submission's blocks are trimmed at a miss only: a game that takes more than 16 MiB a frame would make and free them every frame)
     pthread_mutex_unlock(&g_smu);

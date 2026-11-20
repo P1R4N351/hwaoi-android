@@ -18,6 +18,7 @@
 #include <string.h>
 #include "vka_tstick.h"
 #include "vka_ktgl_cache.h"
+#include "vka_scr_fast.h"
 
 typedef struct { uint64_t serial; p_set_rt rt; int has_rt; p_scissor sc; int has_sc; int64_t copy_stride, copy_img_stride; int rc_skip; vka_dstate d; } qstate;   // what a queue keeps between submissions (d: the draw state, vka_draw.c)
 static qstate S;
@@ -1460,10 +1461,13 @@ static void rcl_op(uint32_t op, const void *a) {   // after the op ran
 enum { MDX_MAX = 1024 };
 static struct { uint64_t ind; VkBuffer buf; VkDeviceSize off; } g_mdx[MDX_MAX];
 static int g_mdx_n; static uint64_t g_mdx_ep = 1, g_mdx_scan_ep, g_mdx_sub = ~0ull, g_mdx_copies, g_mdx_splits, g_mdx_scans;
+static vka_ind_idx4 g_mdx_idx4, g_qdx_idx4, g_scan_seen[2];
 static const uint8_t *g_xret[17]; static int g_nxret;   // exec's return points (the records after each OP_CALL being run), for the look-ahead
-static void mdx_write(void) { if (g_mdx_n || g_mdx_scan_ep == g_mdx_ep) { g_mdx_ep++; g_mdx_n = 0; } }
-static void mdx_sub(void) { if (g_mdx_sub != g_n_sub) { g_mdx_sub = g_n_sub; g_mdx_ep++; g_mdx_n = 0; } }
-static int mdx_find(uint64_t ind) { for (int i = 0; i < g_mdx_n; i++) if (g_mdx[i].ind == ind) return i; return -1; }
+static void mdx_write(void) { if (g_mdx_n || g_mdx_scan_ep == g_mdx_ep) { g_mdx_ep++; g_mdx_n = 0; vka_ind_idx4_clear(&g_mdx_idx4); } }
+static void mdx_sub(void) { if (g_mdx_sub != g_n_sub) { g_mdx_sub = g_n_sub; g_mdx_ep++; g_mdx_n = 0; vka_ind_idx4_clear(&g_mdx_idx4); } }
+static int mdx_find(uint64_t ind) {
+    if (vka_scr_fast_on()) { int nl = 0; int r = vka_ind_idx4_find(&g_mdx_idx4, ind, &nl); if (r >= 0 || !nl) return r; }
+    for (int i = 0; i < g_mdx_n; i++) if (g_mdx[i].ind == ind) return i; return -1; }
 static int mdx_on(void) { return vka_mesh_on() && VKA_ENV("DM_VK_MESH_IND", 1); }
 
 #include "vka_quad_indirect_spv.h"
@@ -1476,29 +1480,51 @@ static VkPipelineLayout g_qdx_pl;
 static VkPipeline g_qdx_pipe;
 static VkBuffer g_qdx_ib;
 static VkDeviceMemory g_qdx_ib_mem;
-static void qdx_write(void) { if (g_qdx_n || g_qdx_scan_ep == g_qdx_ep) { g_qdx_ep++; g_qdx_n = 0; } }
-static void qdx_sub(void) { if (g_qdx_sub != g_n_sub) { g_qdx_sub = g_n_sub; g_qdx_ep++; g_qdx_n = 0; } }
-static int qdx_find(uint64_t ind) { for (int i = 0; i < g_qdx_n; i++) if (g_qdx[i].ind == ind) return i; return -1; }
+static void qdx_write(void) { if (g_qdx_n || g_qdx_scan_ep == g_qdx_ep) { g_qdx_ep++; g_qdx_n = 0; vka_ind_idx4_clear(&g_qdx_idx4); } }
+static void qdx_sub(void) { if (g_qdx_sub != g_n_sub) { g_qdx_sub = g_n_sub; g_qdx_ep++; g_qdx_n = 0; vka_ind_idx4_clear(&g_qdx_idx4); } }
+static int qdx_find(uint64_t ind) {
+    if (vka_scr_fast_on()) { int nl = 0; int r = vka_ind_idx4_find(&g_qdx_idx4, ind, &nl); if (r >= 0 || !nl) return r; }
+    for (int i = 0; i < g_qdx_n; i++) if (g_qdx[i].ind == ind) return i; return -1; }
 static int qdx_on(void) { return V.push_desc && vk.vkCmdPushDescriptorSetKHR && VKA_ENV("DM_VK_QUAD_IND", 1); }
 
 // Collect unique indirect records in replay order up to the next buffer-writing command (kind: 0 = mesh, 1 = quads).
-static int ind_scan_collect(const uint8_t *p, int kind, uint64_t *q, int qmax) {
-    int nq = 0;
+static void ind_push_unique(uint64_t ind, vka_ind_idx4 *seen, uint64_t *q, int *nq, int qmax, int fast) {
+    if (*nq >= qmax) return;
+    if (fast) {
+        int nl = 0;
+        if (vka_ind_idx4_find(seen, ind, &nl) >= 0) return;
+        if (nl) { for (int k = 0; k < *nq; k++) if (q[k] == ind) return; }
+        vka_ind_idx4_put(seen, ind, *nq);
+    } else {
+        for (int k = 0; k < *nq; k++) if (q[k] == ind) return;
+    }
+    q[(*nq)++] = ind;
+}
+static void ind_scan_collect_both(const uint8_t *p, int want_m, uint64_t *mq, int *mn, int want_q, uint64_t *qq, int *qn, int qmax) {
+    int fast = vka_scr_fast_on();
+    if (fast) { if (want_m) vka_ind_idx4_clear(&g_scan_seen[0]); if (want_q) vka_ind_idx4_clear(&g_scan_seen[1]); }
     const uint8_t *ret[17]; int nret = g_nxret; memcpy(ret, g_xret, sizeof(ret[0]) * (size_t)nret);
-    for (int guard = 0; guard < 200000 && nq < qmax; guard++) {
+    for (int guard = 0; guard < 200000 && ((want_m && *mn < qmax) || (want_q && *qn < qmax)); guard++) {
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
         if (h.op == OP_END) { if (!nret) break; p = ret[--nret]; continue; }
         if (h.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
         if (h.op == OP_CALL) { if (nret == 17) break; ret[nret++] = p + h.size; memcpy(&p, a, 8); continue; }
         if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_UPDATE_UB) break;
         if (h.op == OP_DRAW) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t);
-            int match = kind ? (d->prim == NVN_DRAW_PRIMITIVE_QUADS && d->ind && !d->mdi_cnt && qdx_find(d->ind) < 0)
-                             : (d->prim == NVN_PRIM_MESH && d->ind && mdx_find(d->ind) < 0);
-            if (match) { int dup = 0; for (int k = 0; k < nq && !dup; k++) dup = q[k] == d->ind; if (!dup) q[nq++] = d->ind; } }
+            if (want_m && d->prim == NVN_PRIM_MESH && d->ind && !d->mdi_cnt && mdx_find(d->ind) < 0)
+                ind_push_unique(d->ind, &g_scan_seen[0], mq, mn, qmax, fast);
+            if (want_q && d->prim == NVN_DRAW_PRIMITIVE_QUADS && d->ind && !d->mdi_cnt && qdx_find(d->ind) < 0)
+                ind_push_unique(d->ind, &g_scan_seen[1], qq, qn, qmax, fast);
+        }
         if (h.size < 8) break;
         p += h.size;
     }
-    return nq;
+}
+static int ind_scan_collect(const uint8_t *p, int kind, uint64_t *q, int qmax) {
+    int nm = 0, nq = 0;
+    if (kind) ind_scan_collect_both(p, 0, NULL, &nm, 1, q, &nq, qmax);
+    else ind_scan_collect_both(p, 1, q, &nm, 0, NULL, &nq, qmax);
+    return kind ? nq : nm;
 }
 static void mdx_copy(const uint64_t *inds, int n) {
     vka_span s;
@@ -1510,7 +1536,8 @@ static void mdx_copy(const uint64_t *inds, int n) {
         if (!vka_addr(inds[k], 8, &b, &o, NULL) || (o & 3)) continue;   // (the draw skips it, logged there)
         VkBufferCopy c = {o, d, 4}; vk.vkCmdCopyBuffer(g_cb, b, s.buf, 1, &c);
         vk.vkCmdFillBuffer(g_cb, s.buf, d + 4, 8, 1);
-        g_mdx[g_mdx_n].ind = inds[k]; g_mdx[g_mdx_n].buf = s.buf; g_mdx[g_mdx_n++].off = d; g_mdx_copies++;
+        g_mdx[g_mdx_n].ind = inds[k]; g_mdx[g_mdx_n].buf = s.buf; g_mdx[g_mdx_n].off = d;
+        vka_ind_idx4_put(&g_mdx_idx4, inds[k], g_mdx_n); g_mdx_n++; g_mdx_copies++;
         uint32_t w[2] = {0};
         if (vka_cpu_read(inds[k], w, sizeof w) && w[1]) VRED_ONCE("indirect mesh draw record at %#llx has first workgroup %u (as the CPU sees it): not applied", (unsigned long long)inds[k], w[1]);
     }
@@ -1631,7 +1658,8 @@ static void qdx_convert(const uint64_t *inds, int n) {
         VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi};
         vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_qdx_pl, 0, 1, &w);
         vk.vkCmdDispatch(g_cb, 1, 1, 1);
-        g_qdx[g_qdx_n].ind = vi[k]; g_qdx[g_qdx_n].buf = s.buf; g_qdx[g_qdx_n++].off = vo[k] + 32; g_qdx_copies++;
+        g_qdx[g_qdx_n].ind = vi[k]; g_qdx[g_qdx_n].buf = s.buf; g_qdx[g_qdx_n].off = vo[k] + 32;
+        vka_ind_idx4_put(&g_qdx_idx4, vi[k], g_qdx_n); g_qdx_n++; g_qdx_copies++;
     }
     qdx_phase_barrier(g_cb, 2);
     vka_dyn_invalidate();
@@ -1651,6 +1679,21 @@ static void qdx_before_draw(const uint8_t *p, const p_draw *d) {
     int ind_quad = d && d->prim == NVN_DRAW_PRIMITIVE_QUADS && d->ind && !d->mdi_cnt;
     if (!vka_rp_on()) { if (g_qdx_scan_ep != g_qdx_ep || (ind_quad && qdx_find(d->ind) < 0)) qdx_scan(p); return; }
     if (ind_quad && qdx_find(d->ind) < 0) { vka_rp_end(); g_qdx_splits++; qdx_scan(p); }
+}
+static void ind_before_draw(const uint8_t *p, const p_draw *d) {
+    if (!vka_scr_fast_on() || vka_rp_on()) { mdx_before_draw(p, d); qdx_before_draw(p, d); return; }
+    int mo = mdx_on(), qo = qdx_on();
+    if (mo) mdx_sub(); if (qo) qdx_sub();
+    int need_m = mo && (g_mdx_scan_ep != g_mdx_ep || (d && d->prim == NVN_PRIM_MESH && d->ind && mdx_find(d->ind) < 0));
+    int need_q = qo && (g_qdx_scan_ep != g_qdx_ep || (d && d->prim == NVN_DRAW_PRIMITIVE_QUADS && d->ind && !d->mdi_cnt && qdx_find(d->ind) < 0));
+    if (!need_m && !need_q) return;
+    if (need_m && !need_q) { mdx_scan(p); return; }
+    if (need_q && !need_m) { qdx_scan(p); return; }
+    enum { QMAX = 256 }; uint64_t mq[QMAX], qq[QMAX]; int mn = 0, qn = 0;
+    ind_scan_collect_both(p, 1, mq, &mn, 1, qq, &qn, QMAX);
+    g_mdx_scan_ep = g_mdx_ep; g_qdx_scan_ep = g_qdx_ep;
+    if (mn) { g_mdx_scans++; mdx_copy(mq, mn); }
+    if (qn) { g_qdx_scans++; qdx_convert(qq, qn); }
 }
 int vka_qdx_args(uint64_t ind, VkBuffer *b, VkDeviceSize *o) {
     if (!qdx_on()) return 0;
@@ -1841,10 +1884,10 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
         case OP_DLSS: if (!S.rc_skip && g_cb) dlss_eval(a); break;
         case OP_BARRIER: if (g_cb && !bar_kept) { int32_t bits; memcpy(&bits, a, 4); if (!vka_gbar_game(g_cb, (uint32_t)bits)) vka_barrier(g_cb); } break;   // (vka_gbar.c: between dispatches, a compute-to-compute barrier at the next one)
         case OP_DRAW: if (S.rc_skip) vka_rtlog_skip(&S.rt, S.has_rt, &S.d, "skipped by a render condition");
-                      if (!S.rc_skip && g_cb) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t); g_stat_draws++; mdx_before_draw(p, d); qdx_before_draw(p, d); memu_before_draw(p, d); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
+                      if (!S.rc_skip && g_cb) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t); g_stat_draws++; ind_before_draw(p, d); memu_before_draw(p, d); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
                           vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, d, NULL); oq_lost(sk); } else if (!S.rc_skip && g_oq_count) g_oq_lost++; break;
         case OP_DRAW_IDX: if (S.rc_skip) vka_rtlog_skip(&S.rt, S.has_rt, &S.d, "skipped by a render condition");
-                          if (!S.rc_skip && g_cb) { p_draw_idx t; g_stat_draws++; mdx_before_draw(p, NULL); qdx_before_draw(p, NULL); memu_before_draw(p, NULL); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
+                          if (!S.rc_skip && g_cb) { p_draw_idx t; g_stat_draws++; ind_before_draw(p, NULL); memu_before_draw(p, NULL); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
                           vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, NULL, draw_idx_rec(a, h.size, &t)); oq_lost(sk); } else if (!S.rc_skip && g_oq_count) g_oq_lost++; break;
         case OP_DISPATCH: mdx_write(); qdx_write(); if (!S.rc_skip && g_cb) vka_dispatch(&S.d, a); break;
         case OP_DRAW_TEX: not_yet(h.op); if (!S.rc_skip && g_oq_count) { g_oq_lost++; g_oqs_skip++; } break;
