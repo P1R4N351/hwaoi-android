@@ -18,6 +18,7 @@
 #include "vka_ktgl_cache.h"
 #include "vka_dset_fast.h"
 #include "vka_vin_fast.h"
+#include "vka_walk_fast.h"
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -1503,13 +1504,39 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
     return 1;
 }
 // Each stage's bindings, walked once a draw or dispatch (walk_all): the images first used are made from them (make_images), then set 0 is written from them (bind_sets)
-static struct { int n[VKA_NSTAGE], pool[VKA_NSTAGE]; char why[VKA_NSTAGE][200]; vka_res r[VKA_NSTAGE][512]; } g_wk;
+static struct { int n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint8_t fl[VKA_NSTAGE]; char why[VKA_NSTAGE][200]; vka_res r[VKA_NSTAGE][512]; } g_wk;
+static vka_walk_sh_memo4 *g_walk_sh4;
+static vka_walk_meta4 *g_walk_m4;
+static vka_walk_slot *g_walk_slots;
+static void walk_stage_one(const vka_dstate *d, int st, vka_shader *s) {
+    uint32_t sa = s->lib->h->ssbo_align;
+    int fast = vka_walk_fast_on();
+    if (!fast) {
+        g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, sa, V.sb_align, rd_cb, NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
+        g_wk.fl[st] = VKA_WF_FALLBACK; return;
+    }
+    if (!g_walk_sh4) g_walk_sh4 = calloc(1, sizeof *g_walk_sh4);
+    if (!g_walk_m4) g_walk_m4 = calloc(1, sizeof *g_walk_m4);
+    if (!g_walk_slots) g_walk_slots = calloc(VKA_WALK_SLOTS, sizeof *g_walk_slots);
+    uint16_t um = 0;
+    int cacheable = g_walk_sh4 && g_walk_m4 && g_walk_slots && d->s_ssbo[st] && d->s_tex[st] &&
+                    vka_walk_shader_traits(g_walk_sh4, s->e, s->b, &um);
+    if (cacheable && vka_walk_memo4_find(g_walk_m4, g_walk_slots, (uintptr_t)s->e, (uintptr_t)s->b, s->e->key,
+            (uint8_t)st, d->s_ssbo[st], d->s_tex[st], d->b.ubo[st], um, sa, V.sb_align, (uint8_t)(vka_texu_elem != 0),
+            g_wk.r[st], &g_wk.n[st], &g_wk.pool[st], &g_wk.fl[st])) return;
+    g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, sa, V.sb_align, rd_cb, NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
+    g_wk.fl[st] = vka_walk_summarize(g_wk.r[st], g_wk.n[st]);
+    if (cacheable && g_wk.n[st] >= 0 && g_wk.n[st] <= VKA_WALK_MAX_RES)
+        vka_walk_memo4_put(g_walk_m4, g_walk_slots, (uintptr_t)s->e, (uintptr_t)s->b, s->e->key,
+            (uint8_t)st, d->s_ssbo[st], d->s_tex[st], d->b.ubo[st], um, sa, V.sb_align, (uint8_t)(vka_texu_elem != 0),
+            g_wk.r[st], g_wk.n[st], g_wk.pool[st], g_wk.fl[st]);
+}
 static void walk_all(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
     uint64_t t0_ = g_prof ? cntvct() : 0;
     vka_texu_elem = VKA_ENV("DM_VK_TEXU_ELEM", 1);   // see vka_bind.h (live, A/B)
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        vka_shader *s = sh[st]; g_wk.n[st] = 0; g_wk.pool[st] = 0; if (!s) continue;
-        g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, s->lib->h->ssbo_align, V.sb_align, rd_cb, NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
+        vka_shader *s = sh[st]; g_wk.n[st] = 0; g_wk.pool[st] = 0; g_wk.fl[st] = 0;
+        if (s) walk_stage_one(d, st, s);
     }
     if (g_prof) g_ps[0] += cntvct() - t0_;
 }
@@ -1522,7 +1549,7 @@ static void tex_masks(vka_shader *const sh[VKA_NSTAGE], uint64_t tu[5], uint64_t
     if (!VKA_ENV("DM_VK_TEX_RETYPE", 1)) return;
     static const int st_of[] = {0, 1, 2, 3, 4, 6, 7};
     for (size_t j = 0; j < sizeof st_of / sizeof *st_of; j++) {
-        int st = st_of[j]; vka_shader *s = sh[st]; if (!s) continue;
+        int st = st_of[j]; vka_shader *s = sh[st]; if (!s || !(g_wk.fl[st] & VKA_WF_FLOAT_TEX)) continue;
         int rg = vka_shader_tex_range(s); if (rg < 0 || rg >= 5) continue;
         vka_res *r = g_wk.r[st]; uint64_t um = 0, sm = 0, fm = 0, lo = (uint64_t)rg * DMSH_VK_STAGE_BINDINGS;
         for (int i = 0; i < g_wk.n[st]; i++) {
@@ -1707,7 +1734,7 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
 static int make_images(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], int dry) {
     (void)d; int any = 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        if (!sh[st]) continue;
+        if (!sh[st] || !(g_wk.fl[st] & (VKA_WF_TEX_IMG | VKA_WF_TBUF))) continue;
         const vka_res *r = g_wk.r[st];
         for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].tid
                                                  && (vka_tex_id_pending_rec(r[i].tid, r[i].dim) || (r[i].what == VKA_R_IMG && vka_tex_id_storage_pending(r[i].tid)))) {   // (an image remade with storage use copies its content: outside the pass)
@@ -1727,6 +1754,7 @@ static int draw_writes(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) {
     if (sh[2] && sh[2]->gs_fx > 0) return 1;
     for (int st = 0; st < VKA_NSTAGE; st++) {
         if (!sh[st] || (st == 1 && d->rast_discard)) continue;
+        if (!(g_wk.fl[st] & VKA_WF_FALLBACK)) { if (g_wk.fl[st] & VKA_WF_WRITES_MEM) return 1; continue; }
         const vka_res *r = g_wk.r[st];
         for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].flags & DMSH_VK_BF_RW) || r[i].what == VKA_R_IMG || r[i].what == VKA_R_GMEM_LOG) return 1;
     }
@@ -1739,6 +1767,7 @@ static int bar_hazard(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) {
     for (int st = 0; st < VKA_NSTAGE; st++) {
         if (!sh[st] || (st == 1 && d->rast_discard)) continue;
         if (g_wk.pool[st] || g_wk.n[st] < 0) return 1;
+        if (!(g_wk.fl[st] & (VKA_WF_TEX_IMG | VKA_WF_TBUF))) continue;
         const vka_res *r = g_wk.r[st];
         for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_TBUF) && r[i].tid && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim)) return 1;
     }
@@ -1746,7 +1775,7 @@ static int bar_hazard(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) {
 }
 static int depth_sampled(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) {
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        if (!sh[st] || (st == 1 && d->rast_discard)) continue;
+        if (!sh[st] || (st == 1 && d->rast_discard) || !(g_wk.fl[st] & (VKA_WF_TEX_IMG | VKA_WF_TBUF))) continue;
         const vka_res *r = g_wk.r[st];
         for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_TBUF) && r[i].tid && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim) == 2) return 1;
     }
@@ -1760,11 +1789,11 @@ static int ub_hazard(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], int 
         const vka_res *r = g_wk.r[st];
         // Raw global memory (loads or stores through guest addresses, no descriptor: the address table is bound) could read or write the range of a deferred update, which is only
         // in guest RAM at the pass end: its addresses are not known here, so such a draw ends the pass first
-        for (int i = 0; i < g_wk.n[st]; i++) if (r[i].what == VKA_R_GMEM_MAP) {
+        if (g_wk.fl[st] & VKA_WF_GMEM_MAP) for (int i = 0; i < g_wk.n[st]; i++) if (r[i].what == VKA_R_GMEM_MAP) {
             static int n_gm; if (n_gm++ < 8) VLOG("pass ended: a draw with raw global memory access while inline uniform updates are deferred (%d so far)", n_gm);
             return 1;
         }
-        for (int i = 0; i < g_wk.n[st]; i++) {
+        if (g_wk.fl[st] & VKA_WF_BUF) for (int i = 0; i < g_wk.n[st]; i++) {
             if (r[i].what != VKA_R_BUF) continue;
             if (r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
                 if (ub_overlaps(r[i].addr, r[i].size ? r[i].size : V.sb_range)) return 1;
@@ -2952,7 +2981,7 @@ int vka_is_ndve_key(uint64_t k) {
 // floats. So the dispatch uses a pipeline whose module has those images retyped to the texture's class (vka_shader_img_module), and their records ask for views of that class.
 // From the walk (walk_all, just before); the base pipeline p when nothing is retyped or the module cannot be made. DM_VK_IMG_RETYPE=0: never (the class twin views, as before)
 static VkPipeline img_retype(vka_shader *cs, const vka_layout *lay, VkPipeline p) {
-    if (!VKA_ENV("DM_VK_IMG_RETYPE", 1)) return p;
+    if (!VKA_ENV("DM_VK_IMG_RETYPE", 1) || !(g_wk.fl[5] & VKA_WF_FLOAT_TEX)) return p;
     vka_res *r = g_wk.r[5]; uint64_t um = 0, sm = 0, fm = 0;
     for (int i = 0; i < g_wk.n[5]; i++) {
         int img = r[i].what == VKA_R_IMG && r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
