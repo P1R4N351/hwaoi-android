@@ -504,6 +504,7 @@ DM_VK_DRAW_SKIP_KEY	developer	Diagnostics			text			both
 DM_VK_DRIVER	advanced	Graphics	GPU driver		toggle			game		Settings > GPU driver					
 DM_VK_DRV_MEMO	developer	Memory			text			both							
 DM_VK_DRV_STAMP	developer	Graphics			text			both							
+DM_VK_DSET_FAST	developer	Graphics			text			both							
 DM_VK_DS_FIRST_HERE	developer	Graphics			text			both							
 DM_VK_DYN_FILTER	developer	Diagnostics			text			both							
 DM_VK_EAGER_TEX	developer	Diagnostics			text			both							
@@ -708,6 +709,7 @@ DM_VK_SB_PEEK_FROM	developer	Diagnostics			text			both
 DM_VK_SB_PEEK_LINES	developer	Diagnostics			text			both							
 DM_VK_SB_WATCH	developer	Diagnostics			text			both							
 DM_VK_SET_NULLS	developer	Diagnostics			text			both							
+DM_VK_SHADER_FAST	developer	Graphics			text			both							
 DM_VK_SHADER_STATS	developer	Diagnostics			text			both							
 DM_VK_SHARED_SPILL_MB	developer	Graphics			text			both							
 DM_VK_SHLIB	developer	Diagnostics			text			both							

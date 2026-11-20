@@ -78,7 +78,7 @@ static void memu_helper(int dist) {
     for (uint32_t i = 0; i < 3; i++) w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
     vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dist ? pd : ps);
     vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 3, w);
-    g_pd[1].n = 0;   // (another layout's push: the replay's last compute push is forgotten)
+    pd_clear(1);   // (another layout's push: the replay's last compute push is forgotten)
     uint32_t pc[4] = {0, (uint32_t)MB.o.n, MB.cap, 0};
     vk.vkCmdPushConstants(g_cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, pc);
     vk.vkCmdDispatch(g_cb, dist ? (uint32_t)MB.o.n : ((uint32_t)MB.o.n + 63) / 64, 1, 1);
