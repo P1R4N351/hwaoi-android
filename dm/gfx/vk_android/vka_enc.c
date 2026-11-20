@@ -12,6 +12,7 @@
 // Single producer (the replay thread), single consumer (the encoder thread); the consumer spins for a short while when the ring runs empty and then sleeps on a futex.
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_enc_fast.h"
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -41,6 +42,7 @@ enum { RING = 8 << 20 };   // bytes; a frame's ~8,000 draws make ~2 MB of calls
 static uint8_t *g_ring;
 static _Atomic uint64_t g_head, g_tail;   // bytes made / taken (positions mod RING)
 static uint64_t g_ph;                      // the producer's head (published at each call's end)
+static uint64_t g_tail_shadow;
 static _Atomic int g_csleep, g_pwait;      // the consumer sleeps on g_cseq; the producer waits on g_pseq
 static _Atomic uint32_t g_cseq, g_pseq;
 static _Atomic uint64_t g_pwant;          // the tail the producer waits for
@@ -93,6 +95,7 @@ static void wait_tail(uint64_t want) {
             (unsigned long long)atomic_load(&g_tail), (unsigned long long)want, (unsigned long long)atomic_load(&g_head), atomic_load(&g_csleep) ? "asleep" : "awake", atomic_load(&g_running)); }
     }
     atomic_store(&g_pwait, 0);
+    g_tail_shadow = atomic_load_explicit(&g_tail, memory_order_relaxed);
     { uint64_t w = mono_ns() - t0; g_wait_ns += w; atomic_fetch_add_explicit(&g_wait_all, w, memory_order_relaxed); }
 }
 static inline void publish(void) {
@@ -101,15 +104,19 @@ static inline void publish(void) {
     if (atomic_load(&g_csleep) && atomic_exchange(&g_csleep, 0)) { atomic_fetch_add(&g_cseq, 1); fwake(&g_cseq); }   // one wake a sleep (clearing a flag of the encoder's next sleep is safe: it read the sequence before setting it, and the bump follows)
 }
 // Room for a record of n bytes (8-byte multiple), contiguous in the ring
+static inline int enc_room(uint64_t ph, size_t n) {
+    if (vka_enc_fast_on()) return vka_spsc_has_room(ph, n, RING, &g_tail_shadow, &g_tail);
+    return ph + n - atomic_load_explicit(&g_tail, memory_order_acquire) <= RING;
+}
 static void *rec_alloc(uint32_t id, size_t n) {
     uint64_t pos = g_ph % RING;
     if (pos + n > RING) {   // a wrap record fills the rest of the ring
         uint64_t rest = RING - pos;
-        if (g_ph + rest - atomic_load_explicit(&g_tail, memory_order_acquire) > RING) wait_tail(g_ph + rest - RING);
+        if (!enc_room(g_ph, rest)) wait_tail(g_ph + rest - RING);
         ((hdr *)(g_ring + pos))->id = E_WRAP; ((hdr *)(g_ring + pos))->size = (uint32_t)rest;
         g_ph += rest; pos = 0;
     }
-    if (g_ph + n - atomic_load_explicit(&g_tail, memory_order_acquire) > RING) wait_tail(g_ph + n - RING);
+    if (!enc_room(g_ph, n)) wait_tail(g_ph + n - RING);
     hdr *h = (hdr *)(g_ring + pos); h->id = id; h->size = (uint32_t)n;
     return h;
 }
@@ -490,6 +497,7 @@ static int up(void) {
 void vka_enc_sync(void) {
     flush_pub();
     if (g_ph != atomic_load_explicit(&g_tail, memory_order_acquire)) wait_tail(g_ph);
+    g_tail_shadow = atomic_load_explicit(&g_tail, memory_order_relaxed);
 }
 // The replay thread starts recording cb (after vkBeginCommandBuffer): its calls go through the ring when DM_VK_ENC is on
 void vka_enc_start(VkCommandBuffer cb) {

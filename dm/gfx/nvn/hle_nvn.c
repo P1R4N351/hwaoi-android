@@ -13,6 +13,7 @@
 #include "nvn_count.h"
 #include "nvn_tex.h"
 #include "nvn_dpool.h"
+#include "../vk_android/vka_enc_fast.h"
 #include "../tex/nvn_deswizzle.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
@@ -617,22 +618,43 @@ NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) {
 // The ranges: nvn_dpool.h
 static nvn_dpool_tab g_tpt, g_spt;
 static pthread_mutex_t g_dpool_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint32_t g_dpool_seq;
 static int dpool_add(nvn_dpool_tab *t, const void *pool, int n, const char *kind) {   // → the pool's base (assigned at its first Initialize)
     pthread_mutex_lock(&g_dpool_mu);
-    int had = t->n, b = nvn_dpool_add(t, pool, n);
+    atomic_fetch_add_explicit(&g_dpool_seq, 1u, memory_order_release);
+    int had = t->n, b = nvn_dpool_add(t, pool, n), cur_n = t->n;
+    atomic_fetch_add_explicit(&g_dpool_seq, 1u, memory_order_release);
     pthread_mutex_unlock(&g_dpool_mu);
     if (b < 0) { LOG("[RED] %s pools exceed %d: later ones share the first pool's numbering", kind, NVN_NDPOOL); return 0; }
-    if (t->n > had && had) LOG("[nvn] pool #%d (%s, %d entries): numbered from %d in the host table, separate from the earlier pools", t->n, kind, n, b);
+    if (cur_n > had && had) LOG("[nvn] pool #%d (%s, %d entries): numbered from %d in the host table, separate from the earlier pools", cur_n, kind, n, b);
     return b;
 }
-static int dpool_base(nvn_dpool_tab *t, const void *pool) { pthread_mutex_lock(&g_dpool_mu); int b = nvn_dpool_find(t, pool); pthread_mutex_unlock(&g_dpool_mu); return b; }
-static void dpool_release(nvn_dpool_tab *t, const void *pool) { pthread_mutex_lock(&g_dpool_mu); nvn_dpool_release(t, pool); pthread_mutex_unlock(&g_dpool_mu); }
+static int dpool_base(nvn_dpool_tab *t, const void *pool) {
+    if (vka_enc_fast_on()) {
+        uint32_t s_pre = atomic_load_explicit(&g_dpool_seq, memory_order_acquire);
+        int n_ents = t->n, b = 0;
+        if (!(s_pre & 1u) && vka_dpool_seq_find(&g_dpool_seq, t->e, sizeof t->e[0], n_ents, pool, &b) &&
+            atomic_load_explicit(&g_dpool_seq, memory_order_acquire) == s_pre) {
+            return b;
+        }
+    }
+    pthread_mutex_lock(&g_dpool_mu); int b = nvn_dpool_find(t, pool); pthread_mutex_unlock(&g_dpool_mu); return b;
+}
+static void dpool_release(nvn_dpool_tab *t, const void *pool) {
+    pthread_mutex_lock(&g_dpool_mu);
+    atomic_fetch_add_explicit(&g_dpool_seq, 1u, memory_order_release);
+    nvn_dpool_release(t, pool);
+    atomic_fetch_add_explicit(&g_dpool_seq, 1u, memory_order_release);
+    pthread_mutex_unlock(&g_dpool_mu);
+}
 int nvn_dpool_base(const void *pool, int tex) { return dpool_base(tex ? &g_tpt : &g_spt, pool); }   // the replay's bound pools (nvn_mtl.m state_op)
 // The Android frame replayer (dm/gfx/vk_android/vka_replay.c), which runs in the host library without the game: a captured descriptor pool's bases, as its Initialize gave them
 void nvn_dpool_base_set(const void *pool, int tex_base, int samp_base) {
     pthread_mutex_lock(&g_dpool_mu);
+    atomic_fetch_add_explicit(&g_dpool_seq, 1u, memory_order_release);
     if (g_tpt.n < NVN_NDPOOL) g_tpt.e[g_tpt.n++] = (nvn_dpool_ent){pool, tex_base, 0};
     if (g_spt.n < NVN_NDPOOL) g_spt.e[g_spt.n++] = (nvn_dpool_ent){pool, samp_base, 0};
+    atomic_fetch_add_explicit(&g_dpool_seq, 1u, memory_order_release);
     pthread_mutex_unlock(&g_dpool_mu);
 }
 // The pools each command buffer last bound are kept in its own host state (cmd_t tex_base / samp_base). They used to be a 64-entry list of command buffers that was never cleared:
@@ -1486,14 +1508,42 @@ NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int
     }
     p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
 }
+_Static_assert(sizeof(NVNbufferRange) == 16 && offsetof(nvn_dpool_ent, pool) == 0 && offsetof(nvn_dpool_ent, base) == sizeof(void *), "w14 ABI");
+static inline void rec_ubo_fast(cmd_t *o, int32_t st, int32_t i, uint64_t a, size_t n) {
+    if ((unsigned)st < 6u && (unsigned)i < 16u && n <= UINT32_MAX) {
+        uint8_t *p = cmd_alloc(o, 24u);
+        vka_pack_ubo_small_one(p, OP_BIND_UBO_SMALL, (uint16_t)st, (uint16_t)i, a, (uint32_t)n);
+        if (cs_on()) cs_op(OP_BIND_UBO_SMALL, 24u);
+    } else {
+        uint8_t *p = cmd_alloc(o, 32u);
+        vka_pack_buf_one(p, OP_BIND_UBO, st, i, a, (uint64_t)n);
+        if (cs_on()) cs_op(OP_BIND_UBO, 32u);
+    }
+}
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
     shp_bind(SHK_UBO, a, n);
+    if (vka_enc_fast_on()) { rec_ubo_fast(CB(c), st, i, a, n); return; }
     if ((unsigned)st < 6 && (unsigned)i < 16 && n <= UINT32_MAX) {
         *REC(c, OP_BIND_UBO_SMALL, p_bind_ubo_small) = (p_bind_ubo_small){(uint16_t)st, (uint16_t)i, (uint32_t)n, a}; return;
     }
     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
+    cmd_t *o = CB(c);
+    if (vka_enc_fast_on() && n > 1 && n <= 16 && (unsigned)st < 6u && first >= 0 && first + n <= 16 &&
+        !cs_on() && !atomic_load_explicit(&g_shp_n, memory_order_relaxed) && o->recording == 1 && o->cur &&
+        o->end >= o->cur && (size_t)(o->end - o->cur) >= (size_t)n * 24u + OP_RESERVE) {
+        int all_small = 1; uint64_t pairs[32];
+        for (int i = 0; i < n; i++) {
+            if (rg[i].size > UINT32_MAX) { all_small = 0; break; }
+            pairs[2 * i] = rg[i].address; pairs[2 * i + 1] = rg[i].size;
+        }
+        if (all_small) {
+            size_t tot = (size_t)n * 24u;
+            vka_pack_ubo_small_batch(o->cur, OP_BIND_UBO_SMALL, (uint16_t)st, (uint16_t)first, n, pairs);
+            o->cur += tot; o->used += tot; return;
+        }
+    }
     for (int i = 0; i < n; i++) h_nvnCommandBufferBindUniformBuffer(c, st, first + i, rg[i].address, rg[i].size);
 }
 static void ssbo_slot_check(int st, int i) {   // the replay keeps 16 storage buffer slots a stage (NVN's limit); a higher one is not bound
@@ -1501,10 +1551,35 @@ static void ssbo_slot_check(int st, int i) {   // the replay keeps 16 storage bu
 }
 NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
     ssbo_slot_check(st, i); shp_bind(SHK_SSBO, a, n);
+    if (vka_enc_fast_on()) {
+        uint8_t *p = cmd_alloc(CB(c), 32u);
+        vka_pack_buf_one(p, OP_BIND_SSBO, st, i, a, (uint64_t)n);
+        if (cs_on()) cs_op(OP_BIND_SSBO, 32u);
+        return;
+    }
     *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
-    for (int i = 0; i < n; i++) { ssbo_slot_check(st, first + i); shp_bind(SHK_SSBO, rg[i].address, rg[i].size); *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size}; }
+    cmd_t *o = CB(c);
+    if (vka_enc_fast_on() && n > 1 && n <= 16 && first >= 0 && first + n <= 16 &&
+        !cs_on() && !atomic_load_explicit(&g_shp_n, memory_order_relaxed) && o->recording == 1 && o->cur &&
+        o->end >= o->cur && (size_t)(o->end - o->cur) >= (size_t)n * 32u + OP_RESERVE) {
+        uint64_t pairs[32];
+        for (int i = 0; i < n; i++) { pairs[2 * i] = rg[i].address; pairs[2 * i + 1] = rg[i].size; }
+        size_t tot = (size_t)n * 32u;
+        vka_pack_ssbo_batch(o->cur, OP_BIND_SSBO, st, first, n, pairs);
+        o->cur += tot; o->used += tot; return;
+    }
+    for (int i = 0; i < n; i++) {
+        ssbo_slot_check(st, first + i); shp_bind(SHK_SSBO, rg[i].address, rg[i].size);
+        if (vka_enc_fast_on()) {
+            uint8_t *p = cmd_alloc(o, 32u);
+            vka_pack_buf_one(p, OP_BIND_SSBO, st, first + i, rg[i].address, (uint64_t)rg[i].size);
+            if (cs_on()) cs_op(OP_BIND_SSBO, 32u);
+        } else {
+            *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
+        }
+    }
 }
 static p_bind_handles *bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) {
     if (n < 0 || n > 32) { LOG("[RED] bind handle count %d", n); return NULL; }

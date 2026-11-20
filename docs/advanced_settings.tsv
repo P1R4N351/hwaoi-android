@@ -513,6 +513,7 @@ DM_VK_EAGER_TEX	developer	Diagnostics			text			both
 DM_VK_EDGE_UNPIN	developer	Performance			text			both							
 DM_VK_ENC	developer	Graphics			text			both							
 DM_VK_ENC_BATCH	developer	Graphics			text			both							
+DM_VK_ENC_FAST	developer	Graphics			text			both							
 DM_VK_ENC_SPIN	developer	Performance			text			both							
 DM_VK_ENC_TAIL	developer	Graphics			text			both							
 DM_VK_EVENT_GATE	developer	Graphics			text			both							
