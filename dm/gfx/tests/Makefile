@@ -109,6 +109,8 @@ t_state_fast_w11: t_state_fast_w11.c ../vk_android/vka_state_fast.h ../nvn/nvn_h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW11_TEST_HOOKS -I../nvn/include -o $@ t_state_fast_w11.c -lpthread
 t_dyn_fast_w12: t_dyn_fast_w12.c ../vk_android/vka_dyn_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW12_TEST_HOOKS -o $@ t_dyn_fast_w12.c
+t_cs_fast_w13: t_cs_fast_w13.c ../vk_android/vka_cs_fast.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW13_TEST_HOOKS -o $@ t_cs_fast_w13.c
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thermal: t_thermal.c $(MTL_T_DEP)

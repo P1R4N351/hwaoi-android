@@ -21,6 +21,7 @@
 #include "vka_walk_fast.h"
 #include "vka_state_fast.h"
 #include "vka_dyn_fast.h"
+#include "vka_cs_fast.h"
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -2056,8 +2057,9 @@ static void ib_bind(VkBuffer b, VkDeviceSize o, VkIndexType t) {
     vk.vkCmdBindIndexBuffer(g_cb, b, o, t); IB.valid = 1; IB.b = b; IB.o = o; IB.t = t;
 }
 static vka_dyn_guard g_dyn_guard;
+static vka_cs_pipe_state g_cs_pipe;
 static void inst_reset(void);
-void vka_dyn_invalidate(void) { DY.valid = 0; vka_dyn_guard_reset(&g_dyn_guard); VB.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast); VBC.valid = 0; IB.valid = 0; pd_clear(0); pd_clear(1); inst_reset(); }
+void vka_dyn_invalidate(void) { DY.valid = 0; vka_dyn_guard_reset(&g_dyn_guard); vka_cs_pipe_reset(&g_cs_pipe); VB.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast); VBC.valid = 0; IB.valid = 0; pd_clear(0); pd_clear(1); inst_reset(); }
 #define PT(i) do { if (g_prof) { uint64_t t_ = cntvct(); if ((i) > 0 && g_pt_ph == (i) - 1) g_pt[(i) > 0 ? (i) - 1 : 0] += t_ - g_pt_last; g_pt_last = t_; g_pt_ph = (i); } } while (0)
 // ---------- Instanced runs (DM_VK_INSTANCE) ----------
 // Donkey Kong Bananza draws many objects as runs of draws that repeat one mesh (the same pipeline, index range, base vertex and vertex streams) and differ only in where one
@@ -2570,8 +2572,9 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
             if (k == ns && ns < 256) { seen[ns][0] = a; seen[ns++][1] = b;
                 VLOG("mesh draw: task %016llx mesh %016llx pixel %016llx, %s %d workgroups%s", sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)a, (unsigned long long)b,
                      dw->ind ? "indirect" : "direct", dw->count, (sh[7]->e->flags & DMSH_VK_F_MESH_PRIM) ? ", per-primitive outputs" : ""); } }
-        { const char *sk = getenv("DM_VK_MESH_SKIP"); char hex[17]; snprintf(hex, sizeof hex, "%016llx", (unsigned long long)sh[7]->key);
-          if (sk && *sk && strstr(sk, hex)) { g_skipped++; return; } }
+        { static vka_diag_keys msk; uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+          if (vka_diag_need_reload(msk.ready, msk.gen, g)) { char b[256]; vka_diag_keys_parse(&msk, g, vka_env_str("DM_VK_MESH_SKIP", b, sizeof b) ? b : NULL); }
+          if (msk.nk && vka_diag_keys_match(&msk, sh[7]->key)) { g_skipped++; return; } }
         { int c = mesh_cut(d, rt, has_rt, sh[7]->key, dw->ind, sh[1]);   // profile mesh_prepass_cut (a workaround)
           if (c < 0) { prepass_side(d, rt, has_rt, sc, has_sc, dw, sh); g_skipped++; return; }
           eq_relax = c == 1 || (c >= 2 && !prepass_draw(d, rt, has_rt, sc, has_sc, dw, c - 2)); }
@@ -2658,8 +2661,9 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     PT(2);
     walk_all(d, sh);
     {   // DM_VK_BIND_LOG: a draw whose vertex or pixel shader is one of those keys logs its stages' bindings too, as a dispatch does (the first 12 draws in all)
-        const char *bl = getenv("DM_VK_BIND_LOG"); static _Atomic int nb; int hit = 0;
-        for (const char *q = bl; q && *q && !hit;) { char *e; unsigned long long k = strtoull(q, &e, 16); if (e == q) break; hit = (sh[0] && k == sh[0]->key) || (sh[1] && k == sh[1]->key); q = *e == ',' ? e + 1 : e; }
+        static vka_diag_keys blk; uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+        if (vka_diag_need_reload(blk.ready, blk.gen, g)) { char b[256]; vka_diag_keys_parse(&blk, g, vka_env_str("DM_VK_BIND_LOG", b, sizeof b) ? b : NULL); }
+        static _Atomic int nb; int hit = blk.nk && ((sh[0] && vka_diag_keys_match(&blk, sh[0]->key)) || (sh[1] && vka_diag_keys_match(&blk, sh[1]->key)));
         if (hit && atomic_fetch_add(&nb, 1) < 12)
             for (int st = 0; st < VKA_NSTAGE; st++) if (sh[st]) for (int i = 0; i < g_wk.n[st]; i++) { const vka_res *x = &g_wk.r[st][i]; char why[320] = "";
                 if ((x->what == VKA_R_TEX || x->what == VKA_R_IMG) && x->tid) vka_tex_id_desc(x->tid, why, sizeof why);
@@ -3130,7 +3134,7 @@ static void nf_pass(VkPipeline pipe, VkImageView src, VkImageLayout ls, VkImageV
     VkDescriptorImageInfo ii[2] = {{g_nf.samp, src, ls}, {VK_NULL_HANDLE, dst, ld}};
     VkWriteDescriptorSet wr[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
                                   {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]}};
-    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); vka_cs_pipe_reset(&g_cs_pipe);
     vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_nf.lay, 0, 2, wr);
     pd_clear(1);   // the dispatches' last push is no longer bound (another layout disturbs set 0): the next dispatch pushes again (push_same, DM_VK_PUSH_DEDUP)
     vk.vkCmdPushConstants(g_cb, g_nf.lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, 72, pc);
@@ -3385,23 +3389,37 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
     if (!d->inited) vka_dstate_reset(d);
     vka_rp_end();
+    static vka_cs_disp_memo4 g_cs_disp_memo;
+    _Static_assert(sizeof(vka_layout) <= VKA_CS_LAY_MAX, "vka_layout exceeds VKA_CS_LAY_MAX");
     vka_shader *sh[VKA_NSTAGE] = {0}; unsigned bad = 0;
-    if (!resolve(d->cprog, 5, &sh[5], &bad)) SKIP("dispatch skipped: no shader library");
-    if (bad) { g_skipped++; SKIP_COUNT(bad); return; }   // (a missing compute shader: logged once per key by vka_shader.c miss_compute; resolved again when the layer grows)
-    if (!sh[5]) SKIP("dispatch with no compute shader bound: skipped");
-    if (VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(sh[5]->key)) {
-        if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
-        vka_barrier(g_cb);
-        g_dispatches++;
-        return;
+    vka_layout lay = {0}; VkPipeline p = VK_NULL_HANDLE;
+    const prog_t *cp = d->cprog; uint64_t cser = cp ? cp->serial : 0; unsigned lgen = vka_layer_gen();
+    uintptr_t sh5_u = 0, pipe_u = 0;
+    int cs_fast = vka_cs_fast_on();
+    int cs_hit = cs_fast && cp && cser && vka_cs_disp_memo4_find(&g_cs_disp_memo, (uintptr_t)cp, cser, lgen, &sh5_u, &lay, sizeof lay, &pipe_u);
+    if (cs_hit) {
+        sh[5] = (vka_shader *)sh5_u; p = (VkPipeline)pipe_u;
+        if (VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(sh[5]->key)) {
+            if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
+            vka_barrier(g_cb); g_dispatches++; return;
+        }
+    } else {
+        if (!resolve(cp, 5, &sh[5], &bad)) SKIP("dispatch skipped: no shader library");
+        if (bad) { g_skipped++; SKIP_COUNT(bad); return; }   // (a missing compute shader: logged once per key by vka_shader.c miss_compute; resolved again when the layer grows)
+        if (!sh[5]) SKIP("dispatch with no compute shader bound: skipped");
+        if (VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(sh[5]->key)) {
+            if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
+            vka_barrier(g_cb); g_dispatches++; return;
+        }
+        static vka_ktgl_cs_cache g_ktgl_cs_lay;
+        if (!(VKA_ENV("DM_VK_KTGL_CACHE", 1) && vka_ktgl_cs_lay_get(&g_ktgl_cs_lay, sh[5], &lay, sizeof lay))) {
+            if (!vka_layout_of(sh, 1, &lay)) SKIP("dispatch skipped: no pipeline layout");
+            if (VKA_ENV("DM_VK_KTGL_CACHE", 1)) vka_ktgl_cs_lay_put(&g_ktgl_cs_lay, sh[5], &lay, sizeof lay);
+        }
+        p = vka_cs_pipeline_frame(sh[5], &lay);   // (VK_NULL_HANDLE while being made in the background, DM_VK_CS_ASYNC: the dispatch skipped)
+        if (cs_fast && cp && cser && p != VK_NULL_HANDLE)
+            vka_cs_disp_memo4_put(&g_cs_disp_memo, (uintptr_t)cp, cser, lgen, (uintptr_t)sh[5], &lay, sizeof lay, (uintptr_t)p);
     }
-    static vka_ktgl_cs_cache g_ktgl_cs_lay;
-    vka_layout lay;
-    if (!(VKA_ENV("DM_VK_KTGL_CACHE", 1) && vka_ktgl_cs_lay_get(&g_ktgl_cs_lay, sh[5], &lay, sizeof lay))) {
-        if (!vka_layout_of(sh, 1, &lay)) SKIP("dispatch skipped: no pipeline layout");
-        if (VKA_ENV("DM_VK_KTGL_CACHE", 1)) vka_ktgl_cs_lay_put(&g_ktgl_cs_lay, sh[5], &lay, sizeof lay);
-    }
-    VkPipeline p = vka_cs_pipeline_frame(sh[5], &lay);   // (VK_NULL_HANDLE while being made in the background, DM_VK_CS_ASYNC: the dispatch skipped)
     if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
     if (!p) { g_skipped++; if (vks_pipeline_counts(vka_pso_wait)) g_skip_dev[VKS_PIPELINE]++; return; }
     d->b.dispatch[0] = (uint32_t)dp->x; d->b.dispatch[1] = (uint32_t)dp->y; d->b.dispatch[2] = (uint32_t)dp->z; d->b.nvn2 = (uint32_t)vka_nvn2();
@@ -3420,8 +3438,9 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     if (g_do_nk || g_do_all) dobj_note(sh[5]->key, g_wk.r[5], g_wk.n[5]);   // DM_VK_DISP_OBJ (g_do_nk -1: not read yet)
     p = img_retype(sh[5], &lay, p);
     {   // DM_VK_BIND_LOG=<hex key>[,…]: the binding records of those compute shaders' dispatches (the first 12 in all) (what each binding is bound to), to follow a pass's inputs and outputs
-        const char *bl = getenv("DM_VK_BIND_LOG"); static _Atomic int nb; int hit = 0;
-        for (const char *q = bl; q && *q && !hit;) { char *e; unsigned long long k = strtoull(q, &e, 16); if (e == q) break; hit = k == sh[5]->key; q = *e == ',' ? e + 1 : e; }
+        static vka_diag_keys blc; uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+        if (vka_diag_need_reload(blc.ready, blc.gen, g)) { char b[256]; vka_diag_keys_parse(&blc, g, vka_env_str("DM_VK_BIND_LOG", b, sizeof b) ? b : NULL); }
+        static _Atomic int nb; int hit = blc.nk && vka_diag_keys_match(&blc, sh[5]->key);
         if (hit && atomic_fetch_add(&nb, 1) < 12)
             for (int i = 0; i < g_wk.n[5]; i++) { const vka_res *x = &g_wk.r[5][i]; char why[320] = "";
                 if ((x->what == VKA_R_TEX || x->what == VKA_R_IMG) && x->tid) vka_tex_id_desc(x->tid, why, sizeof why);
@@ -3509,19 +3528,24 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     // DM_VK_DISPATCH_LOG=1: one line per dispatch (its index in the submission's run of dispatches since the last log reset, key, groups, workgroup, shared memory, flags);
     // DM_VK_DISPATCH_SKIP=<from>[,<to>]: dispatches from..to (default: to the end) are recorded without their vkCmdDispatch, to find the one that writes a wrong picture
     uint64_t vka_frame(void); static unsigned long long nd; static uint64_t fr = ~0ull; static int lg; if (vka_frame() != fr) { fr = vka_frame(); lg = (int)VKA_ENV("DM_VK_DISPATCH_LOG", 0); nd = 0; }
-    unsigned long long di = nd++; const char *sk = getenv("DM_VK_DISPATCH_SKIP"); int skip = 0;
-    if (sk && *sk) { char *e; unsigned long long a = strtoull(sk, &e, 10), b = *e == ',' ? strtoull(e + 1, NULL, 10) : ~0ull; skip = di >= a && di <= b; }
+    unsigned long long di = nd++; int skip = 0;
+    { static vka_diag_range dsr; uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+      if (vka_diag_need_reload(dsr.ready, dsr.gen, g)) { char b[256]; vka_diag_range_parse(&dsr, g, vka_env_str("DM_VK_DISPATCH_SKIP", b, sizeof b) ? b : NULL); }
+      skip = vka_diag_range_hit(&dsr, di); }
     if (!skip && VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(sh[5]->key)) skip = 1;
     if (!skip && bisect_drop(sh)) skip = 1;
     // DM_VK_DISPATCH_SKIP_KEY=<hex key>[,…]: the dispatches of those compute shaders are recorded without their vkCmdDispatch (by shader instead of by index)
-    const char *sks = getenv("DM_VK_DISPATCH_SKIP_KEY");
-    for (const char *p = sks; !skip && p && *p;) { char *e; unsigned long long k = strtoull(p, &e, 16); if (e == p) break; skip = k == sh[5]->key; p = *e == ',' ? e + 1 : e; }
+    { static vka_diag_keys dsk; uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+      if (!skip) {
+          if (vka_diag_need_reload(dsk.ready, dsk.gen, g)) { char b[256]; vka_diag_keys_parse(&dsk, g, vka_env_str("DM_VK_DISPATCH_SKIP_KEY", b, sizeof b) ? b : NULL); }
+          if (dsk.nk) skip = vka_diag_keys_match(&dsk, sh[5]->key);
+      } }
     if (lg) VLOG("dispatch %llu: %016llx groups %d,%d,%d%s local %u,%u,%u shared %u flags %#x%s", di, (unsigned long long)sh[5]->key, dp->x, dp->y, dp->z, dp->ind ? " (indirect)" : "",
                  sh[5]->e->local[0], sh[5]->e->local[1], sh[5]->e->local[2], sh[5]->e->shared, sh[5]->e->flags, skip ? " SKIPPED" : "");
     if (skip) { vka_barrier(g_cb); g_dispatches++; return; }
     if (vka_gp_active) vka_gp_note('c', sh[5]->key, 0, dp->ind ? 0 : (uint64_t)(dp->x > 0 ? dp->x : 0) * (uint64_t)(dp->y > 0 ? dp->y : 0) * (uint64_t)(dp->z > 0 ? dp->z : 0));
     vka_rw_pre(g_cb);   // DM_VK_RANGE_WATCH
-    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    if (vka_cs_pipe_bind_needed(&g_cs_pipe, cs_fast, (uint64_t)(uintptr_t)g_cb, (uint64_t)(uintptr_t)p)) vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     if (dp->ind) vk.vkCmdDispatchIndirect(g_cb, ib, io);
     else if (dp->x > 0 && dp->y > 0 && dp->z > 0) {
         if (sb && (uint64_t)dp->x * dp->y * dp->z > ns) spill_dispatch((uint32_t)dp->x, (uint32_t)dp->y, (uint32_t)dp->z, ns);

@@ -67,7 +67,7 @@ static void memu_dispatch(const vka_dstate *d, int st, vka_shader *cs, const vka
     if (!sets_push(lay, VK_PIPELINE_BIND_POINT_COMPUTE, pool)) return;
     uint32_t pc[4] = {(uint32_t)idx, 0, 0, 0};
     vk.vkCmdPushConstants(g_cb, lay->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, VKA_MEMU_PUSH_BYTES, pc);
-    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p); vka_cs_pipe_reset(&g_cs_pipe);
     vk.vkCmdDispatchIndirect(g_cb, MB.rec.buf, MB.rec.off + ((VkDeviceSize)idx * VKA_MEMU_REC_WORDS + argw) * 4);
 }
 // A helper pass over the batch's records (setup: one invocation each; distribution: one workgroup each)
@@ -76,7 +76,7 @@ static void memu_helper(int dist) {
     VkDescriptorBufferInfo bi[3] = {{MB.rec.buf, MB.rec.off, (VkDeviceSize)MEMU_MAX * VKA_MEMU_REC_WORDS * 4}, {MB.ctl, 0, 64}, {MB.arena, 0, VK_WHOLE_SIZE}};
     VkWriteDescriptorSet w[3];
     for (uint32_t i = 0; i < 3; i++) w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
-    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dist ? pd : ps);
+    vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dist ? pd : ps); vka_cs_pipe_reset(&g_cs_pipe);
     vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 3, w);
     pd_clear(1);   // (another layout's push: the replay's last compute push is forgotten)
     uint32_t pc[4] = {0, (uint32_t)MB.o.n, MB.cap, 0};
