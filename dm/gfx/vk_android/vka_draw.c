@@ -23,6 +23,7 @@
 #include "vka_dyn_fast.h"
 #include "vka_cs_fast.h"
 #include "vka_gw_fast.h"
+#include "vka_view_fast.h"
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -370,10 +371,17 @@ typedef struct { VkFormat cf[8]; uint32_t n; VkFormat ds; uint32_t d, s, samples
 // Every shape's render pass is kept for the run (the pipelines made against it hold no reference, but each pass begun with it does until its fence): the list grows, so a
 // shape past any cap never makes a new VkRenderPass per pass (the 256-entry array this was did, and leaked one at each)
 typedef struct { rpkey k; VkRenderPass rp; } rpent;
+_Static_assert(sizeof(rpkey) == 56, "rpkey must be 56B");
+static _Thread_local vka_rp_memo4 t_rp_memo4;
 static rpent *g_rpc; static int g_nrpc, g_rpcap; static pthread_mutex_t g_rpmu = PTHREAD_MUTEX_INITIALIZER;
 static VkRenderPass rp_obtain(const rpkey *k) {
+    int fast = vka_view_fast_on();
+    if (fast) { uint64_t rpu = 0; if (vka_rp_memo4_get(&t_rp_memo4, k, &rpu)) return (VkRenderPass)(uintptr_t)rpu; }
     pthread_mutex_lock(&g_rpmu);
-    for (int i = 0; i < g_nrpc; i++) if (!memcmp(&g_rpc[i].k, k, sizeof *k)) { VkRenderPass r = g_rpc[i].rp; pthread_mutex_unlock(&g_rpmu); return r; }
+    for (int i = 0; i < g_nrpc; i++) if (!memcmp(&g_rpc[i].k, k, sizeof *k)) {
+        VkRenderPass r = g_rpc[i].rp;
+        if (fast && r != VK_NULL_HANDLE) vka_rp_memo4_put(&t_rp_memo4, k, (uint64_t)(uintptr_t)r);
+        pthread_mutex_unlock(&g_rpmu); return r; }
     VkAttachmentDescription at[9]; VkAttachmentReference cr[8], dr; uint32_t na = 0;
     VkSampleCountFlagBits sc = (VkSampleCountFlagBits)(k->samples ? k->samples : 1);
     for (uint32_t i = 0; i < k->n; i++) {
@@ -394,6 +402,7 @@ static VkRenderPass rp_obtain(const rpkey *k) {
     else {
         if (g_nrpc == g_rpcap) { int nc = g_rpcap ? 2 * g_rpcap : 64; rpent *n = realloc(g_rpc, (size_t)nc * sizeof *n); if (n) { g_rpc = n; g_rpcap = nc; } }
         if (g_nrpc < g_rpcap) { g_rpc[g_nrpc].k = *k; g_rpc[g_nrpc++].rp = r; } else VRED_ONCE("render pass list: out of memory");
+        if (fast && r != VK_NULL_HANDLE) vka_rp_memo4_put(&t_rp_memo4, k, (uint64_t)(uintptr_t)r);
         if ((g_nrpc & (g_nrpc - 1)) == 0 && g_nrpc >= 256) VLOG("classic render passes: %d shapes", g_nrpc);
     }
     pthread_mutex_unlock(&g_rpmu);
@@ -410,11 +419,14 @@ typedef struct { VkRenderPass rp; uint32_t w, h, layers, na; fbatt a[9]; } fbkey
 // classic passes on, every pipeline is made against a VkRenderPass, so a pass that fell back to dynamic rendering for want of a framebuffer would draw with pipelines
 // it is not compatible with
 typedef struct { fbkey k; VkFramebuffer fb; uint64_t h; int used; } fbent;
+_Static_assert(offsetof(fbkey, a) == 24 && sizeof(fbatt) == 48 && sizeof(fbkey) == 456, "fbkey layout");
 static fbent *g_fbc; static uint32_t g_fbcap, g_fbn;
+static vka_fb_memo4 g_fb_memo4;
 static uint64_t fb_hash(const fbkey *k) { uint64_t h = 1469598103934665603ull; const uint8_t *p = (const uint8_t *)k; for (size_t i = 0; i < sizeof *k; i++) { h ^= p[i]; h *= 1099511628211ull; } return h; }
 static int fb_grow(void) {
     uint32_t nc = g_fbcap ? 2 * g_fbcap : 1024; fbent *n = calloc(nc, sizeof *n);
     if (!n) return 0;
+    vka_fb_memo4_clear(&g_fb_memo4);
     for (uint32_t i = 0; i < g_fbcap; i++) if (g_fbc[i].used) { uint32_t j = (uint32_t)g_fbc[i].h & (nc - 1); while (n[j].used) j = (j + 1) & (nc - 1); n[j] = g_fbc[i]; }
     free(g_fbc); g_fbc = n; g_fbcap = nc;
     if (nc > 1024) VLOG("classic render passes: framebuffer table %u entries", nc);
@@ -422,8 +434,24 @@ static int fb_grow(void) {
 }
 static VkFramebuffer fb_obtain(const fbkey *k) {   // (the recording thread only)
     if (2 * (g_fbn + 1) > g_fbcap && !fb_grow()) { VRED_ONCE("framebuffer table: out of memory"); return VK_NULL_HANDLE; }
-    uint64_t h = fb_hash(k); uint32_t i = (uint32_t)h & (g_fbcap - 1);
-    for (; g_fbc[i].used; i = (i + 1) & (g_fbcap - 1)) if (g_fbc[i].h == h && !memcmp(&g_fbc[i].k, k, sizeof *k)) return g_fbc[i].fb;
+    int fast = vka_view_fast_on();
+    uint64_t h = fast ? vka_fbkey_hash_fast(k, k->na, sizeof *k, offsetof(fbkey, a), sizeof(fbatt)) : fb_hash(k);
+    if (fast) {
+        uint32_t slot = 0; uint64_t fbu = 0;
+        if (vka_fb_memo4_get(&g_fb_memo4, h, (uint64_t)(uintptr_t)k->rp, &slot, &fbu) &&
+            slot < g_fbcap && g_fbc[slot].used && g_fbc[slot].h == h &&
+            vka_fbkey_eq_fast(&g_fbc[slot].k, k, g_fbc[slot].k.na, k->na, sizeof *k, offsetof(fbkey, a), sizeof(fbatt)))
+            return (VkFramebuffer)(uintptr_t)fbu;
+    }
+    uint32_t i = (uint32_t)h & (g_fbcap - 1);
+    for (; g_fbc[i].used; i = (i + 1) & (g_fbcap - 1)) {
+        int eq = fast ? (g_fbc[i].h == h && vka_fbkey_eq_fast(&g_fbc[i].k, k, g_fbc[i].k.na, k->na, sizeof *k, offsetof(fbkey, a), sizeof(fbatt)))
+                      : (g_fbc[i].h == h && !memcmp(&g_fbc[i].k, k, sizeof *k));
+        if (eq) {
+            if (fast) vka_fb_memo4_put(&g_fb_memo4, h, (uint64_t)(uintptr_t)k->rp, i, (uint64_t)(uintptr_t)g_fbc[i].fb);
+            return g_fbc[i].fb;
+        }
+    }
     VkFramebufferAttachmentImageInfo ai[9];
     for (uint32_t a = 0; a < k->na; a++) ai[a] = (VkFramebufferAttachmentImageInfo){VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO, NULL, k->a[a].fl, k->a[a].u, k->a[a].w, k->a[a].h, k->a[a].nl, k->a[a].nvf, k->a[a].vf};
     VkFramebufferAttachmentsCreateInfo fa = {VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO, NULL, k->na, ai};
@@ -432,6 +460,7 @@ static VkFramebuffer fb_obtain(const fbkey *k) {   // (the recording thread only
     VkFramebuffer fb = VK_NULL_HANDLE; VkResult e = vk.vkCreateFramebuffer(V.dev, &ci, NULL, &fb);
     if (e) { VRED_ONCE("vkCreateFramebuffer %d", e); return VK_NULL_HANDLE; }
     g_fbc[i].k = *k; g_fbc[i].h = h; g_fbc[i].fb = fb; g_fbc[i].used = 1; g_fbn++;
+    if (fast) vka_fb_memo4_put(&g_fb_memo4, h, (uint64_t)(uintptr_t)k->rp, i, (uint64_t)(uintptr_t)fb);
     return fb;
 }
 static fbatt fb_att(const vka_img *im, uint32_t lv, uint32_t nl, VkFormat view) {
