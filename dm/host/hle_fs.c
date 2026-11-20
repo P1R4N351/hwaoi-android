@@ -56,6 +56,7 @@ typedef struct {
     int save;                        // mounted as save data (a transaction, or its read-only fallback): Unmount frees its name (h_fs_Unmount)
     _Atomic int poison;              // failure state belongs to this backing, not to the process
     _Atomic uint64_t first_write_ns;
+    _Atomic uint8_t img_pub;         // 1 once read-only non-overlay image fields are published (lock-free img_path)
 } mount_t;
 static mount_t g_mnt[MAX_MOUNT];   // commit non-empty = transactional save mount
 static int g_nmnt;
@@ -194,8 +195,33 @@ static const char *fwd_slashes(const char *p, char *buf, size_t n) {
 }
 static int norm_rest(const char *rest, char *out, size_t n);
 static int rom_overlay_path(const mount_t *m, const char *rest, char *out, size_t n);
+static _Atomic int g_fs_fast_img = -1;
+static int fs_fast_img_sync(void) {
+    const char *e = getenv("DM_FS_FAST_IMG");
+    int v = !(e && !strcmp(e, "0"));
+    atomic_store_explicit(&g_fs_fast_img, v, memory_order_release);
+    return v;
+}
+static inline int fs_fast_img_on(void) {
+    int v = atomic_load_explicit(&g_fs_fast_img, memory_order_acquire);
+    return v < 0 ? fs_fast_img_sync() : v;
+}
+static int img_path_fast(const char *p, int *mi, int64_t *k) {
+    if (!fs_fast_img_on()) return 0;
+    char fwd[1024]; p = fwd_slashes(p, fwd, sizeof fwd); const char *c = p ? strchr(p, ':') : NULL; if (!c) return 0;
+    size_t ln = (size_t)(c - p); int nm = __atomic_load_n(&g_nmnt, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nm; i++) {
+        if (!atomic_load_explicit(&g_mnt[i].img_pub, memory_order_acquire)) continue;
+        if (strlen(g_mnt[i].name) != ln || strncmp(g_mnt[i].name, p, ln)) continue;
+        char normed[1024]; const char *rest = c + 1; *mi = i;
+        if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) { *k = -1; return 1; } rest = normed; }
+        *k = img_find(g_mnt[i].img, rest); return 1;
+    }
+    return 0;
+}
 // A path on an image mount: returns 1 with the mount in *mi and the entry in *k (-1 with errno set when there is none); 0 for a path on any other mount, or one an overlay folder (DM_ROMFS_OVERLAY) has, which then opens as a host file
 static int img_path(const char *p, int *mi, int64_t *k) {
+    if (img_path_fast(p, mi, k)) return 1;
     PATH_LOCK(); char fwd[1024]; p = fwd_slashes(p, fwd, sizeof fwd); const char *c = p ? strchr(p, ':') : NULL; if (!c) return 0;
     size_t ln = c - p;
     for (int i = 0; i < g_nmnt; i++) {
@@ -228,6 +254,8 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn, int s
         if (!used) s = f;
     }
     if (s == g_nmnt && g_nmnt >= MAX_MOUNT) die("mount table full");
+    fs_fast_img_sync();
+    atomic_store_explicit(&g_mnt[s].img_pub, 0, memory_order_release);
     strlcpy(g_mnt[s].name, name, sizeof g_mnt[0].name);
     g_mnt[s].ro = ro; g_mnt[s].overlay[0] = 0; g_mnt[s].commit[0] = 0;
     g_mnt[s].txn_root = -1; g_mnt[s].save = txn;
@@ -276,7 +304,9 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn, int s
         }
         if (bad) die("the game files %s (%s:) %s%s", dir, name, bad, strstr(bad, "missing") ? " (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)" : "");
     }
-    int reused = s < g_nmnt; if (!reused) g_nmnt++;
+    if (g_mnt[s].img && !g_mnt[s].overlay[0] && !getenv("DM_ROMFS_OVERLAY"))
+        atomic_store_explicit(&g_mnt[s].img_pub, 1, memory_order_release);
+    int reused = s < g_nmnt; if (!reused) __atomic_store_n(&g_nmnt, g_nmnt + 1, __ATOMIC_RELEASE);
     char shown[sizeof g_mnt[0].dir]; strlcpy(shown, txn ? g_mnt[s].dir : dir, sizeof shown); int ov = g_mnt[s].overlay[0] != 0;   // read under the lock: an Unmount and a later mount may take the entry again
     pthread_mutex_unlock(&g_lock);
     if (txn_err) front_save_failed(txn_err);
@@ -485,6 +515,7 @@ HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", 
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
+            atomic_store_explicit(&g_mnt[i].img_pub, 0, memory_order_release);
             strlcpy(g_mnt[i].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[i].overlay); break;
         }
     }
@@ -1014,11 +1045,12 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         sz = off < 0 || (uint64_t)off >= x->b ? 0 : (size_t)(x->b - off) < sz ? (size_t)(x->b - off) : sz;
         if (x->flags & IMG_ENT_ZSTD) {   // a compressed NUP file: its decompressed bytes, held by the open (one more reference for this read, in case the game reads a closed handle)
             romfs_img *m = g_mnt[IMG_M(h)].img; char why[400] = ""; uint64_t f0 = now_ns();
-            const uint8_t *src = nup_z_get(m, x->a, why, sizeof why);
+            int fast = fs_fast_img_on();
+            const uint8_t *src = nup_z_pin_read(m, x->a, fast, why, sizeof why);
             if (!src) { LOG("[RED] fs ReadFile: cannot decompress a file of %s: %s", ((nup_aux *)m->aux)->what, why); return RES_FAIL; }
             dm_guest_write_prepare(buf, sz);
             memcpy(buf, src + off, sz);
-            nup_z_put(m, x->a);
+            nup_z_unpin_read(m, x->a, fast);
             *out = sz; fs_stat_note(1, f0, sz);
             return RES_OK;
         }

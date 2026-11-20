@@ -9,6 +9,7 @@
 #include "vka_memu_abi.h"
 #include "vka_pwlist.h"
 #include "vka_psogate.h"
+#include "vka_pso_cache.h"
 #include "vk_prewarm_seed.h"   // the profile's seed list (dm/games/<id>/vk_prewarm.bin; dm/games/game.py seed): dm_vk_prewarm_seed, dm_vk_prewarm_seed_len (0: none)
 #include "../nvn/nvn_mtl.h"
 #include <stdlib.h>
@@ -330,7 +331,13 @@ void vka_pso_waits(uint64_t *save_ns, uint64_t *pw_wait_ns) { if (save_ns) *save
 // waits for that thread instead of making it a second time). p and linked change in place when the optimized pipeline replaces the linked one
 typedef struct gval { VkPipeline p; uint8_t linked, busy, pw; pid_t tid; } gval;   // pw, tid: a prewarm thread is making it (busy), that thread (busy_wait)
 typedef struct { vka_shader *sh[VKA_NSTAGE]; VkPipelineLayout layout; vka_gkey k; } gkey_full;   // (sh[5], compute, stays NULL)
+_Static_assert(offsetof(gkey_full, k.va) <= VKA_PSO_FAST_KEY_MAX, "vka_pso_fast_cache key size");
+_Static_assert(sizeof(gkey_full) <= VKA_PSO_FULL_KEY_MAX, "vka_pso_full_cache key size");
 static kmap g_gfx = {.klen = sizeof(gkey_full)};
+static int pso_memo_on(void) { static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_PSO_MEMO", 1); return on; }
+static vka_pso_fast_cache g_gfx_fast;
+static vka_pso_full_cache g_gfx_full;
+static vka_pso_cs_cache g_cs_memo;
 static pthread_cond_t g_busy_cv = PTHREAD_COND_INITIALIZER;
 // The create info of a graphics pipeline, built in place (its members point at one another): the whole pipeline and each stage library take their parts from it
 typedef struct {
@@ -1399,16 +1406,25 @@ static inline VkPipeline gval_use(gval *g) {
     return p;
 }
 VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
-    static gkey_full fk, last; static gval *last_g;
+    static gkey_full fk, last; static size_t last_len; static gval *last_g;
     // With vertex input dynamic state the key's static vertex input (va, vb: two thirds of it) stays zero: only what comes before it is hashed and compared with the
     // previous draw's key (draws in a row often share their pipeline). The entry's pipeline is read at each draw: the optimized one replaces a linked one in place
     size_t len = k->vin_static ? sizeof fk : offsetof(gkey_full, k.va);
     memset(&fk, 0, len);   // (the rest stays zero: vin_static is the device's, the same for every key)
     memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay->layout; memcpy(&fk.k, k, len - offsetof(gkey_full, k));
-    if (last_g && !memcmp(&fk, &last, len)) return gval_use(last_g);
+    if (last_g && last_len == len && !memcmp(&fk, &last, len)) return gval_use(last_g);
+    uint64_t h = fnv(&fk, len, 1469598103934665603ull);
+    int memo = pso_memo_on(), async = !sh[7] && as_threads() > 0;
+    gval *g = memo ? vka_pso_gfx_get(&g_gfx_fast, &g_gfx_full, &fk, (uint32_t)len, h) : NULL;
+    if (g && (!__atomic_load_n(&g->busy, __ATOMIC_ACQUIRE) || async)) {
+        memcpy(&last, &fk, len); last_len = len; last_g = g;
+        return gval_use(g);
+    }
     int made;
-    gval *g = gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, lay, k, 0, &made);
-    memcpy(&last, &fk, len); last_g = g;
+    g = gfx_obtain(&fk, h, len, sh, lay, k, 0, &made);
+    if (memo && g && (!__atomic_load_n(&g->busy, __ATOMIC_ACQUIRE) || async))
+        vka_pso_gfx_put(&g_gfx_fast, &g_gfx_full, &fk, (uint32_t)len, h, g);
+    memcpy(&last, &fk, len); last_len = len; last_g = g;
     return gval_use(g);
 }
 
@@ -1436,6 +1452,11 @@ static void cs_queue(gval *g, vka_shader *cs, const vka_layout *lay) {
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made, uint64_t umask, uint64_t smask, int frame) {
     *made = 0; vka_pso_wait = 0;
     if (VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(cs->key)) return VK_NULL_HANDLE;
+    int memo = frame && !prewarm && pso_memo_on();
+    if (memo) {
+        gval *cg = vka_pso_cs_get(&g_cs_memo, cs, (uint64_t)(uintptr_t)lay->layout, umask, smask);
+        if (cg && !__atomic_load_n(&cg->busy, __ATOMIC_ACQUIRE)) return __atomic_load_n(&cg->p, __ATOMIC_ACQUIRE);
+    }
     VkShaderModule csm = umask | smask ? vka_shader_img_module(cs, umask, smask) : vka_shader_cs_module(cs);
     if (!csm) return VK_NULL_HANDLE;   // (a retyped module that cannot be made: the caller takes the base pipeline)
     ckey k; memset(&k, 0, sizeof k); k.cs = cs; k.layout = lay->layout; k.umask = umask; k.smask = smask;
@@ -1450,7 +1471,9 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
             return VK_NULL_HANDLE;
         }
         if (g->busy) busy_wait(g);
-        VkPipeline p = g->p; pthread_mutex_unlock(&g_mu); return p;
+        VkPipeline p = __atomic_load_n(&g->p, __ATOMIC_ACQUIRE); pthread_mutex_unlock(&g_mu);
+        if (memo) vka_pso_cs_put(&g_cs_memo, cs, (uint64_t)(uintptr_t)lay->layout, umask, smask, g);
+        return p;
     }
     g = calloc(1, sizeof *g); g->busy = 1; g->pw = (uint8_t)(prewarm != 0); g->tid = prewarm ? gettid() : 0; km_put(&g_cs, &k, h, g);
     pthread_mutex_unlock(&g_mu);
@@ -1470,16 +1493,19 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
             if (r != VK_SUCCESS) p = VK_NULL_HANDLE;
             pthread_mutex_lock(&g_mu);
             g_create_ns += dns;
-            if (p) { g_ncs++; g_made++; g_frame_made++; g_probe_hit++; g_create_ms += dns / 1e6; g->p = p; g->busy = 0; pthread_cond_broadcast(&g_busy_cv); }
+            if (p) { g_ncs++; g_made++; g_frame_made++; g_probe_hit++; g_create_ms += dns / 1e6; __atomic_store_n(&g->p, p, __ATOMIC_RELEASE); __atomic_store_n(&g->busy, 0, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_busy_cv); }
             else { g_probe_miss++; g_probe_miss_ns += dns; }
             pthread_mutex_unlock(&g_mu);
-            if (p) { vka_shader *s5[5] = {cs, NULL, NULL, NULL, NULL}; pw_note(VKA_PW_CS, s5, "", 0); return p; }
+            if (p) { if (memo) vka_pso_cs_put(&g_cs_memo, cs, (uint64_t)(uintptr_t)lay->layout, umask, smask, g);
+                vka_shader *s5[5] = {cs, NULL, NULL, NULL, NULL}; pw_note(VKA_PW_CS, s5, "", 0); return p; }
         }
         cs_queue(g, cs, lay);
         atomic_fetch_add_explicit(&g_as_skips, 1, memory_order_relaxed); vka_pso_wait = 1;
         return VK_NULL_HANDLE;
     }
     cs_build(g, cs, lay, csm, umask, smask, prewarm, 0);
+    if (memo && !__atomic_load_n(&g->busy, __ATOMIC_ACQUIRE))
+        vka_pso_cs_put(&g_cs_memo, cs, (uint64_t)(uintptr_t)lay->layout, umask, smask, g);
     return __atomic_load_n(&g->p, __ATOMIC_ACQUIRE);
 }
 // A new compute entry g (busy) made and published. async: a frame-path miss made on an asynchronous thread (cs_queue), its time not the frame's

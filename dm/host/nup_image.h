@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "romfs_image.h"
@@ -54,13 +55,17 @@ typedef struct {
     uint64_t off, stored, size;
     uint8_t *buf;          // the decompressed file, or NULL
     uint8_t mapped;        // buf is a read-only map of a temporary file (a large file): kept for the image's life, not in the cache's budget
-    uint32_t refs;         // opens holding buf
+    _Atomic uint32_t refs; // opens + in-flight lock-free reads holding buf
     uint8_t loading;       // a thread is decompressing it (the others wait on nup_aux.cv)
+    uint8_t in_lru;        // present in intrusive LRU ring (O(1) eviction)
+    uint32_t lru_prev, lru_next;
     uint64_t used;         // LRU stamp
 } nup_z;
 typedef struct {
     pthread_mutex_t lock; pthread_cond_t cv;
-    uint64_t nz, held, budget, clock, disk_min, ndec;   // disk_min: files of this size and more go to a temporary file (0: none); ndec: decompressions
+    uint64_t nz, budget, clock, disk_min, ndec;   // disk_min: files of this size and more go to a temporary file (0: none); ndec: decompressions
+    _Atomic uint64_t held;
+    uint32_t lru_head, lru_tail;
     nup_z *z;
     char what[160];        // "<file> package <selector>", for messages
 } nup_aux;
@@ -211,6 +216,7 @@ static romfs_img *nup_image_open(const char *spec, char *why, size_t wn) {
     m->fd = fd; fd = -1;
     if (!(m->e = malloc(isz ? isz : 1)) || !(aux = calloc(1, sizeof *aux))) { e = ENOMEM; NUP_BAD("out of memory"); }
     pthread_mutex_init(&aux->lock, NULL); pthread_cond_init(&aux->cv, NULL);
+    aux->lru_head = NUP_NONE; aux->lru_tail = NUP_NONE;
     if (nz && !(aux->z = calloc((size_t)nz, sizeof *aux->z))) { e = ENOMEM; NUP_BAD("out of memory"); }
     m->n = n; m->names = (const char *)m->e + n * sizeof(img_ent); aux->nz = nz;
     { const char *mb = getenv("DM_NUP_CACHE_MB"); aux->budget = (uint64_t)(mb && *mb ? atoll(mb) : 128) << 20; }
@@ -251,13 +257,35 @@ bad:
 #undef NUP_BAD
 }
 
-// Frees cached buffers no open holds, oldest first, until the cache fits its budget (or only held ones are left). Called with a->lock held
+// Intrusive LRU ring helpers (a->lock held; zi < a->nz < NUP_NONE).
+static void nup_lru_remove(nup_aux *a, uint32_t zi) {
+    nup_z *z = &a->z[zi];
+    if (!z->in_lru) return;
+    if (z->lru_prev != NUP_NONE) a->z[z->lru_prev].lru_next = z->lru_next; else a->lru_head = z->lru_next;
+    if (z->lru_next != NUP_NONE) a->z[z->lru_next].lru_prev = z->lru_prev; else a->lru_tail = z->lru_prev;
+    z->lru_prev = NUP_NONE; z->lru_next = NUP_NONE; z->in_lru = 0;
+}
+static void nup_lru_touch(nup_aux *a, uint32_t zi) {
+    nup_z *z = &a->z[zi];
+    if (z->in_lru) nup_lru_remove(a, zi);
+    z->lru_prev = a->lru_tail; z->lru_next = NUP_NONE; z->in_lru = 1;
+    if (a->lru_tail != NUP_NONE) a->z[a->lru_tail].lru_next = zi; else a->lru_head = zi;
+    a->lru_tail = zi;
+}
+// Frees cached buffers no open holds, oldest first in O(1) amortized via LRU ring, until within budget. Called with a->lock held.
 static void nup_z_trim(nup_aux *a) {
-    while (a->held > a->budget) {
-        nup_z *old = NULL;
-        for (uint64_t i = 0; i < a->nz; i++) { nup_z *z = &a->z[i]; if (z->buf && !z->mapped && !z->refs && !z->loading && (!old || z->used < old->used)) old = z; }
-        if (!old) return;
-        free(old->buf); old->buf = NULL; a->held -= old->size;
+    while (atomic_load_explicit(&a->held, memory_order_relaxed) > a->budget) {
+        uint32_t cur = a->lru_head;
+        while (cur != NUP_NONE) {
+            nup_z *z = &a->z[cur];
+            if (z->buf && !z->mapped && !z->loading && atomic_load_explicit(&z->refs, memory_order_acquire) == 0) break;
+            cur = z->lru_next;
+        }
+        if (cur == NUP_NONE) return;
+        nup_z *old = &a->z[cur];
+        nup_lru_remove(a, cur);
+        free(old->buf); old->buf = NULL;
+        atomic_fetch_sub_explicit(&a->held, old->size, memory_order_relaxed);
     }
 }
 #ifdef DM_NUP_ZSTD
@@ -302,7 +330,7 @@ static const uint8_t *nup_z_get(romfs_img *m, uint64_t zi, char *why, size_t wn)
     nup_aux *a = m->aux; nup_z *z = &a->z[zi];
     pthread_mutex_lock(&a->lock);
     while (z->loading) pthread_cond_wait(&a->cv, &a->lock);
-    if (z->buf) { z->refs++; z->used = ++a->clock; pthread_mutex_unlock(&a->lock); return z->buf; }
+    if (z->buf) { atomic_fetch_add_explicit(&z->refs, 1u, memory_order_release); z->used = ++a->clock; if (!z->mapped) nup_lru_touch(a, (uint32_t)zi); pthread_mutex_unlock(&a->lock); return z->buf; }
     z->loading = 1; pthread_mutex_unlock(&a->lock);
     uint8_t *out = NULL, *src = NULL; int e = 0;
 #ifndef DM_NUP_ZSTD
@@ -337,12 +365,15 @@ static const uint8_t *nup_z_get(romfs_img *m, uint64_t zi, char *why, size_t wn)
 #ifdef DM_NUP_ZSTD
     if (e) { if (!mapped) free(out); out = NULL; }
     else {
-        z->buf = out; z->mapped = mapped; z->refs++; z->used = ++a->clock; a->ndec++; if (!mapped) a->held += z->size; nup_z_trim(a);
+        z->buf = out; z->mapped = mapped; z->used = ++a->clock; a->ndec++;
+        if (!mapped) { atomic_fetch_add_explicit(&a->held, z->size, memory_order_relaxed); nup_lru_touch(a, (uint32_t)zi); }
+        atomic_fetch_add_explicit(&z->refs, 1u, memory_order_release);
+        nup_z_trim(a);
         if (!(a->ndec & 255)) LOG("fs NUP: %llu decompressions of the %llu compressed files of %s so far (a file the cache gave up is decompressed again at its next open)", (unsigned long long)a->ndec, (unsigned long long)a->nz, a->what);
     }
 #else
     if (e) { free(out); out = NULL; }
-    else { z->buf = out; z->refs++; z->used = ++a->clock; a->held += z->size; nup_z_trim(a); }
+    else { z->buf = out; z->used = ++a->clock; atomic_fetch_add_explicit(&a->held, z->size, memory_order_relaxed); nup_lru_touch(a, (uint32_t)zi); atomic_fetch_add_explicit(&z->refs, 1u, memory_order_release); nup_z_trim(a); }
 #endif
     pthread_cond_broadcast(&a->cv); pthread_mutex_unlock(&a->lock);
     if (e) errno = e;
@@ -350,6 +381,28 @@ static const uint8_t *nup_z_get(romfs_img *m, uint64_t zi, char *why, size_t wn)
 }
 static void nup_z_put(romfs_img *m, uint64_t zi) {
     nup_aux *a = m->aux; pthread_mutex_lock(&a->lock);
-    if (a->z[zi].refs) a->z[zi].refs--;
+    if (atomic_load_explicit(&a->z[zi].refs, memory_order_relaxed)) atomic_fetch_sub_explicit(&a->z[zi].refs, 1u, memory_order_acq_rel);
     nup_z_trim(a); pthread_mutex_unlock(&a->lock);
+}
+// Lock-free read-side pin/unpin when OpenFile already holds refs >= 1 (zero mutex on hit).
+static inline const uint8_t *nup_z_pin_read(romfs_img *m, uint64_t zi, int fast, char *why, size_t wn) {
+    nup_aux *a = m->aux;
+    if (fast && a && zi < a->nz) {
+        nup_z *z = &a->z[zi];
+        uint32_t r = atomic_load_explicit(&z->refs, memory_order_acquire);
+        while (r > 0) {
+            if (atomic_compare_exchange_weak_explicit(&z->refs, &r, r + 1u, memory_order_acquire, memory_order_acquire))
+                return z->buf;
+        }
+    }
+    return nup_z_get(m, zi, why, wn);
+}
+static inline void nup_z_unpin_read(romfs_img *m, uint64_t zi, int fast) {
+    nup_aux *a = m->aux;
+    if (!fast || !a || zi >= a->nz) { nup_z_put(m, zi); return; }
+    nup_z *z = &a->z[zi];
+    uint32_t prev = atomic_fetch_sub_explicit(&z->refs, 1u, memory_order_acq_rel);
+    if (prev == 1u && atomic_load_explicit(&a->held, memory_order_relaxed) > a->budget) {
+        pthread_mutex_lock(&a->lock); nup_z_trim(a); pthread_mutex_unlock(&a->lock);
+    }
 }

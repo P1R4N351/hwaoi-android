@@ -16,13 +16,14 @@ GAME_H = ../gen/$(GAME)/game_profile.h
 # reference to an undefined symbol only when it is named as allowed to stay undefined
 WEAK_HOST = -Wl,-U,_vka_swap_rb
 
-run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
+run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
 	$(B)/t_language
 	$(B)/t_heap_size
 	$(B)/t_touch
 	$(B)/t_gesture
 	$(B)/t_oe $(QUIET)
 	$(B)/t_fs $(QUIET)
+	$(B)/t_nup_fast
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_commit_list
 	$(B)/t_thread_leak
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_case $(QUIET)
@@ -207,6 +208,8 @@ $(B)/zstddec.o: ../../third_party/zstd/zstddeclib.c | $(B)
 	$(CLANG) -O2 -w -c -o $@ $<
 $(B)/t_fs: t_fs.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h ../nup_image.h ../nsp_toc.h nup_fixture_zst.h $(B)/zstddec.o $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -DDM_NUP_ZSTD -I.. $(GINC) -o $@ t_fs.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c $(B)/zstddec.o
+$(B)/t_nup_fast: t_nup_fast.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h ../nup_image.h ../nsp_toc.h nup_fixture_zst.h $(B)/zstddec.o $(GAME_H) | $(B)
+	$(CLANG) -O2 -Wall -Wextra -Werror -Wno-unused-function -DDM_NUP_ZSTD -I.. $(GINC) -o $@ t_nup_fast.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c $(B)/zstddec.o -lpthread
 # Manual check of the NUP reader against a real dump (not in run): build/t_nup_dump <file>.nup:<selector> <RomFS folder>
 $(B)/t_nup_dump: t_nup_dump.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../hle_bigstack.c ../nup_image.h ../nsp_toc.h ../romfs_image.h $(B)/zstddec.o $(GAME_H) | $(B)
 	$(CLANG) -O2 -Wno-unused-function -DDM_NUP_ZSTD -I.. $(GINC) -o $@ t_nup_dump.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c $(B)/zstddec.o
