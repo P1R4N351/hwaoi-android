@@ -28,6 +28,7 @@
 #include "vka_wbfollow.h"
 #include "vka_edge_unpin.h"
 #include "vka_tex_fast.h"
+#include "vka_gw_fast.h"
 #include <assert.h>
 #include "../nvn/nvn_tex.h"
 
@@ -762,6 +763,23 @@ static uint64_t mem_hash(const uint8_t *p, uint64_t n) { uint64_t h = 1469598103
 enum { GW_COPY, GW_FILL, GW_UPDATE, GW_OPAQUE };
 typedef struct { uint64_t lo, hi, src, seq, fence; uint32_t kind, value; uint8_t *data; } gw_t;
 static gw_t *g_gw; static int g_ngw, g_gwcap; static uint64_t g_gwseq = 1, g_gw_over, g_gw_late;
+static vka_gw_summary g_gw_sum;
+static void gw_sum_rebuild_locked(void) {
+    uint32_t cnt = 0, hcnt = 0;
+    uint64_t mlo = 0, mhi = 0, blm = 0, hlo = 0, hhi = 0, hblm = 0;
+    for (int i = 0; i < g_ngw; i++) {
+        const gw_t *w = &g_gw[i];
+        if (!cnt || w->lo < mlo) mlo = w->lo;
+        if (!cnt || w->hi > mhi) mhi = w->hi;
+        blm |= vka_gw_bloom_mask(w->lo, w->hi); cnt++;
+        if (w->kind == GW_OPAQUE || w->kind == GW_COPY) {
+            if (!hcnt || w->lo < hlo) hlo = w->lo;
+            if (!hcnt || w->hi > hhi) hhi = w->hi;
+            hblm |= vka_gw_bloom_mask(w->lo, w->hi); hcnt++;
+        }
+    }
+    vka_gw_sum_publish(&g_gw_sum, cnt, mlo, mhi, blm, hcnt, hlo, hhi, hblm);
+}
 static void gw_add(int kind, uint64_t dst, uint64_t n, uint64_t src, uint32_t value, const void *data) {
     if (!n) return;
     vka_tbuf_wrote(dst, n);   // (images of buffer textures over it are copied again at their next use)
@@ -769,19 +787,20 @@ static void gw_add(int kind, uint64_t dst, uint64_t n, uint64_t src, uint32_t va
     if (g_ngw == g_gwcap) { g_gwcap = g_gwcap ? 2 * g_gwcap : 256; g_gw = realloc(g_gw, (size_t)g_gwcap * sizeof *g_gw); }
     if (kind == GW_OPAQUE)   // the same range again in this submission (a storage buffer bound by draw after draw): one entry, at the newest place
         for (int i = g_ngw - 1; i >= 0 && i >= g_ngw - 16 && !g_gw[i].fence; i--) if (g_gw[i].kind == GW_OPAQUE && g_gw[i].lo == dst && g_gw[i].hi == dst + n) {
-            gw_t w = g_gw[i]; memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w; pthread_mutex_unlock(&g_tmu); return; }
+            gw_t w = g_gw[i]; if (i < g_ngw - 1) memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w; pthread_mutex_unlock(&g_tmu); return; }
     if (kind == GW_UPDATE)   // the same inline update range again in this submission (Splatoon Raiders' 1,550 occlusion queries: 11,010 updates to 7 ranges): overwrite in place
         for (int i = g_ngw - 1; i >= 0 && i >= g_ngw - 16 && !g_gw[i].fence; i--) {
             if (g_gw[i].kind == GW_COPY) break;
             if (g_gw[i].kind == GW_UPDATE && g_gw[i].lo == dst && g_gw[i].hi == dst + n && g_gw[i].data) {
                 memcpy(g_gw[i].data, data, (size_t)n);
-                gw_t w = g_gw[i]; memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w;
+                gw_t w = g_gw[i]; if (i < g_ngw - 1) memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w;
                 pthread_mutex_unlock(&g_tmu); return;
             }
             if (g_gw[i].lo < dst + n && dst < g_gw[i].hi) break;
         }
     uint8_t *cp = NULL; if (kind == GW_UPDATE && (cp = malloc(n))) memcpy(cp, data, n); else if (kind == GW_UPDATE) kind = GW_OPAQUE;
     g_gw[g_ngw++] = (gw_t){dst, dst + n, src, g_gwseq++, 0, (uint32_t)kind, value, cp};
+    vka_gw_sum_add(&g_gw_sum, dst, dst + n, kind == GW_OPAQUE || kind == GW_COPY);
     pthread_mutex_unlock(&g_tmu);
 }
 void vka_tex_gw_copy(uint64_t src, uint64_t dst, uint64_t n) { gw_add(GW_COPY, dst, n, src, 0, NULL); }
@@ -813,11 +832,11 @@ static void gml_entry(void *arg, int k) {   // the bitmap: table entry k (1 + th
     if (k - 1 >= c->nchunks) return;
     uint64_t a = c->lo[k - 1], b = c->hi[k - 1];
     for (int j = g_ngw - 1; j >= 0 && j >= g_ngw - 32; j--) if (g_gw[j].kind == GW_OPAQUE && g_gw[j].lo <= a && g_gw[j].hi >= b) return;
-    gw_grow(); g_gw[g_ngw++] = (gw_t){a, b, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; g_gml_pages += (b - a) >> 12;
+    gw_grow(); g_gw[g_ngw++] = (gw_t){a, b, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; vka_gw_sum_add(&g_gw_sum, a, b, 1); g_gml_pages += (b - a) >> 12;
 }
 static void gml_page(void *arg, uint64_t a) {   // the page-hash set of an older ABI: the 4 KiB page at a was written
     gml_ctx *c = arg;
-    gw_grow(); g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; g_gml_pages++;
+    gw_grow(); g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; vka_gw_sum_add(&g_gw_sum, a, a + 4096, 1); g_gml_pages++;
 }
 static void gml_poll(void) {   // caller holds g_tmu
     uint64_t done = vka_done();
@@ -932,6 +951,7 @@ void vka_tex_gw_commit(uint64_t fence) {   // the writes recorded since the last
 // applied in order. *seen = the newest write the content includes with every older one (the writes not done and not applied, opaque ones, cap it). Caller holds g_tmu
 static uint8_t *gw_content(const uint8_t *mem, uint64_t n, uint64_t *seen) {
     uint64_t a = (uint64_t)(uintptr_t)mem, b = a + n, done = vka_done(), cap = g_gwseq - 1; uint8_t *c = NULL;
+    if (vka_gw_fast_on() && !vka_gw_sum_hit_locked(&g_gw_sum, a, b)) { *seen = cap; return NULL; }
     for (int i = 0; i < g_ngw; i++) {
         gw_t *w = &g_gw[i];
         if (w->fence && w->fence <= done) continue;   // landed: memory has it
@@ -939,7 +959,7 @@ static uint8_t *gw_content(const uint8_t *mem, uint64_t n, uint64_t *seen) {
         if (w->kind == GW_OPAQUE) { if (w->seq - 1 < cap) cap = w->seq - 1; continue; }
         if (!c) { if (!(c = malloc(n))) { cap = 0; break; } dm_guest_read_mapped(c, (uintptr_t)mem, n); }
         uint64_t lo = w->lo > a ? w->lo : a, hi = w->hi < b ? w->hi : b;
-        if (w->kind == GW_FILL) { for (uint64_t k = lo; k < hi; k++) { uint32_t v = w->value; c[k - a] = ((const uint8_t *)&v)[(k - w->lo) & 3]; } }
+        if (w->kind == GW_FILL) { if (vka_gw_fast_on()) vka_gw_fill_bytes(c + (lo - a), lo, hi, w->lo, w->value); else for (uint64_t k = lo; k < hi; k++) { uint32_t v = w->value; c[k - a] = ((const uint8_t *)&v)[(k - w->lo) & 3]; } }
         else if (w->kind == GW_UPDATE) memcpy(c + (lo - a), w->data + (lo - w->lo), hi - lo);
         else {   // a copy: its source as the GPU will read it, which an earlier pending write over the source would change (then the write lands later: re-uploaded)
             const uint8_t *s = (const uint8_t *)(uintptr_t)(w->src + (lo - w->lo));
@@ -958,6 +978,7 @@ int vka_tex_gw_read(uint64_t addr, uint64_t n, void *out) {
         if (vka_addr(addr, n, NULL, NULL, NULL)) memcpy(out, (const void *)(uintptr_t)addr, (size_t)n);
         else dm_guest_read_mapped(out, (uintptr_t)addr, (size_t)n);
     } else if (!vka_addr(addr, n, NULL, NULL, NULL) && dm_guest_unmapped((uintptr_t)addr, n)) return 0;
+    if (vka_gw_fast_on() && !(out ? vka_gw_may_overlap(&g_gw_sum, addr, addr + n) : vka_gw_may_hazard(&g_gw_sum, addr, addr + n))) return 1;
     pthread_mutex_lock(&g_tmu);
     uint64_t a = addr, b = a + n, done = vka_done(); uint8_t *c = out; int ok = 1;
     for (int i = 0; i < g_ngw; i++) {
@@ -974,7 +995,8 @@ int vka_tex_gw_read(uint64_t addr, uint64_t n, void *out) {
             if (!ok) break;
             if (c) dm_guest_read_mapped(c + (lo - a), (uintptr_t)(w->src + (lo - w->lo)), (size_t)(hi - lo));
         } else if (c && w->kind == GW_FILL) {
-            for (uint64_t k = lo; k < hi; k++) { uint32_t v = w->value; c[k - a] = ((const uint8_t *)&v)[(k - w->lo) & 3]; }
+            if (vka_gw_fast_on()) vka_gw_fill_bytes(c + (lo - a), lo, hi, w->lo, w->value);
+            else for (uint64_t k = lo; k < hi; k++) { uint32_t v = w->value; c[k - a] = ((const uint8_t *)&v)[(k - w->lo) & 3]; }
         } else if (c && w->kind == GW_UPDATE) {
             memcpy(c + (lo - a), w->data + (lo - w->lo), (size_t)(hi - lo));
         }
@@ -3397,6 +3419,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         }
         #undef GW_TAKES
         g_ngw = k;
+        gw_sum_rebuild_locked();
     }
     // Tracked images whose pages the CPU wrote since their last upload (a write to a protected page moves the dirty clock, so nothing is scanned while it stands still)
     // Sparse pools' textures also when a mapping request came since (the page table's generation moved)

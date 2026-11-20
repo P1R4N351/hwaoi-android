@@ -22,6 +22,7 @@
 #include "vka_state_fast.h"
 #include "vka_dyn_fast.h"
 #include "vka_cs_fast.h"
+#include "vka_gw_fast.h"
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -250,18 +251,20 @@ static struct {
 // draw whose non-UBO buffers overlap UB (or whose UBO has an uncompleted opaque GPU write) ends the pass first (ub_hazard), and vka_rp_end flushes UB to placed guest RAM
 enum { UB_MAX = 256 };
 static struct {
-    int n, m_valid; uint64_t lo, hi, seq, m_seq, m_addr, m_size; vka_span m_span;
+    int n, m_valid; uint64_t lo, hi, seq, m_seq, m_addr, m_size, bloom; vka_span m_span; vka_ub_shadow_memo4 sm;
     struct { uint64_t dst, n, cap; uint8_t *data; } e[UB_MAX];
 } UB;
 static int ub_overlaps(uint64_t addr, uint64_t size) {
     uint64_t b = addr + size;
     if (!UB.n || !size || b <= UB.lo || addr >= UB.hi) return 0;
+    if (vka_gw_fast_on() && !(UB.bloom & vka_ub_bloom_mask(addr, b))) return 0;
     for (int i = 0; i < UB.n; i++) if (UB.e[i].dst < b && addr < UB.e[i].dst + UB.e[i].n) return 1;
     return 0;
 }
 static void ub_apply(uint64_t addr, void *out, size_t size) {
     uint64_t b = addr + size;
     if (!UB.n || !size || b <= UB.lo || addr >= UB.hi) return;
+    if (vka_gw_fast_on() && !(UB.bloom & vka_ub_bloom_mask(addr, b))) return;
     uint8_t *c = out;
     for (int i = 0; i < UB.n; i++) {
         uint64_t lo = UB.e[i].dst > addr ? UB.e[i].dst : addr, hi = UB.e[i].dst + UB.e[i].n < b ? UB.e[i].dst + UB.e[i].n : b;
@@ -270,7 +273,7 @@ static void ub_apply(uint64_t addr, void *out, size_t size) {
 }
 static void ub_flush(void) {
     if (!UB.n) return;
-    int n = UB.n; UB.n = 0; UB.m_valid = 0;
+    int n = UB.n; UB.n = 0; UB.m_valid = 0; UB.bloom = 0; vka_ub_shadow_reset(&UB.sm);
     uint64_t last_d = 0, last_n = 0;
     vka_rw_pre(g_cb);
     for (int i = 0; i < n; i++) {
@@ -296,7 +299,7 @@ int vka_rp_ub_defer(uint64_t dst, uint64_t n, const void *data) {
         if (!k) return 0;
         done += k;
     }
-    int slot = -1;
+    int slot = -1, was_empty = (UB.n == 0);
     for (int i = UB.n - 1; i >= 0; i--) {
         uint64_t lo = UB.e[i].dst, hi = lo + UB.e[i].n;
         if (lo <= dst && dst + n <= hi) { slot = i; break; }
@@ -326,6 +329,7 @@ int vka_rp_ub_defer(uint64_t dst, uint64_t n, const void *data) {
         UB.n++;
     }
     if (dst + n > UB.hi) UB.hi = dst + n;
+    UB.bloom = was_empty ? vka_ub_bloom_mask(dst, dst + n) : (UB.bloom | vka_ub_bloom_mask(dst, dst + n));
     UB.seq++; UB.m_valid = 0;
     vka_tex_gw_update(dst, n, data);
     { void inst_reset_on_ub(void); inst_reset_on_ub(); }
@@ -985,11 +989,14 @@ static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
     VkBuffer b; VkDeviceSize o;
     uint64_t run = addr_run_fast(addr, size, &b, &o);
     if (UB.n && ub_overlaps(addr, run ? run : size)) {
-        uint64_t sz = run && run < size ? run : size;
-        if (UB.m_valid && UB.m_seq == UB.seq && UB.m_addr == addr && UB.m_size == sz) { *bi = (VkDescriptorBufferInfo){UB.m_span.buf, UB.m_span.off, sz}; return 1; }
+        uint64_t sz = run && run < size ? run : size, bu = 0, of = 0;
+        if (vka_gw_fast_on()) {
+            if (vka_ub_shadow_lookup(&UB.sm, UB.seq, addr, sz, &bu, &of)) { *bi = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)bu, (VkDeviceSize)of, sz}; return 1; }
+        } else if (UB.m_valid && UB.m_seq == UB.seq && UB.m_addr == addr && UB.m_size == sz) { *bi = (VkDescriptorBufferInfo){UB.m_span.buf, UB.m_span.off, sz}; return 1; }
         vka_span s; if (!vka_scratch(sz, V.ub_align, &s)) return 0;
         if (!vka_tex_gw_read(addr, sz, s.ptr) && !cpu_read(addr, s.ptr, (size_t)sz)) memset(s.ptr, 0, (size_t)sz);
-        UB.m_valid = 1; UB.m_seq = UB.seq; UB.m_addr = addr; UB.m_size = sz; UB.m_span = s;
+        if (vka_gw_fast_on()) vka_ub_shadow_insert(&UB.sm, UB.seq, addr, sz, (uint64_t)(uintptr_t)s.buf, (uint64_t)s.off);
+        else { UB.m_valid = 1; UB.m_seq = UB.seq; UB.m_addr = addr; UB.m_size = sz; UB.m_span = s; }
         *bi = (VkDescriptorBufferInfo){s.buf, s.off, sz}; return 1;
     }
     if (run && !(o % V.ub_align) && !(addr % V.ub_align)) { *bi = (VkDescriptorBufferInfo){b, o, run}; return 1; }
