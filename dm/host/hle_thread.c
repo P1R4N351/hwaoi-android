@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include "hle_sync_fast.h"
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -33,17 +34,34 @@ enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W };
 // An entry lives as long as that handle: CloseHandle on it removes the entry (se_unbind), so a SystemEvent destroyed and created again at the same address gets a new kernel event.
 // Entries used to stay forever: the second bind returned early, the new event was never created and signals went to the closed handle (or to whatever event reused its number).
 // Lock order: G, then g_se_lock (nothing takes G while holding g_se_lock)
+static int sync_fast_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("DM_SYNC_FAST"); v = !(e && atoi(e) == 0); atomic_store_explicit(&on, v, memory_order_relaxed); }
+    return v;
+}
 static struct { void *ev; uint32_t wh; uint64_t id; } g_se[512];
 static int g_nse;
 static uint64_t g_next_se_id = 1;   // g_se_lock: binding identity survives neither address nor handle reuse
+static hle_se_idx g_se_idx;
 static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
+static void se_rebuild_idx(void) {   // caller holds g_se_lock
+    memset(&g_se_idx, 0, sizeof g_se_idx);
+    for (int i = 0; i < g_nse; i++) hle_se_put(&g_se_idx, g_se[i].ev, g_se[i].wh, g_se[i].id);
+}
 static uint32_t se_find(void *ev) {   // caller holds g_se_lock
+    if (sync_fast_on() && ev) {
+        uint32_t wh = hle_se_find_ev(&g_se_idx, ev, NULL);
+        if (wh || !g_se_idx.overflow) return wh;
+    }
     for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
     return 0;
 }
 static void se_unbind(uint32_t wh) {   // caller holds G
     pthread_mutex_lock(&g_se_lock);
+    hle_se_del_wh(&g_se_idx, wh);
     for (int i = 0; i < g_nse; ) if (g_se[i].wh == wh) g_se[i] = g_se[--g_nse]; else i++;
+    if (g_se_idx.overflow) se_rebuild_idx();
     pthread_mutex_unlock(&g_se_lock);
 }
 typedef struct event { int signaled; int refs; } event_t;
@@ -65,6 +83,8 @@ typedef struct thr {
     int host_owned;            // a guest thread the host created itself (dm_guest_thread_spawn): it waits in host code and is not one of the game's threads
     uint64_t wseq;             // Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // Wait chain
+    struct thr **wprev, *bnext, **bprev;
+    uint64_t wbloom;
     struct thr *all;           // All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
     int closed;                // Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
@@ -99,12 +119,26 @@ static int g_core_preempt;   // also check already-runnable peers after every th
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
+static hle_hmap g_hmap;
 static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // All waiting threads (lock / condition / address / synchronization)
+static thr_t *g_wbucket[HLE_WB_BUCKETS];
+static thr_t *g_wsync;
+static uint32_t g_wb_live;
 
 static uint32_t h_new(int type, void *obj) {     // Caller holds G
-    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
+    if (sync_fast_on()) {
+        unsigned i = hle_hmap_alloc(&g_hmap);
+        if (!i || g_h[i].type) {
+            memset(&g_hmap, 0, sizeof g_hmap);
+            for (int k = 1; k < MAX_H; k++) if (g_h[k].type) hle_hmap_mark(&g_hmap, (unsigned)k);
+            i = hle_hmap_alloc(&g_hmap);
+        }
+        if (i > 0 && i < MAX_H && !g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
+        if (i) hle_hmap_free(&g_hmap, i);
+    }
+    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; hle_hmap_mark(&g_hmap, (unsigned)i); return 0x1000 + i; }
     die("handle table full");
 }
 static void *h_peek(uint32_t h, int type) {      // Lookup only, no report
@@ -233,17 +267,49 @@ void dm_host_lock(pthread_mutex_t *m) {
 }
 
 // ---------- Wait primitives (called holding G) ----------
+static void wb_reset_if_empty(void) {
+    if (!g_wait && g_wb_live) { memset(g_wbucket, 0, sizeof g_wbucket); g_wsync = NULL; g_wb_live = 0; }
+}
+static void wb_link(thr_t *t, int kind) {
+    wb_reset_if_empty();
+    t->next = g_wait; t->wprev = &g_wait;
+    if (g_wait) g_wait->wprev = &t->next;
+    g_wait = t;
+    thr_t **head = kind == 4 ? &g_wsync : &g_wbucket[hle_wb_hash(kind, kind == 2 ? t->wkey : t->waddr)];
+    t->bnext = *head; t->bprev = head;
+    if (*head) (*head)->bprev = &t->bnext;
+    *head = t; g_wb_live++;
+}
+static void wb_retarget_lock(thr_t *t, uint64_t addr) {
+    if (t->bprev && *t->bprev == t) { *t->bprev = t->bnext; if (t->bnext) t->bnext->bprev = t->bprev; }
+    t->wkind = 1; t->waddr = addr;
+    thr_t **head = &g_wbucket[hle_wb_hash(1, addr)];
+    t->bnext = *head; t->bprev = head;
+    if (*head) (*head)->bprev = &t->bnext;
+    *head = t;
+}
 static void wait_unlink(thr_t *t) {
-    for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
-    t->next = NULL;
+    if (t->wprev && *t->wprev == t) { *t->wprev = t->next; if (t->next) t->next->wprev = t->wprev; }
+    else for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; if (t->next) t->next->wprev = p; break; }
+    t->next = NULL; t->wprev = NULL;
+    if (t->bprev && *t->bprev == t) { *t->bprev = t->bnext; if (t->bnext) t->bnext->bprev = t->bprev; if (g_wb_live) g_wb_live--; }
+    t->bnext = NULL; t->bprev = NULL;
 }
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
 static thr_t *pick(int kind, uint64_t a) {
     thr_t *b = NULL;
+    if (sync_fast_on() && kind >= 1 && kind <= 3) {
+        wb_reset_if_empty();
+        for (thr_t *t = g_wbucket[hle_wb_hash(kind, a)]; t; t = t->bnext) {
+            if (t->wkind != kind || (kind == 2 ? t->wkey : t->waddr) != a) continue;
+            if (!b || hle_wb_prio_better(t->prio, t->wseq, b->prio, b->wseq)) b = t;
+        }
+        return b;
+    }
     for (thr_t *t = g_wait; t; t = t->next) {
         if (t->wkind != kind || (kind == 2 ? t->wkey : t->waddr) != a) continue;
-        if (!b || t->prio < b->prio || (t->prio == b->prio && t->wseq < b->wseq)) b = t;
+        if (!b || hle_wb_prio_better(t->prio, t->wseq, b->prio, b->wseq)) b = t;
     }
     return b;
 }
@@ -268,7 +334,9 @@ static void wake(thr_t *t, int64_t res) {
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_wait(thr_t *t, int kind, int64_t ns);
 static int64_t block(thr_t *t, int kind, int64_t ns) {
-    t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
+    t->wkind = kind; t->woke = 0; t->wseq = ++g_wseq;
+    if (ns == 0 && sync_fast_on()) { t->wkind = 0; return R_TIMEOUT; }
+    wb_link(t, kind);
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     // The time blocked, for the [longframe] line (dm_guest_wait_take): a frame whose presenting thread stood in a guest wait names the kind and the thread that ended it
     uint64_t t0 = now_ns(); t->woke_by = 0;
@@ -308,7 +376,9 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
     if (!w) { st32(addr, 0); return; }
-    for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
+    thr_t *head = sync_fast_on() ? g_wbucket[hle_wb_hash(1, addr)] : g_wait;
+    for (thr_t *t = head; t; t = sync_fast_on() ? t->bnext : t->next)
+        if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
@@ -319,7 +389,8 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
         if (v == 0) { if (cas32(addr, &v, tag)) { wake(t, 0); return; } continue; }
         if (cas32(addr, &v, v | WAITERS_BIT)) break;
     }
-    t->wkind = 1; t->waddr = addr; t->wtag = tag;      // Still in g_wait, changed to a lock wait
+    t->wtag = tag;
+    wb_retarget_lock(t, addr);                           // Still in g_wait, moved to mutex wait bucket
     t->wseq = ++g_wseq;                                  // The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
 }
 
@@ -586,7 +657,28 @@ static int sig_obj(uint32_t h, int *bad) {    // 1 = signaled (holding G)
 }
 // A synchronization object became signaled (an event, or a thread that exited): wake the WaitSynchronization waiters whose handle set holds it, so they re-check (holding G).
 // It used to wake every such waiter on every signal; each then re-checked its handles and went back to sleep, a wake-up per waiting thread per signal
+static uint64_t sync_bloom_of(const uint32_t *hs, int n) {
+    if (!hs || n <= 0) return ~0ull;
+    uint64_t bm = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned k = hs[i] - 0x1000;
+        if (k > 0 && k < MAX_H && g_h[k].obj) bm |= hle_obj_bloom_ins(g_h[k].obj);
+    }
+    return bm;
+}
 static void wake_sync_waiters(const void *obj) {
+    if (sync_fast_on()) {
+        wb_reset_if_empty();
+        uint64_t bit = obj ? hle_obj_bloom_qry(obj) : ~0ull;
+        for (thr_t *w = g_wsync; w; ) { thr_t *n = w->bnext;
+            if (w->wkind == 4 && (!obj || !w->whs || (w->wbloom & bit))) {
+                int hit = !w->whs;
+                for (int i = 0; i < w->whn && !hit; i++) { unsigned k = w->whs[i] - 0x1000; hit = k > 0 && k < MAX_H && g_h[k].obj == obj; }
+                if (hit) wake(w, -1);
+            }
+            w = n; }
+        return;
+    }
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next;
         if (w->wkind == 4) { int hit = !w->whs;
             for (int i = 0; i < w->whn && !hit; i++) { unsigned k = w->whs[i] - 0x1000; hit = k > 0 && k < MAX_H && g_h[k].obj == obj; }
@@ -639,7 +731,7 @@ int thr_list(pthread_t *out, int max) {
 void thr_counts(int *handles, int *live, int *objs) {
     int nh = 0, nl = 0, no = 0;
     pthread_mutex_lock(&G);
-    for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
+    nh = sync_fast_on() ? hle_hmap_count(&g_hmap) : 0; if (!sync_fast_on()) for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     for (thr_t *t = g_all; t; t = t->all) { no++; nl += t->started && !t->exited; }
     pthread_mutex_unlock(&G);
     *handles = nh; *live = nl; *objs = no;
@@ -1109,7 +1201,9 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
         pthread_mutex_lock(&G);
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // In kernel order; once turned into a lock wait or woken it is no longer kind 2
-        int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+        int left = 0;
+        for (thr_t *w = sync_fast_on() ? g_wbucket[hle_wb_hash(2, key)] : g_wait; w; w = sync_fast_on() ? w->bnext : w->next)
+            if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
@@ -1131,7 +1225,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x35: {  // SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
         pthread_mutex_lock(&G);
-        int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
+        int nw = 0; for (thr_t *w = sync_fast_on() ? g_wbucket[hle_wb_hash(3, addr)] : g_wait; w; w = sync_fast_on() ? w->bnext : w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
         if (type != 0) {
             int32_t nv = val + 1;
@@ -1183,7 +1277,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             if (idx >= 0) { r = 0; break; }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
-            t->whs = hs; t->whn = n; int64_t br = block(t, 4, left); t->whs = NULL; t->whn = 0;
+            t->whs = hs; t->whn = n; t->wbloom = sync_bloom_of(hs, n); int64_t br = block(t, 4, left); t->whs = NULL; t->whn = 0;
             if (br == R_TIMEOUT) { r = R_TIMEOUT; break; }
         }
         pthread_mutex_unlock(&G);
@@ -1203,10 +1297,10 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);
             event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
-            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+            g_h[i].type = O_FREE; g_h[i].obj = NULL; hle_hmap_free(&g_hmap, i);
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             thr_t *t = g_h[i].obj;
-            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+            g_h[i].type = O_FREE; g_h[i].obj = NULL; hle_hmap_free(&g_hmap, i);
             t->closed = 1;
             if (t->exited) thr_free(t);
         }
@@ -1233,7 +1327,7 @@ void hle_bind_system_event(void *ev, int autoclear) {      // Must be called on 
     wh = getw(ev);
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent binding table full");
-    g_se[g_nse].ev = ev; g_se[g_nse].wh = wh; g_se[g_nse++].id = g_next_se_id++;
+    uint64_t seid = g_next_se_id++; g_se[g_nse].ev = ev; g_se[g_nse].wh = wh; g_se[g_nse++].id = seid; hle_se_put(&g_se_idx, ev, wh, seid);
     pthread_mutex_unlock(&g_se_lock);
 }
 uint32_t hle_dup_readable_handle(uint32_t h) {   // A second read end of the same kernel event, as a service's handle copied to its client: each end closes on its own (refs); 0 if h is no read end
@@ -1252,7 +1346,8 @@ uint32_t hle_new_event(uint32_t *write_end) {   // A new kernel event, as svcCre
 uint64_t hle_system_event_binding(void *ev) {
     uint64_t id = 0;
     pthread_mutex_lock(&g_se_lock);
-    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) { id = g_se[i].id; break; }
+    if (sync_fast_on() && ev) (void)hle_se_find_ev(&g_se_idx, ev, &id);
+    if (!id && (!sync_fast_on() || g_se_idx.overflow)) for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) { id = g_se[i].id; break; }
     pthread_mutex_unlock(&g_se_lock);
     return id;
 }
@@ -1262,7 +1357,8 @@ int hle_signal_system_event_binding(uint64_t binding) {
     pthread_mutex_lock(&G);
     uint32_t wh = 0;
     pthread_mutex_lock(&g_se_lock);
-    for (int i = 0; i < g_nse; i++) if (g_se[i].id == binding) { wh = g_se[i].wh; break; }
+    if (sync_fast_on()) wh = hle_se_find_id(&g_se_idx, binding);
+    if (!wh && (!sync_fast_on() || g_se_idx.overflow)) for (int i = 0; i < g_nse; i++) if (g_se[i].id == binding) { wh = g_se[i].wh; break; }
     pthread_mutex_unlock(&g_se_lock);
     event_t *e = wh ? h_get(wh, O_EVENT_W) : NULL;
     if (e) { e->signaled = 1; wake_sync_waiters(e); }

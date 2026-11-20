@@ -27,6 +27,7 @@
 #include "vka_texown.h"
 #include "vka_wbfollow.h"
 #include "vka_edge_unpin.h"
+#include "vka_tex_fast.h"
 #include <assert.h>
 #include "../nvn/nvn_tex.h"
 
@@ -2927,16 +2928,25 @@ int vka_tex_id_in_pass(int id) {
 }
 typedef struct { int id; uint8_t dim; uint32_t ver, gen; vka_img *im; VkImageView v; } vmemo;
 static vmemo g_vm[2048]; static struct { int id; uint32_t ver; VkSampler s; } g_sm[512];
+static vka_vmemo4 g_vm4; static vka_smemo4 g_sm4; static vka_cmemo4 g_cm4;
+static inline int tex_fast_on(void) { return VKA_ENV("DM_VK_TEX_FAST", 1) != 0; }
 static inline vmemo *vm_slot(int id, uint8_t dim) { return &g_vm[((unsigned)id * 7u + dim) & 2047]; }
 static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
     return m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && !in_fb(m->im);
 }
 int vka_tex_id_in_pass_rec(int id, uint8_t dim) {
     if (!g_nfb || id <= 0) return 0;
-    if (id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1)) {
-        const vmemo *m = vm_slot(id, dim);
-        if (m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && m->im)
-            return in_fb(m->im) ? (m->im->f.kind >= 3 ? 2 : 1) : 0;
+    if (id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1) && g_tver) {
+        uint32_t ver = atomic_load_explicit(&g_tver[id], memory_order_acquire);
+        uint32_t gen = atomic_load_explicit(&g_tgen, memory_order_acquire);
+        if (tex_fast_on()) {
+            const vka_vm_ent *e = vka_vmemo4_find(&g_vm4, id, dim, ver, gen);
+            if (e && e->im) { const vka_img *im = (const vka_img *)e->im; return in_fb(im) ? (im->f.kind >= 3 ? 2 : 1) : 0; }
+        } else {
+            const vmemo *m = vm_slot(id, dim);
+            if (m->id == id && m->dim == dim && m->ver == ver && m->gen == gen && m->im)
+                return in_fb(m->im) ? (m->im->f.kind >= 3 ? 2 : 1) : 0;
+        }
     }
     return vka_tex_id_in_pass(id);
 }
@@ -2944,24 +2954,43 @@ int vka_tex_id_in_pass_rec(int id, uint8_t dim) {
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout) {
     if (layout) *layout = VK_IMAGE_LAYOUT_GENERAL;
     if (storage || id <= 0 || id >= (1 << 20) || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return id_view(id, cb, dim, storage, NULL, VK_FORMAT_UNDEFINED);
-    vmemo *m = vm_slot(id, dim);
-    if (vm_hit(m, id, dim)) {
-        if (m->im) { m->im->last_frame = vka_frame(); m->im->last_fence = vka_fence_last(); }
-        return m->v;
-    }
     uint32_t gen = atomic_load_explicit(&g_tgen, memory_order_acquire), ver = g_tver ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0;
+    int fast = tex_fast_on();
+    if (fast && g_tver) {
+        const vka_vm_ent *e = vka_vmemo4_find(&g_vm4, id, dim, ver, gen);
+        if (e && e->im && !in_fb((const vka_img *)e->im)) {
+            vka_img *im = (vka_img *)e->im; im->last_frame = vka_frame(); im->last_fence = vka_fence_last();
+            return (VkImageView)e->v;
+        }
+    } else if (!fast) {
+        vmemo *m = vm_slot(id, dim);
+        if (vm_hit(m, id, dim)) { if (m->im) { m->im->last_frame = vka_frame(); m->im->last_fence = vka_fence_last(); } return m->v; }
+    }
     vka_img *im = NULL; VkImageView v = id_view(id, cb, dim, 0, &im, VK_FORMAT_UNDEFINED);
     if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
-    if (v && im && g_tver && !in_fb(im)) *m = (vmemo){id, dim, ver, gen, im, v};
+    if (v && im && g_tver && !in_fb(im)) {
+        if (fast) vka_vmemo4_put(&g_vm4, id, dim, ver, gen, im, (void *)v);
+        else *vm_slot(id, dim) = (vmemo){id, dim, ver, gen, im, v};
+    }
     return v;
 }
 int vka_tex_id_pending_rec(int id, uint8_t dim) {   // 0 at once when the memo holds the ID (its image was made)
-    if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1) && vm_hit(vm_slot(id, dim), id, dim)) return 0;
+    if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1) && g_tver) {
+        if (tex_fast_on()) {
+            const vka_vm_ent *e = vka_vmemo4_find(&g_vm4, id, dim, atomic_load_explicit(&g_tver[id], memory_order_acquire), atomic_load_explicit(&g_tgen, memory_order_acquire));
+            if (e && e->im && !in_fb((const vka_img *)e->im)) return 0;
+        } else if (vm_hit(vm_slot(id, dim), id, dim)) return 0;
+    }
     return vka_tex_id_pending(id);
 }
 VkSampler vka_samp_id_rec(int id) {
     if (id <= 0 || id >= 4096 * 4 || !g_sver || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return vka_samp_id(id);
     uint32_t ver = atomic_load_explicit(&g_sver[id], memory_order_acquire);
+    if (tex_fast_on()) {
+        VkSampler sp = (VkSampler)vka_smemo4_get(&g_sm4, id, ver);
+        if (sp) return sp;
+        sp = vka_samp_id(id); vka_smemo4_put(&g_sm4, id, ver, (void *)sp); return sp;
+    }
     typeof(g_sm[0]) *m = &g_sm[id & 511];
     if (m->id == id && m->ver == ver && m->s) return m->s;
     VkSampler sp = vka_samp_id(id);
@@ -3012,6 +3041,13 @@ int vka_tex_id_class_rec(int id) {
     static struct { int id; uint32_t ver; int cls; } m[2048];
     if (id <= 0 || id >= (1 << 20) || !g_tver) return vka_tex_id_class(id);
     uint32_t ver = atomic_load_explicit(&g_tver[id], memory_order_acquire);
+    if (tex_fast_on()) {
+        int cls = 0;
+        if (vka_cmemo4_get(&g_cm4, id, ver, &cls)) return cls;
+        cls = vka_tex_id_class(id);
+        vka_cmemo4_put(&g_cm4, id, ver, cls);
+        return cls;
+    }
     typeof(m[0]) *e = &m[(unsigned)id & 2047];
     if (e->id == id && e->ver == ver) return e->cls;
     int c = vka_tex_id_class(id);

@@ -97,6 +97,8 @@ t_vka_lc: t_vka_lc.c ../vk_android/vka_mem_lc.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -o $@ $< -lpthread
 t_dirty_deswz_w6: t_dirty_deswz_w6.c ../tex/nvn_deswizzle.c ../nvn/nvn_tex.c ../tex/nvn_deswizzle_fast.h ../nvn/nvn_dirty_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW6_TEST_HOOKS -o $@ t_dirty_deswz_w6.c ../tex/nvn_deswizzle.c ../nvn/nvn_tex.c -lpthread
+t_tex_memo_w7: t_tex_memo_w7.c ../vk_android/vka_tex_fast.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW7_TEST_HOOKS -o $@ t_tex_memo_w7.c -lpthread
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thermal: t_thermal.c $(MTL_T_DEP)

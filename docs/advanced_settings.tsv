@@ -427,6 +427,7 @@ DM_SPLIT_SPILL	developer	Diagnostics			text			both
 DM_SPLIT_TARGETED	developer	Packing			text			both							
 DM_SVC	developer	Diagnostics			text			both							
 DM_SYMCHECK	developer	Diagnostics			text			both							
+DM_SYNC_FAST	developer	Performance			text			both							
 DM_TBUF_ALIGN	internal	Diagnostics			text			both						Mac or iOS only	
 DM_TEAM_ID	developer	Game			text			both							
 DM_TELEPORT	developer	Diagnostics			text			both							
@@ -735,6 +736,7 @@ DM_VK_SYNCLOG	developer	Diagnostics			text			both
 DM_VK_TBUF	developer	Graphics			text			both							
 DM_VK_TEST_HANG	developer	Diagnostics			text			both							
 DM_VK_TEXU_ELEM	developer	Diagnostics			text			both							
+DM_VK_TEX_FAST	developer	Performance			text			both							
 DM_VK_TEX_MEMO	developer	Memory			text			both							
 DM_VK_TEX_PEEK	developer	Diagnostics			text			both							
 DM_VK_TEX_PEEK_FROM	developer	Diagnostics			text			both							
