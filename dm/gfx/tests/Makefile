@@ -127,6 +127,8 @@ t_reg_fl_fast_w20: t_reg_fl_fast_w20.c ../nvn/nvn_reg_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW20_TEST_HOOKS -o $@ t_reg_fl_fast_w20.c -lpthread
 t_serial_fast_w21: t_serial_fast_w21.c ../vk_android/vka_serial_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW21_TEST_HOOKS -o $@ t_serial_fast_w21.c -lpthread
+t_img_fast_w22: t_img_fast_w22.c ../vk_android/vka_img_fast.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW22_TEST_HOOKS -o $@ t_img_fast_w22.c -lpthread
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thermal: t_thermal.c $(MTL_T_DEP)

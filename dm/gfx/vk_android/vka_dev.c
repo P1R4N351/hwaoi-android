@@ -570,8 +570,17 @@ static uint64_t g_fence, g_submitted, g_done;
 static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER, g_scv = PTHREAD_COND_INITIALIZER;
 
-uint64_t vka_fence_last(void) { pthread_mutex_lock(&g_fmu); uint64_t f = g_fence; pthread_mutex_unlock(&g_fmu); return f; }
-uint64_t vka_fence_next(void) { pthread_mutex_lock(&g_fmu); uint64_t f = ++g_fence; pthread_mutex_unlock(&g_fmu); return f; }
+uint64_t vka_fence_last(void) {
+    if (VKA_ENV("DM_VK_IMG_FAST", 1)) return __atomic_load_n(&g_fence, __ATOMIC_ACQUIRE);
+    pthread_mutex_lock(&g_fmu); uint64_t f = __atomic_load_n(&g_fence, __ATOMIC_ACQUIRE); pthread_mutex_unlock(&g_fmu); return f;
+}
+uint64_t vka_fence_next(void) {
+    pthread_mutex_lock(&g_fmu);
+    uint64_t f = __atomic_load_n(&g_fence, __ATOMIC_RELAXED) + 1;
+    __atomic_store_n(&g_fence, f, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_fmu);
+    return f;
+}
 void vka_fence_post(uint64_t fence, void *ops, int n, void (*run)(void *, int)) {
     pthread_mutex_lock(&g_fmu);
     while (g_post[fence % POST_RING].fence && g_post[fence % POST_RING].fence != fence) pthread_cond_wait(&g_fcv, &g_fmu);   // that slot's earlier fence has not completed yet
