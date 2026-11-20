@@ -101,6 +101,8 @@ t_tex_memo_w7: t_tex_memo_w7.c ../vk_android/vka_tex_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW7_TEST_HOOKS -o $@ t_tex_memo_w7.c -lpthread
 t_shader_dset_w8: t_shader_dset_w8.c ../vk_android/vka_shader_fast.h ../vk_android/vka_dset_fast.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW8_TEST_HOOKS -o $@ t_shader_dset_w8.c -lpthread
+t_vin_fast_w9: t_vin_fast_w9.c ../vk_android/vka_vin_fast.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror -DW9_TEST_HOOKS -o $@ t_vin_fast_w9.c -lpthread
 t_fstep: t_fstep.c ../nvn/nvn_fstep.h
 	clang -O1 -Wall -o $@ t_fstep.c
 t_thermal: t_thermal.c $(MTL_T_DEP)

@@ -774,6 +774,7 @@ DM_VK_VB_FILTER	developer	Graphics			text			both
 DM_VK_VEGETATION	advanced	Graphics	Full vegetation		toggle			game		Game settings > Full vegetation					
 DM_VK_VIEW_LEARN	developer	Graphics			text			both							
 DM_VK_VIN_DYN	developer	Graphics			text		On where the device has it; off with Qualcomm's driver before 512.800	both							
+DM_VK_VIN_FAST	developer	Graphics			text			both							
 DM_VK_VIN_SKIP	developer	Graphics			text			both							
 DM_VK_WB_FOLLOW	developer	Graphics			text			both							
 DM_VK_WORKER	developer	Graphics			text			both							

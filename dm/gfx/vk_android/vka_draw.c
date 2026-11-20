@@ -17,6 +17,20 @@
 #include "vka_wbfollow.h"
 #include "vka_ktgl_cache.h"
 #include "vka_dset_fast.h"
+#include "vka_vin_fast.h"
+uint64_t vka_mem_gen(void);
+static vka_addrm4 *g_addrm4;
+static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
+    if (!addr || !vka_vin_fast_on()) return vka_addr_run(addr, len, b, o);
+    if (!g_addrm4) g_addrm4 = calloc(1, sizeof *g_addrm4);
+    uint64_t mg = vka_mem_gen(), bu = 0, oo = 0, run = 0;
+    if (g_addrm4 && vka_addrm4_find(g_addrm4, mg, addr, len, &bu, &oo, &run)) {
+        *b = (VkBuffer)(uintptr_t)bu; *o = (VkDeviceSize)oo; return run;
+    }
+    run = vka_addr_run(addr, len, b, o);
+    if (g_addrm4 && run) vka_addrm4_put(g_addrm4, mg, addr, len, (uint64_t)(uintptr_t)*b, (uint64_t)*o, run);
+    return run;
+}
 _Static_assert(sizeof(((vka_progsh *)0)->sh) == VKA_KTGL_NSTAGES * sizeof(void *), "pm stages");
 _Static_assert(sizeof(vka_layout) <= VKA_KTGL_LAY_BYTES, "layout size");
 #include <math.h>
@@ -949,7 +963,7 @@ int vka_mesh_on(void) { return V.mesh && !V.memu; }
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
     if (!size || size > V.ub_range) size = size ? V.ub_range : 65536 < V.ub_range ? 65536 : V.ub_range;
     VkBuffer b; VkDeviceSize o;
-    uint64_t run = vka_addr_run(addr, size, &b, &o);
+    uint64_t run = addr_run_fast(addr, size, &b, &o);
     if (UB.n && ub_overlaps(addr, run ? run : size)) {
         uint64_t sz = run && run < size ? run : size;
         if (UB.m_valid && UB.m_seq == UB.seq && UB.m_addr == addr && UB.m_size == sz) { *bi = (VkDescriptorBufferInfo){UB.m_span.buf, UB.m_span.off, sz}; return 1; }
@@ -1201,7 +1215,7 @@ static void rt_peek(const char *what, int i, const tex_t *t, const vka_img *im, 
 }
 static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
     VkBuffer b; VkDeviceSize o;
-    uint64_t run = vka_addr_run(addr, size ? size : V.sb_range, &b, &o);
+    uint64_t run = addr_run_fast(addr, size ? size : V.sb_range, &b, &o);
     if (!run) { VRED_ONCE("storage buffer at %#llx is not in placed guest RAM: it is not bound", (unsigned long long)addr); return 0; }
     if (run > V.sb_range) run = V.sb_range;
     *bi = (VkDescriptorBufferInfo){b, o, run}; return 1;
@@ -1842,52 +1856,99 @@ static void vin_build(const vka_dstate *d, const vka_shader *vs, vka_gkey *k) {
 // The vertex buffers the command buffer holds (slot: buffer, offset, size): a draw binds only the slots that changed, consecutive ones in one call. Vulkan keeps vertex
 // buffer bindings across pipeline binds and passes for the life of the command buffer; forgotten with the dynamic state (vka_dyn_invalidate: a new command buffer or
 // part). Profile p2: vin_bind was 13 % of the replay thread, one vkCmdBindVertexBuffers2 a stream a draw. DM_VK_VB_FILTER=0 (live): every slot every draw
-static struct { int valid, vin_stale; VkBuffer b[33]; VkDeviceSize o[33], sz[33]; uint32_t vnb, vna; VkVertexInputBindingDescription2EXT vb[33]; VkVertexInputAttributeDescription2EXT va[32]; } VB;
+typedef struct { VkVertexInputBindingDescription2EXT b[33]; VkVertexInputAttributeDescription2EXT a[32]; } vka_vc_vk_slot;
+static struct { int valid, vin_stale; uint32_t vser; VkBuffer b[33]; VkDeviceSize o[33], sz[33]; uint32_t vnb, vna; VkVertexInputBindingDescription2EXT vb[33]; VkVertexInputAttributeDescription2EXT va[32]; } VB;
+static vka_vinfast_vc_memo4 *g_vc_memo4;
+static vka_vc_vk_slot *g_vc_vk;
+static int32_t g_vi_vk_slot = -1;
+static vka_vinfast_vbc g_vbc_fast = {.bound_zb = -1};
+static void vi_sync_from_slot(void) {
+    if (g_vi_vk_slot < 0 || !g_vc_vk) return;
+    const vka_vc_vk_slot *s = &g_vc_vk[g_vi_vk_slot];
+    if (VI.nb) memcpy(VI.b, s->b, VI.nb * sizeof *VI.b);
+    if (VI.na) memcpy(VI.a, s->a, VI.na * sizeof *VI.a);
+    g_vi_vk_slot = -1;
+}
 static void vb_set(uint32_t slot, VkBuffer b, VkDeviceSize o, VkDeviceSize sz, uint32_t *n0, uint32_t *nn, VkBuffer *rb, VkDeviceSize *ro, VkDeviceSize *rs) {
     if (slot >= 33) return;
     if (VB.valid && g_vb_filter && VB.b[slot] == b && VB.o[slot] == o && VB.sz[slot] == sz) return;
     VB.b[slot] = b; VB.o[slot] = o; VB.sz[slot] = sz;
-    if (*nn && *n0 + *nn != slot) { vk.vkCmdBindVertexBuffers2(g_cb, *n0, *nn, rb, ro, rs, NULL); *nn = 0; }   // a run ends: bound in one call
+    if (*nn && *n0 + *nn != slot) { vk.vkCmdBindVertexBuffers2(g_cb, *n0, *nn, rb, ro, rs, NULL); *nn = 0; }
     if (!*nn) *n0 = slot;
     rb[*nn] = b; ro[*nn] = o; rs[*nn] = sz; (*nn)++;
 }
-static void vin_bind(const vka_dstate *d) {
-    if (!VB.valid) memset(&VB, 0, sizeof VB);
-    // The vertex input state too only when it changed (it was set every draw: up to 65 descriptions copied into the encoder's ring and the driver), and again after
-    // every pipeline bind: Vulkan keeps dynamic vertex input across vkCmdBindPipeline, but drivers have lost it there before (hardening; the buffers stay filtered)
-    if (V.vin_dyn) {
-        int same = VB.valid && !VB.vin_stale && g_vb_filter && VB.vnb == VI.nb && VB.vna == VI.na && !memcmp(VB.vb, VI.b, VI.nb * sizeof *VI.b) && !memcmp(VB.va, VI.a, VI.na * sizeof *VI.a);
-        if (!same) { vk.vkCmdSetVertexInputEXT(g_cb, VI.nb, VI.b, VI.na, VI.a); VB.vnb = VI.nb; VB.vna = VI.na; memcpy(VB.vb, VI.b, VI.nb * sizeof *VI.b); memcpy(VB.va, VI.a, VI.na * sizeof *VI.a); }
-        VB.vin_stale = 0;
+static void vin_set_input(int fast) {
+    if (!V.vin_dyn) return;
+    const VkVertexInputBindingDescription2EXT *bp = (g_vi_vk_slot >= 0 && g_vc_vk) ? g_vc_vk[g_vi_vk_slot].b : VI.b;
+    const VkVertexInputAttributeDescription2EXT *ap = (g_vi_vk_slot >= 0 && g_vc_vk) ? g_vc_vk[g_vi_vk_slot].a : VI.a;
+    int same = fast ? (VB.valid && !VB.vin_stale && g_vb_filter && VB.vser && VB.vser == g_vi_ser)
+                    : (VB.valid && !VB.vin_stale && g_vb_filter && VB.vnb == VI.nb && VB.vna == VI.na && !memcmp(VB.vb, bp, VI.nb * sizeof *bp) && !memcmp(VB.va, ap, VI.na * sizeof *ap));
+    if (!same) {
+        vk.vkCmdSetVertexInputEXT(g_cb, VI.nb, bp, VI.na, ap);
+        VB.vser = g_vi_ser;
+        if (!fast) { VB.vnb = VI.nb; VB.vna = VI.na; memcpy(VB.vb, bp, VI.nb * sizeof *bp); memcpy(VB.va, ap, VI.na * sizeof *ap); }
     }
+    VB.vin_stale = 0;
+}
+static void vin_bind(const vka_dstate *d) {
+    if (!VB.valid) { memset(&VB, 0, sizeof VB); vka_vinfast_vbc_reset(&g_vbc_fast); }
+    int fast = vka_vin_fast_on() && g_vb_filter && V.vin_dyn;
+    vin_set_input(fast);
+    uint64_t mg = fast ? vka_mem_gen() : 0;
+    uint32_t need_u = VI.used; int need_z = VI.zero;
+    if (fast && !vka_vinfast_need_streams(&g_vbc_fast, VB.valid, d->s_vbuf, mg, VI.used, VI.zero, VI.zb, &need_u, &need_z)) { VB.valid = 1; return; }
     VkBuffer rb[33]; VkDeviceSize ro[33], rs[33]; uint32_t n0 = 0, nn = 0;
-    for (uint32_t st = 0; st < 16; st++) if (VI.used >> st & 1) {   // each stream at its address, as far as it is bound and placed
+    for (uint32_t st = 0; st < 16; st++) if (need_u >> st & 1) {
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
-        if (addr) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
+        if (addr) { VkBuffer cb; VkDeviceSize co; uint64_t run = addr_run_fast(addr, size ? size : 1ull << 30, &cb, &co);
                     if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
         vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
     }
-    if (VI.zero) vb_set(VI.zb, g_zero.buf, g_zero.off, 65536, &n0, &nn, rb, ro, rs);
+    if (need_z) vb_set(VI.zb, g_zero.buf, g_zero.off, 65536, &n0, &nn, rb, ro, rs);
     if (nn) vk.vkCmdBindVertexBuffers2(g_cb, n0, nn, rb, ro, rs, NULL);
     VB.valid = 1;
+    if (fast) vka_vinfast_note_streams(&g_vbc_fast, 1, d->s_vbuf, mg, need_u, need_z, VI.zb);
 }
-// The vertex input unchanged since the last draw (DM_VK_VIN_SKIP, live from the next submission, default 1; 0: built and compared every draw, as before). With vertex input
-// dynamic state the descriptions (VI) are a function of the vertex shader and the attribute and stream records alone (vin_build), so a draw with the same shader and no
-// such record since (d->s_vfmt) keeps VI and the key's retyped inputs (VC). And vin_bind of an unchanged VI, with no vertex buffer record since (d->s_vbuf) and no segment
-// come or gone (vka_mem_gen: the address lookups), into a command buffer that holds what the last vin_bind bound (VB.valid, no pipeline bind since: vin_stale), sets and
-// binds nothing (every slot equal to the bound one, DM_VK_VB_FILTER), so it is not run (VBC). Any other vin_bind (an instanced run's) forgets VBC
 static uint64_t g_vin_kept, g_vin_built, g_vb_kept, g_vb_bound;
 static struct { int valid; const vka_shader *vs; uint64_t s_vfmt; uint32_t vin_u, vin_s; } VC;
 static struct { int valid; uint32_t ser; uint64_t s_vbuf, mg; } VBC;
+static void vin_vc_store(const vka_shader *vs, const vka_dstate *d, const vka_gkey *k) {
+    if (!g_vc_memo4) g_vc_memo4 = calloc(1, sizeof *g_vc_memo4);
+    if (!g_vc_vk) g_vc_vk = calloc(VKA_VC_SLOTS, sizeof *g_vc_vk);
+    if (!g_vc_memo4 || !g_vc_vk) return;
+    vka_vinfast_vc_ent e = {.vs_u = (uint64_t)(uintptr_t)vs, .s_vfmt = d->s_vfmt, .ser = g_vi_ser, .vin_u = k->vin_u, .vin_s = k->vin_s,
+                             .used = (uint16_t)VI.used, .nb = (uint8_t)VI.nb, .na = (uint8_t)VI.na, .zb = (uint8_t)VI.zb, .zero = (uint8_t)VI.zero, .valid = 1};
+    uint32_t slot = vka_vinfast_vc_alloc(g_vc_memo4, &e);
+    if (VI.nb) memcpy(g_vc_vk[slot].b, VI.b, VI.nb * sizeof *VI.b);
+    if (VI.na) memcpy(g_vc_vk[slot].a, VI.a, VI.na * sizeof *VI.a);
+    g_vi_vk_slot = (int32_t)slot;
+}
 static void vin_build_kept(const vka_dstate *d, const vka_shader *vs, vka_gkey *k) {
     if (g_vin_skip && V.vin_dyn && VC.valid && VC.vs == vs && VC.s_vfmt == d->s_vfmt) { k->vin_u = VC.vin_u; k->vin_s = VC.vin_s; g_vin_kept++; return; }
+    if (g_vin_skip && V.vin_dyn && vka_vin_fast_on() && g_vc_memo4) {
+        uint32_t slot = 0;
+        const vka_vinfast_vc_ent *hit = vka_vinfast_vc_find(g_vc_memo4, (uint64_t)(uintptr_t)vs, d->s_vfmt, &slot);
+        if (hit) {
+            VI.nb = hit->nb; VI.na = hit->na; VI.used = hit->used; VI.zb = hit->zb; VI.zero = hit->zero; g_vi_ser = hit->ser;
+            g_vi_vk_slot = (int32_t)slot;
+            VC.valid = 1; VC.vs = vs; VC.s_vfmt = d->s_vfmt; VC.vin_u = hit->vin_u; VC.vin_s = hit->vin_s;
+            k->vin_u = hit->vin_u; k->vin_s = hit->vin_s; g_vin_kept++; return;
+        }
+    }
+    g_vi_vk_slot = -1;
     vin_build(d, vs, k); g_vin_built++;
     VC.valid = 1; VC.vs = vs; VC.s_vfmt = d->s_vfmt; VC.vin_u = k->vin_u; VC.vin_s = k->vin_s;
+    if (V.vin_dyn && vka_vin_fast_on()) vin_vc_store(vs, d, k);
 }
 static void vin_bind_kept(const vka_dstate *d) {
     uint64_t mg = vka_mem_gen();
-    if (g_vin_skip && V.vin_dyn && g_vb_filter && VB.valid && !VB.vin_stale && VBC.valid && VBC.ser == g_vi_ser && VBC.s_vbuf == d->s_vbuf && VBC.mg == mg) { g_vb_kept++; return; }
+    if (g_vin_skip && V.vin_dyn && g_vb_filter && VB.valid && !VB.vin_stale) {
+        if (vka_vin_fast_on()) {
+            uint32_t nu = 0; int nz = 0;
+            if (VB.vser && VB.vser == g_vi_ser && !vka_vinfast_need_streams(&g_vbc_fast, 1, d->s_vbuf, mg, VI.used, VI.zero, VI.zb, &nu, &nz)) { g_vb_kept++; return; }
+        } else if (VBC.valid && VBC.ser == g_vi_ser && VBC.s_vbuf == d->s_vbuf && VBC.mg == mg) { g_vb_kept++; return; }
+    }
     vin_bind(d); g_vb_bound++;
     VBC.valid = 1; VBC.ser = g_vi_ser; VBC.s_vbuf = d->s_vbuf; VBC.mg = mg;
 }
@@ -1913,7 +1974,7 @@ static void ib_bind(VkBuffer b, VkDeviceSize o, VkIndexType t) {
     vk.vkCmdBindIndexBuffer(g_cb, b, o, t); IB.valid = 1; IB.b = b; IB.o = o; IB.t = t;
 }
 static void inst_reset(void);
-void vka_dyn_invalidate(void) { DY.valid = 0; VB.valid = 0; VBC.valid = 0; IB.valid = 0; pd_clear(0); pd_clear(1); inst_reset(); }
+void vka_dyn_invalidate(void) { DY.valid = 0; VB.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast); VBC.valid = 0; IB.valid = 0; pd_clear(0); pd_clear(1); inst_reset(); }
 #define PT(i) do { if (g_prof) { uint64_t t_ = cntvct(); if ((i) > 0 && g_pt_ph == (i) - 1) g_pt[(i) > 0 ? (i) - 1 : 0] += t_ - g_pt_last; g_pt_last = t_; g_pt_ph = (i); } } while (0)
 // ---------- Instanced runs (DM_VK_INSTANCE) ----------
 // Donkey Kong Bananza draws many objects as runs of draws that repeat one mesh (the same pipeline, index range, base vertex and vertex streams) and differ only in where one
@@ -2617,6 +2678,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     // DM_VK_INSTANCE: a direct indexed draw of one instance with only vertex and pixel shaders, their base modules and no retyped inputs may join the open run (its
     // instanced pipeline stays bound) or start one (decided at the sets, below)
     VkBuffer i_ib = VK_NULL_HANDLE; VkDeviceSize i_io = 0; VkIndexType i_it = VK_INDEX_TYPE_UINT16;
+    if (g_inst_on && g_vi_vk_slot >= 0) vi_sync_from_slot();
     int icand = g_inst_on && !mesh && di && !di->ind && !expand && di->instances <= 1 && d->b.base_instance == 0 && sh[1] && !sh[2] && !sh[3] && !sh[4] && !d->rast_discard
                 && !(k.vin_u | k.vin_s) && k.fs_variant == DMSH_VK_MOD_BASE && lay.push && vka_enc_on() && inst_ib(di, &i_ib, &i_io, &i_it);
     int ijoin = icand && RUN.open && p == RUN.base.p && DY.valid && DY.pipe == RUN.ipipe && vka_enc_total() == RUN.mark && inst_same_draw(&RUN.base, i_ib, i_io, i_it, di, d);
@@ -2667,7 +2729,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         if (istart) {   // the run's table as an instance-rate input at INST_LOC
             VI.b[VI.nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, INST_BIND, 4, VK_VERTEX_INPUT_RATE_INSTANCE, 1};
             VI.a[VI.na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, INST_LOC, INST_BIND, VK_FORMAT_R32_UINT, 0};
-            vin_bind(d); VBC.valid = 0;
+            vin_bind(d); VBC.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast);
             VI.nb--; VI.na--;
             VkDeviceSize tsz = 4 * INST_CAP; vk.vkCmdBindVertexBuffers2(g_cb, INST_BIND, 1, &i_ta.buf, &i_ta.off, &tsz, NULL);
         } else vin_bind_kept(d);
@@ -2844,7 +2906,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
             if (vka_enc_total() == RUN.mark) { RUN.table[RUN.n++] = (uint32_t)(i_d / 16); RUN.args[1] = RUN.n; g_inst_joined++; g_draws++; inst_fast_arm(d, rt, has_rt, sc, has_sc, di, 0); PT(8); return; }
             inst_close(); g_inst_falls++;   // (a dynamic state was set for it): drawn alone after all
             vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.valid = 0; pd_clear(0);
-            vin_bind(d); VBC.valid = 0;
+            vin_bind(d); VBC.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast);
             if (!sets_push(&lay, VK_PIPELINE_BIND_POINT_GRAPHICS, 0)) { g_skipped++; return; }
             ijoin = 0; ib = i_ib; io = i_io; it = i_it;
         } else if (!vka_addr(di->ibuf, ind ? isz : isz * (uint64_t)(di->count > 0 ? di->count : 1), &ib, &io, NULL) || io % isz) SKIPD(VKS_GUESTMEM, "index buffer at %#llx is not in placed guest RAM: skipped", (unsigned long long)di->ibuf);
