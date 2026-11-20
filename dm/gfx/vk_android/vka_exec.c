@@ -1354,14 +1354,14 @@ static void dlss_eval(const p_dlss *o) {
         f.c.src = ct; f.c.dst = ot; f.c.sr = (NVNcopyRegion){sx, sy, 0, iw, ih, 1}; f.c.dr = (NVNcopyRegion){dx, dy, 0, ow, oh, 1};
         f.depth = o->tex[DLSS_DEPTH]; f.motion = o->tex[DLSS_MOTION]; memcpy(f.jitter, o->jitter, sizeof f.jitter); memcpy(f.mv, o->mv, sizeof f.mv); f.reset = o->reset;
         vka_img *z = f.depth ? vka_tex_get(f.depth, g_cb) : NULL, *m = f.motion ? vka_tex_get(f.motion, g_cb) : NULL;
-        if (!o->base[DLSS_DEPTH][0] && !o->base[DLSS_DEPTH][1] && !o->base[DLSS_MOTION][0] && !o->base[DLSS_MOTION][1] && vka_dlss_fsr3(g_cb, s, sfmt, d, enc, z, m, &f)) { vka_img_written(d); g_stat_ops++; return; }
+        if (!o->base[DLSS_DEPTH][0] && !o->base[DLSS_DEPTH][1] && !o->base[DLSS_MOTION][0] && !o->base[DLSS_MOTION][1] && vka_dlss_fsr3(g_cb, s, sfmt, d, enc, z, m, &f)) { vka_dyn_invalidate(); vka_img_written(d); g_stat_ops++; return; }
         mode = 2;
     }
-    if (mode >= 2 && vka_dlss_run(g_cb, o, mode, s, sl, sfmt, sx, sy, iw, ih, d, dl, enc, dx, dy, ow, oh)) { vka_img_written(d); g_stat_ops++; return; }
+    if (mode >= 2 && vka_dlss_run(g_cb, o, mode, s, sl, sfmt, sx, sy, iw, ih, d, dl, enc, dx, dy, ow, oh)) { vka_dyn_invalidate(); vka_img_written(d); g_stat_ops++; return; }
     if (in_srgb != enc) {   // the bilinear scale through the decoding view, encoded for an sRGB output: a blit would carry one texture's encoding into the other
         VkImageView v = (s->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && s->samples == 1 && !s->f.kind ? vka_view(s, sfmt ? sfmt : s->f.view, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, sl, 1, 0, 1, NULL) : VK_NULL_HANDLE;
         uint32_t tw = s->w >> sl ? s->w >> sl : 1, th = s->h >> sl ? s->h >> sl : 1;
-        if (vka_dlss_scale(g_cb, v, sx, sy, iw, ih, tw, th, d, dl, dx, dy, ow, oh, enc)) { vka_img_written(d); g_stat_ops++; return; }
+        if (vka_dlss_scale(g_cb, v, sx, sy, iw, ih, tw, th, d, dl, dx, dy, ow, oh, enc)) { vka_dyn_invalidate(); vka_img_written(d); g_stat_ops++; return; }
         VRED_ONCE("DLSS stand-in: input and output differ in sRGB (NVN formats %#x → %#x) and the encoding copy cannot run: a blit, whose picture is off in brightness", ct->d.format, ot->d.format);
     }
     if ((s->f.kind && s->f.kind < 3) || s->f.kind != d->f.kind || s->f.bw > 1 || s->samples > 1) {

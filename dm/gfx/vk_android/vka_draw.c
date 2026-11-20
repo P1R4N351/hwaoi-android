@@ -20,6 +20,7 @@
 #include "vka_vin_fast.h"
 #include "vka_walk_fast.h"
 #include "vka_state_fast.h"
+#include "vka_dyn_fast.h"
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -42,7 +43,7 @@ _Static_assert(sizeof(vka_layout) <= VKA_KTGL_LAY_BYTES, "layout size");
 #include <time.h>
 #include <string.h>
 
-static VkCommandBuffer g_cb; static unsigned g_slot; static int g_prof, g_dyn_filter = 1, g_pass_keep = 1, g_vb_filter = 1;   // g_prof: this draw is timed (vka_draw)
+static VkCommandBuffer g_cb; static unsigned g_slot; static int g_prof, g_dyn_filter = 1, g_pass_keep = 1, g_vb_filter = 1; static int g_push_dedup = 1, g_push_delta, g_xp_scissor;   // g_prof: this draw is timed (vka_draw)
 static int g_prof_all, g_prof_every;   // DM_VK_PROF: every draw timed; the pace line's sample (DM_VK_PACE_PROF): one draw in g_prof_every
 static int g_vin_skip = 1;             // DM_VK_VIN_SKIP (vin_build_kept)
 static int g_inst_on;   // DM_VK_INSTANCE (the instanced runs below)
@@ -200,6 +201,7 @@ void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0) && inst_device_ok();   // live: from this submission
     g_vin_skip = VKA_ENV("DM_VK_VIN_SKIP", 1);
     g_vattr_clear = VKA_ENV("DM_VK_VATTR_CLEAR", 1);
+    g_push_dedup = VKA_ENV("DM_VK_PUSH_DEDUP", 1); g_push_delta = VKA_ENV("DM_VK_PUSH_DELTA", 0); g_xp_scissor = VKA_ENV("DM_VK_XP_SCISSOR", 0);
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
     g_cur_dp[g_slot] = 0;
     vka_pso_save(0);
@@ -1608,7 +1610,42 @@ void vka_drv_memo_stats(char *b, size_t n) {
     g_pd_delta_w = g_pd_delta_all = 0;
 }
 static VkWriteDescriptorSet g_dw[512]; static uint32_t g_dwn;   // the writes that changed (push_same returns 2)
+static inline void w_pack4(const VkWriteDescriptorSet *w, uint64_t row[4]) {
+    row[0] = (uint64_t)w->dstBinding | (uint64_t)w->dstArrayElement << 16 | (uint64_t)w->descriptorType << 32 | (uint64_t)w->descriptorCount << 48;
+    if (w->pBufferInfo) { row[1] = (uint64_t)w->pBufferInfo->buffer; row[2] = w->pBufferInfo->offset; row[3] = w->pBufferInfo->range; }
+    else if (w->pImageInfo) { row[1] = (uint64_t)w->pImageInfo->sampler; row[2] = (uint64_t)w->pImageInfo->imageView; row[3] = w->pImageInfo->imageLayout; }
+    else if (w->pTexelBufferView) { row[1] = (uint64_t)*w->pTexelBufferView; row[2] = 0; row[3] = 0; }
+    else { row[1] = 1; row[2] = 1; row[3] = 1; }
+}
+static int push_fill_from(int c, uint32_t from) {
+    for (uint32_t i = from; i < g_w.n; i++) {
+        const VkWriteDescriptorSet *w = &g_w.w[i];
+        if (w->descriptorCount != 1) return (pd_clear(c), -1);
+        w_pack4(w, g_pd[c].w + 2 + 4 * (size_t)i);
+    }
+    return 0;
+}
+static int push_same_fast(int c, VkPipelineLayout layout) {
+    size_t need = 2 + 4 * (size_t)g_w.n;
+    if (!vka_pd_grow(&g_pd[c].w, &g_pd[c].cap, need)) return (pd_clear(c), 0);
+    if (g_pd[c].n == need && g_pd[c].w[0] == (uint64_t)layout && g_pd[c].w[1] == g_w.n) {
+        for (uint32_t i = 0; i < g_w.n; i++) {
+            const VkWriteDescriptorSet *w = &g_w.w[i];
+            if (w->descriptorCount != 1) return (pd_clear(c), 0);
+            uint64_t row[4]; w_pack4(w, row);
+            if (!vka_pd_eq4(g_pd[c].w + 2 + 4 * (size_t)i, row)) {
+                if (push_fill_from(c, i) < 0) return 0;
+                g_pd_push++; g_pd_push_all++; return 0;
+            }
+        }
+        g_pd_skip++; g_pd_skip_all++; return 1;
+    }
+    g_pd[c].w[0] = (uint64_t)layout; g_pd[c].w[1] = g_w.n;
+    if (push_fill_from(c, 0) < 0) return 0;
+    g_pd[c].n = need; g_pd_push++; g_pd_push_all++; return 0;
+}
 static int push_same(VkPipelineBindPoint bp, VkPipelineLayout layout) {
+    if (vka_dyn_memo_on() && g_push_dedup && !g_push_delta) return push_same_fast(bp == VK_PIPELINE_BIND_POINT_COMPUTE, layout);
     static uint64_t *buf; static size_t cap;
     size_t need = 2 + (size_t)g_w.n * 5, k = 0;
     if (need > cap) { cap = need * 2; buf = realloc(buf, cap * sizeof *buf); if (!buf) { cap = 0; return 0; } }
@@ -2018,8 +2055,9 @@ static void ib_bind(VkBuffer b, VkDeviceSize o, VkIndexType t) {
     if (IB.valid && g_vb_filter && IB.b == b && IB.o == o && IB.t == t) return;
     vk.vkCmdBindIndexBuffer(g_cb, b, o, t); IB.valid = 1; IB.b = b; IB.o = o; IB.t = t;
 }
+static vka_dyn_guard g_dyn_guard;
 static void inst_reset(void);
-void vka_dyn_invalidate(void) { DY.valid = 0; VB.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast); VBC.valid = 0; IB.valid = 0; pd_clear(0); pd_clear(1); inst_reset(); }
+void vka_dyn_invalidate(void) { DY.valid = 0; vka_dyn_guard_reset(&g_dyn_guard); VB.valid = 0; VB.vser = 0; vka_vinfast_vbc_reset(&g_vbc_fast); VBC.valid = 0; IB.valid = 0; pd_clear(0); pd_clear(1); inst_reset(); }
 #define PT(i) do { if (g_prof) { uint64_t t_ = cntvct(); if ((i) > 0 && g_pt_ph == (i) - 1) g_pt[(i) > 0 ? (i) - 1 : 0] += t_ - g_pt_last; g_pt_last = t_; g_pt_ph = (i); } } while (0)
 // ---------- Instanced runs (DM_VK_INSTANCE) ----------
 // Donkey Kong Bananza draws many objects as runs of draws that repeat one mesh (the same pipeline, index range, base vertex and vertex streams) and differ only in where one
@@ -2780,6 +2818,15 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         } else vin_bind_kept(d);
     }
 
+    if (g_fs_sub || g_pp_side) vka_dyn_guard_reset(&g_dyn_guard);
+    int dyn_fast = vka_dyn_memo_on() && g_dyn_filter == 1 && !g_rtl_pass && !g_fs_sub && !g_pp_side;
+    vka_dyn_key dyn_k;
+    if (dyn_fast) {
+        uint32_t dkf = vka_dyn_pack_flags(has_sc, mesh, eq_relax, di && d->restart.on, di ? di->itype : 0, vka_origin_ll(), vka_queue_origin_ll());
+        vka_dyn_key_fill(&dyn_k, d, d->s_vfmt, d->bind_gen, R.full_w, R.full_h, R.area.offset.x, R.area.offset.y, R.area.extent.width, R.area.extent.height,
+                         (uint32_t)R.df, (uint32_t)R.sf, has_sc ? sc->x : 0, has_sc ? sc->y : 0, has_sc ? sc->w : 0, has_sc ? sc->h : 0, (uint32_t)topo, dkf, g_xp_scissor);
+        if (DY.valid && vka_dyn_guard_hit(&g_dyn_guard, &dyn_k)) goto dyn_done;
+    }
     // Viewport and scissor. The translator writes clip space for Metal (y up, origin upper left): Metal's viewport, flipped for a lower-left window origin as on Metal, then given
     // a negative height, maps it as Metal does (android/SHADERS.md "Depth and Y")
     float vx = d->has_vp ? d->vp[0][0] : 0, vy = d->has_vp ? d->vp[0][1] : 0, vw = d->has_vp ? d->vp[0][2] : (float)R.full_w, vh = d->has_vp ? d->vp[0][3] : (float)R.full_h;
@@ -2798,7 +2845,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         if (x1 <= x0 || y1 <= y0) { if (g_rtl_pass && rtl_room()) VLOG("rt log draw %u: fragment %016llx not drawn: empty scissor %d,%d %dx%d", g_rtl_d++, (unsigned long long)(sh[1] ? sh[1]->key : 0), sc->x, sc->y, sc->w, sc->h); return; }   // an empty scissor: nothing drawn
         scr = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
     }
-    { int xs = VKA_ENV("DM_VK_XP_SCISSOR", 0);   // experiment (wrong picture): every draw's scissor cut to xs x xs pixels, to split a pass's GPU time into per-pixel and per-draw work
+    { int xs = g_xp_scissor;   // experiment (wrong picture): every draw's scissor cut to xs x xs pixels, to split a pass's GPU time into per-pixel and per-draw work
       if (xs > 0) { if (scr.extent.width > (uint32_t)xs) scr.extent.width = (uint32_t)xs; if (scr.extent.height > (uint32_t)xs) scr.extent.height = (uint32_t)xs; } }
     DY_SET(sc, scr, vk.vkCmdSetScissor(g_cb, 0, 1, &scr));
     // Rasterizer and depth / stencil
@@ -2836,6 +2883,8 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     if (restart) { uint32_t all = di->itype == 0 ? 0xff : di->itype == 1 ? 0xffff : 0xffffffffu; if (d->restart.index != all) VRED_ONCE("primitive restart index %#x is not the all-ones index Vulkan restarts at", d->restart.index); }
     if (!mesh) DY_SET1(pr, (uint32_t)(restart), vk.vkCmdSetPrimitiveRestartEnable(g_cb, DY.pr));
     DY.valid = 1;
+    if (dyn_fast) vka_dyn_guard_put(&g_dyn_guard, &dyn_k);
+dyn_done:
     if (g_rtl_pass && rtl_room()) {   // DM_VK_RT_LOG: the draw's state
         char cm[200]; size_t cn = 0;
         for (uint32_t i = 0; i < R.ncolor && cn < sizeof cm; i++) if (R.cf[i]) cn += (size_t)snprintf(cm + cn, sizeof cm - cn, " c%u mask %x out %x blend %d(%d,%d,%d/%d,%d,%d)", i, k.att[i].mask,
