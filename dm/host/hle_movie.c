@@ -10,6 +10,7 @@
 #include "vpx/vp8dx.h"
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #include "hle_movie_yuv.h"   // md_nv12 / md_rgba, shared with hle_codec_video.c
+#include "hle_movie_nv12.h"
 #if PLAT_APPLE
 #include <AudioToolbox/AudioToolbox.h>   // AAC
 #else
@@ -239,18 +240,11 @@ static void md_dims(const mdec_t *d, int *w, int *h, int *stride, int *slice) {
 enum { MDJ_NONE, MDJ_DECODE, MDJ_CLOSE, MDJ_QUIT, MDJ_TAKE };
 static int md_threads(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n >= 8 ? 4 : 2; }
 // I420 → NV12 (stride = width, plane height = height); a smaller picture is padded with black, a larger one cropped
+static int g_fast_nv12 = -1;   // DM_MOVIE_FAST_NV12=0: legacy full-frame border memset + row-by-row copy (A/B)
 void md_nv12(const vpx_image_t *im, uint8_t *dst, int w, int h) {
-    int cw = (int)im->d_w < w ? (int)im->d_w : w, ch = (int)im->d_h < h ? (int)im->d_h : h;
-    if (cw < w || ch < h) { memset(dst, 16, (size_t)w * h); memset(dst + (size_t)w * h, 128, (size_t)w * h / 2); }
-    for (int y = 0; y < ch; y++) memcpy(dst + (size_t)y * w, im->planes[0] + (size_t)y * im->stride[0], cw);
-    int cw2 = (cw + 1) / 2, ch2 = (ch + 1) / 2;
-    for (int y = 0; y < ch2 && y < h / 2; y++) {
-        const uint8_t *u = im->planes[1] + (size_t)y * im->stride[1], *v = im->planes[2] + (size_t)y * im->stride[2];
-        uint8_t *o = dst + (size_t)w * h + (size_t)y * w;
-        int x = 0;
-        for (; x + 16 <= cw2; x += 16) { uint8x16x2_t t = { { vld1q_u8(u + x), vld1q_u8(v + x) } }; vst2q_u8(o + 2 * x, t); }
-        for (; x < cw2 && 2 * x + 1 < w; x++) { o[2 * x] = u[x]; o[2 * x + 1] = v[x]; }
-    }
+    if (g_fast_nv12 < 0) { const char *e = getenv("DM_MOVIE_FAST_NV12"); g_fast_nv12 = !(e && *e == '0'); }
+    dm_movie_nv12_pack(im->planes[0], im->stride[0], im->planes[1], im->stride[1], im->planes[2], im->stride[2],
+                       (int)im->d_w, (int)im->d_h, dst, w, h, g_fast_nv12, 0);
 }
 #ifdef __ANDROID__   // the Vulkan replay's (vka_present.c), when it is linked in: 1 when the swapchain is BGRA
 __attribute__((weak)) int vka_swap_rb(void);
@@ -348,7 +342,11 @@ static int md_vpx(mdec_t *d, const uint8_t *p, int n, int slot) {
         vpx_codec_iface_t *iface = d->type == MD_TYPE_VP8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx();
         vpx_codec_err_t e = vpx_codec_dec_init(&d->vpx, iface, &cfg, 0);
         if (e) { LOG("[RED] movie: libvpx failed to create the %s decoder: %s", codec, vpx_codec_err_to_string(e)); return 0; }
-        if (d->type == MD_TYPE_VP9) vpx_codec_control(&d->vpx, VP9D_SET_ROW_MT, 1);
+        if (d->type == MD_TYPE_VP9) {
+            vpx_codec_control(&d->vpx, VP9D_SET_ROW_MT, 1);
+            const char *lo = getenv("DM_MOVIE_LOOP_OPT");   // DM_MOVIE_LOOP_OPT=0 disables VP9 multi-thread loop-filter opt (A/B)
+            if (!(lo && *lo == '0')) vpx_codec_control(&d->vpx, VP9D_SET_LOOP_FILTER_OPT, 1);
+        }
         d->vpx_on = 1;
         LOG("[movie] libvpx %s: %s decoder, %d threads", vpx_codec_version_str(), codec, cfg.threads);
     }

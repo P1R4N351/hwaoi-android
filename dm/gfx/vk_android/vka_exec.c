@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vka_tstick.h"
+#include "vka_ktgl_cache.h"
 
 typedef struct { uint64_t serial; p_set_rt rt; int has_rt; p_scissor sc; int has_sc; int64_t copy_stride, copy_img_stride; int rc_skip; vka_dstate d; } qstate;   // what a queue keeps between submissions (d: the draw state, vka_draw.c)
 static qstate S;
@@ -1594,6 +1595,16 @@ VkBuffer vka_qdx_ib(void) {
     g_qdx_ib = b; g_qdx_ib_mem = mem;
     return g_qdx_ib;
 }
+static void qdx_phase_barrier(VkCommandBuffer cb, int phase) {
+    _Static_assert(VK_PIPELINE_STAGE_TRANSFER_BIT == 0x00001000u && VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT == 0x00000800u &&
+                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT == 0x00000002u, "vk stage bits");
+    _Static_assert(VK_ACCESS_TRANSFER_WRITE_BIT == 0x00001000u && VK_ACCESS_SHADER_READ_BIT == 0x00000020u &&
+                   VK_ACCESS_SHADER_WRITE_BIT == 0x00000040u && VK_ACCESS_INDIRECT_COMMAND_READ_BIT == 0x00000001u, "vk access bits");
+    if (!VKA_ENV("DM_VK_KTGL_CACHE", 1)) { vka_barrier(cb); return; }
+    vka_ktgl_bar_spec sp = vka_ktgl_qdx_bar_spec(phase, 0);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = sp.src_access, .dstAccessMask = sp.dst_access};
+    vk.vkCmdPipelineBarrier(cb, sp.src_stage, sp.dst_stage, 0, 1, &mb, 0, NULL, 0, NULL);
+}
 static void qdx_convert(const uint64_t *inds, int n) {
     if (!n || g_qdx_n + n > QDX_MAX) { if (n) VRED_ONCE("indirect quad draws: more than %d records between two writes: the rest skipped", QDX_MAX); return; }
     if (!qdx_init_pipe()) return;
@@ -1611,7 +1622,7 @@ static void qdx_convert(const uint64_t *inds, int n) {
         vi[nv] = inds[k]; vo[nv++] = d;
     }
     if (!nv) return;
-    vka_barrier(g_cb);
+    qdx_phase_barrier(g_cb, 1);
     vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_qdx_pipe);
     uint32_t max_q = QDX_MAX_QUADS;
     vk.vkCmdPushConstants(g_cb, g_qdx_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof max_q, &max_q);
@@ -1622,7 +1633,7 @@ static void qdx_convert(const uint64_t *inds, int n) {
         vk.vkCmdDispatch(g_cb, 1, 1, 1);
         g_qdx[g_qdx_n].ind = vi[k]; g_qdx[g_qdx_n].buf = s.buf; g_qdx[g_qdx_n++].off = vo[k] + 32; g_qdx_copies++;
     }
-    vka_barrier(g_cb);
+    qdx_phase_barrier(g_cb, 2);
     vka_dyn_invalidate();
     if (g_qdx_scans + g_qdx_splits == 1 || (g_qdx_scans + g_qdx_splits) % 20000 == 0)
         VLOG("indirect quad draws: %llu conversions, %llu look-aheads, %llu render passes split", (unsigned long long)g_qdx_copies,

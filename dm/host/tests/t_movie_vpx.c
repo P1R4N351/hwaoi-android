@@ -185,6 +185,84 @@ static void vorbis_split(void) {
     assert(!md_vorbis_emit(&d, 0, 1024));
     puts("Vorbis movie sound: an output takes the length asked for and leaves the rest");
 }
+#include <time.h>
+
+static uint64_t mv_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void nv12_fill_i420(uint8_t *y, int ys, uint8_t *u, int us, uint8_t *v, int vs, int w, int h) {
+    int h2 = (h + 1) / 2, w2 = (w + 1) / 2;
+    for (int r = 0; r < h; r++) {
+        for (int c = 0; c < w; c++) y[(size_t)r * (size_t)ys + (size_t)c] = (uint8_t)((r * 7 + c * 3) & 0xff);
+    }
+    for (int r = 0; r < h2; r++) {
+        for (int c = 0; c < w2; c++) {
+            u[(size_t)r * (size_t)us + (size_t)c] = (uint8_t)((0x20 + r + c * 5) & 0xff);
+            v[(size_t)r * (size_t)vs + (size_t)c] = (uint8_t)((0x90 + r * 3 + c) & 0xff);
+        }
+    }
+}
+
+static int nv12_verify_case(int sw, int sh, int dw, int dh, int ys, int uvs, int fault_mode) {
+    size_t ysz = (size_t)ys * (size_t)sh, uvsz = (size_t)uvs * (size_t)((sh + 1) / 2);
+    size_t osz = (size_t)dw * (size_t)dh * 3u / 2u;
+    uint8_t *y = malloc(ysz), *u = malloc(uvsz), *v = malloc(uvsz), *ref = malloc(osz), *got = malloc(osz);
+    assert(y && u && v && ref && got);
+    nv12_fill_i420(y, ys, u, uvs, v, uvs, sw, sh);
+    memset(ref, 0xaa, osz);
+    memset(got, 0x55, osz);
+    dm_movie_nv12_pack(y, ys, u, uvs, v, uvs, sw, sh, ref, dw, dh, 0, 0);
+    dm_movie_nv12_pack(y, ys, u, uvs, v, uvs, sw, sh, got, dw, dh, 1, fault_mode);
+    int eq = (memcmp(ref, got, osz) == 0);
+    free(y); free(u); free(v); free(ref); free(got);
+    return eq;
+}
+
+static void nv12_bench_case(const char *tag, int sw, int sh, int dw, int dh, int ys, int uvs, int iters) {
+    size_t ysz = (size_t)ys * (size_t)sh, uvsz = (size_t)uvs * (size_t)((sh + 1) / 2);
+    size_t osz = (size_t)dw * (size_t)dh * 3u / 2u;
+    uint8_t *y = malloc(ysz), *u = malloc(uvsz), *v = malloc(uvsz), *dst = malloc(osz);
+    assert(y && u && v && dst);
+    nv12_fill_i420(y, ys, u, uvs, v, uvs, sw, sh);
+    uint64_t t0 = mv_now_ns();
+    for (int i = 0; i < iters; i++) {
+        y[0] = (uint8_t)i;
+        dm_movie_nv12_pack(y, ys, u, uvs, v, uvs, sw, sh, dst, dw, dh, 0, 0);
+    }
+    uint64_t base_ns = mv_now_ns() - t0;
+    t0 = mv_now_ns();
+    for (int i = 0; i < iters; i++) {
+        y[0] = (uint8_t)i;
+        dm_movie_nv12_pack(y, ys, u, uvs, v, uvs, sw, sh, dst, dw, dh, 1, 0);
+    }
+    uint64_t fast_ns = mv_now_ns() - t0;
+    printf("aoi_nv12[%s]: iters=%d base_us=%.2f fast_us=%.2f speedup=%.2fx (dst[0]=%u)\n",
+           tag, iters, (double)base_ns / iters / 1e3, (double)fast_ns / iters / 1e3,
+           fast_ns ? (double)base_ns / (double)fast_ns : 0.0, (unsigned)dst[0]);
+    free(y); free(u); free(v); free(dst);
+}
+
+static void nv12_pack_suite(void) {
+    const char *fe = getenv("T_MOVIE_NV12_FAULT");
+    int fault_mode = fe ? atoi(fe) : 0;
+    assert(nv12_verify_case(1920, 1080, 1920, 1080, 1920, 960, 0) == 1);
+    assert(nv12_verify_case(1920, 1080, 1920, 1080, 1984, 1024, 0) == 1);
+    int pad_ok = nv12_verify_case(1280, 720, 1920, 1080, 1280, 640, fault_mode);
+    int odd_ok = nv12_verify_case(1279, 719, 1920, 1080, 1344, 672, fault_mode);
+    if (!pad_ok || !odd_ok) {
+        fprintf(stderr, "FAIL: nv12 border/UV mismatch (fault_mode=%d pad_ok=%d odd_ok=%d)\n",
+                fault_mode, pad_ok, odd_ok);
+        exit(1);
+    }
+    nv12_bench_case("1080p_contig", 1920, 1080, 1920, 1080, 1920, 960, 400);
+    nv12_bench_case("720p_pad_1080p", 1280, 720, 1920, 1080, 1280, 640, 400);
+    setenv("DM_MOVIE_LOOP_OPT", "0", 1); decode(3, MD_FMT_NV12, vp9, sizeof vp9);
+    setenv("DM_MOVIE_LOOP_OPT", "1", 1); decode(3, MD_FMT_NV12, vp9, sizeof vp9);
+}
+
 int main(void) {
     playing();
     vorbis_flush();
@@ -199,4 +277,5 @@ int main(void) {
         decode(2, format, vp8, sizeof vp8);
     }
     puts("VP8 and VP9 key frames: NV12 and RGBA pixels match");
+    nv12_pack_suite();
 }

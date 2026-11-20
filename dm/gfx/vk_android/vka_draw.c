@@ -15,6 +15,9 @@
 #include "vka_memu_abi.h"
 #include "vka_prepass.h"
 #include "vka_wbfollow.h"
+#include "vka_ktgl_cache.h"
+_Static_assert(sizeof(((vka_progsh *)0)->sh) == VKA_KTGL_NSTAGES * sizeof(void *), "pm stages");
+_Static_assert(sizeof(vka_layout) <= VKA_KTGL_LAY_BYTES, "layout size");
 #include <math.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -1682,14 +1685,30 @@ static int ub_hazard(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], int 
 // ---------- Draws ----------
 // A program's shaders by its serial (a program that gets new shaders gets a new serial, hle_nvn.c), remembered for the draws after: the shader table's lock and lookup
 // were taken once per stage of every draw
-static struct { uint64_t serial; unsigned gen; vka_progsh ps; } g_pm[64];   // gen: vka_layer_gen when made (a program missing a shader is resolved again when the layer grows)
+static struct { uint64_t serial; unsigned gen; vka_progsh ps; } g_pm[64];   // gen: vka_layer_gen when made (legacy DM_VK_KTGL_CACHE=0)
+static vka_ktgl_pm_cache g_ktgl_pm;
+static int resolve_cached(const prog_t *p, uint64_t sr, unsigned gen, vka_progsh *ps) {
+    if (VKA_ENV("DM_VK_KTGL_CACHE", 1)) {
+        void *tmp[VKA_KTGL_NSTAGES];
+        uint32_t bad32 = 0;
+        if (sr && vka_ktgl_pm_get(&g_ktgl_pm, sr, gen, VKA_BAD_MISSING, tmp, &bad32, 0)) {
+            memcpy(ps->sh, tmp, sizeof ps->sh);
+            ps->bad = bad32;
+            return 1;
+        }
+        if (!vka_prog_shaders(p, ps)) return 0;
+        if (sr) { memcpy(tmp, ps->sh, sizeof tmp); vka_ktgl_pm_put(&g_ktgl_pm, sr, gen, tmp, ps->bad); }
+        return 1;
+    }
+    typeof(g_pm[0]) *m = &g_pm[(sr ^ sr >> 6) & 63];
+    if (sr && m->serial == sr && (m->gen == gen || !(m->ps.bad & VKA_BAD_MISSING))) *ps = m->ps;
+    else { if (!vka_prog_shaders(p, ps)) return 0; if (sr) { m->serial = sr; m->gen = gen; m->ps = *ps; } }
+    return 1;
+}
 static int resolve(const prog_t *p, int st, vka_shader **out, unsigned *bad) {
     *out = NULL; if (!p) return 1;
     vka_progsh ps;
-    uint64_t sr = p->serial; typeof(g_pm[0]) *m = &g_pm[(sr ^ sr >> 6) & 63];
-    unsigned gen = vka_layer_gen();
-    if (sr && m->serial == sr && (m->gen == gen || !(m->ps.bad & VKA_BAD_MISSING))) ps = m->ps;
-    else { if (!vka_prog_shaders(p, &ps)) return 0; if (sr) { m->serial = sr; m->gen = gen; m->ps = ps; } }
+    if (!resolve_cached(p, p->serial, vka_layer_gen(), &ps)) return 0;
     if (ps.bad & (1u << st | VKA_BAD_MISSING)) { *bad |= 1u << st | (ps.bad & VKA_BAD_MISSING); return 1; }   // (VKA_BAD_MISSING kept: not the device's cause)
     *out = ps.sh[st]; return 1;
 }
@@ -2387,11 +2406,21 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     }
 
     PT(1);
-    // The last draw's shaders' layout (layouts live as long as the device): the layout table's lock and hash a draw
+    // The last draw's shaders' layout + 256-entry L1 memo (layouts live as long as the device): avoids g_mu lock on alternating separable KTGL draws
     static vka_shader *lsh[VKA_NSTAGE]; static vka_layout llay; static int lok;
+    static vka_ktgl_lay_cache g_ktgl_lay;
     vka_layout lay;
-    if (lok && !memcmp(lsh, sh, sizeof lsh)) lay = llay;
-    else { lok = 0; if (!vka_layout_of(sh, 0, &lay)) SKIP("draw skipped: no pipeline layout"); memcpy(lsh, sh, sizeof lsh); llay = lay; lok = 1; }
+    if (lok && !memcmp(lsh, sh, sizeof lsh)) {
+        lay = llay;
+    } else if (VKA_ENV("DM_VK_KTGL_CACHE", 1) &&
+               vka_ktgl_lay_get(&g_ktgl_lay, (const void *const *)sh, &lay, sizeof lay)) {
+        memcpy(lsh, sh, sizeof lsh); llay = lay; lok = 1;
+    } else {
+        lok = 0;
+        if (!vka_layout_of(sh, 0, &lay)) SKIP("draw skipped: no pipeline layout");
+        if (VKA_ENV("DM_VK_KTGL_CACHE", 1)) vka_ktgl_lay_put(&g_ktgl_lay, (const void *const *)sh, &lay, sizeof lay);
+        memcpy(lsh, sh, sizeof lsh); llay = lay; lok = 1;
+    }
     // Images first used by this draw are made (cleared or uploaded) outside the render pass, then the pass opens over the bound targets
     PT(2);
     walk_all(d, sh);
@@ -3121,7 +3150,12 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
         g_dispatches++;
         return;
     }
-    vka_layout lay; if (!vka_layout_of(sh, 1, &lay)) SKIP("dispatch skipped: no pipeline layout");
+    static vka_ktgl_cs_cache g_ktgl_cs_lay;
+    vka_layout lay;
+    if (!(VKA_ENV("DM_VK_KTGL_CACHE", 1) && vka_ktgl_cs_lay_get(&g_ktgl_cs_lay, sh[5], &lay, sizeof lay))) {
+        if (!vka_layout_of(sh, 1, &lay)) SKIP("dispatch skipped: no pipeline layout");
+        if (VKA_ENV("DM_VK_KTGL_CACHE", 1)) vka_ktgl_cs_lay_put(&g_ktgl_cs_lay, sh[5], &lay, sizeof lay);
+    }
     VkPipeline p = vka_cs_pipeline_frame(sh[5], &lay);   // (VK_NULL_HANDLE while being made in the background, DM_VK_CS_ASYNC: the dispatch skipped)
     if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
     if (!p) { g_skipped++; if (vks_pipeline_counts(vka_pso_wait)) g_skip_dev[VKS_PIPELINE]++; return; }
