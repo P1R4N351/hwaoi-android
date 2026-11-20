@@ -401,6 +401,7 @@ int vka_tex_id_in_pass_rec(int id, uint8_t dim);
 int vka_tex_id_target(int id);                      // the NVN target texture ID id stands for (its view's), -1 = not registered
 int vka_tex_id_buffer(int id, uint64_t *addr, uint32_t *elems, int *format);   // a buffer texture: its storage's guest address, elements and NVN format; 0 = not one
 int vka_tex_id_is_buffer(int id);                   // texture ID id was registered as a buffer texture (no lock)
+uint32_t vka_tex_id_tver(int id);                 // registration version for ID id (no lock)
 // ---------- Buffer textures (vka_tbuf.c) ----------
 VkBufferView vka_tbuf_view(int id, int storage);     // a texel buffer view over buffer texture id's guest memory; VK_NULL_HANDLE = none (logged)
 int vka_tbuf_pending(int id, uint8_t dim);           // buffer texture id read as an image of shape dim needs its copy refreshed (outside a render pass: vka_tbuf_refresh)

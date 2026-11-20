@@ -2656,6 +2656,9 @@ static void treg(int id, const tex_t *t, const view_t *v, int img) {
 int vka_tex_id_is_buffer(int id) {   // (no lock: the draw path asks it for every texture binding)
     return id > 0 && id < (1 << 20) && g_tisbuf && atomic_load_explicit(&g_tisbuf[id], memory_order_acquire);
 }
+uint32_t vka_tex_id_tver(int id) {
+    return id > 0 && id < (1 << 20) && g_tver ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0u;
+}
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { treg(id, t, v, 0); }
 void mtl_reg_image(int id, const tex_t *t, const view_t *v) { treg(id, t, v, 1); }
 void mtl_reg_samp(int id, const samp_par *p) {
