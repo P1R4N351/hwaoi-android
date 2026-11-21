@@ -286,23 +286,34 @@ static inline int vka_lkey_eq_fast(const void *a, const void *b, uint32_t n,
 
 #endif
 
-#if defined(VKA_PWLIST_H) && !defined(VKA_PCACHE_FAST_PW_H)
-#define VKA_PCACHE_FAST_PW_H
-static inline int vka_pw_rec_ok_fast(const pwrec *r, const uint8_t *kb, int fault_mode) {
-    if (r->kind > VKA_PW_MESH || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
-    if (r->kind == VKA_PW_CS) return r->klen == 0;
-    if (r->kind == VKA_PW_MESH && (!r->key[1] || r->key[3] || r->key[4] || r->inst[0] || r->inst[1])) return 0;
+#if defined(VKA_GKEY_H) && !defined(VKA_PCACHE_FAST_GKEY_H)
+#define VKA_PCACHE_FAST_GKEY_H
+typedef struct { uint8_t kind, bad, inst[2]; uint32_t klen; uint64_t key[5]; } vka_pwrec_w34;
+_Static_assert(sizeof(vka_pwrec_w34) == 48u, "vka_pwrec_w34 size");
+enum {
+    VKA_PW_W34_GFX = 0, VKA_PW_W34_CS = 1, VKA_PW_W34_MESH = 2,
+    VKA_PW_W34_TOPO_MAX = 10, VKA_PW_W34_POLY_MAX = 2, VKA_PW_W34_LOGIC_MAX = 15,
+    VKA_PW_W34_BLENDF_MAX = 18, VKA_PW_W34_BLENDOP_MAX = 4, VKA_PW_W34_FS_VAR_MAX = 4
+};
+static inline size_t vka_pw_size_w34(const vka_pwrec_w34 *r) {
+    return sizeof *r + (((size_t)r->klen + 7u) & ~(size_t)7u);
+}
+static inline int vka_pw_rec_ok_fast_raw(const vka_pwrec_w34 *r, const uint8_t *kb, int fault_mode) {
+    if (r->kind > VKA_PW_W34_MESH || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
+    if (r->kind == VKA_PW_W34_CS) return r->klen == 0;
+    if (r->kind == VKA_PW_W34_MESH && (!r->key[1] || r->key[3] || r->key[4] || r->inst[0] || r->inst[1])) return 0;
     size_t pfx = offsetof(vka_gkey, va);
     if (r->klen < pfx) return 0;
-    vka_gkey k = {0};
+    vka_gkey k;
+    memset(&k, 0, sizeof k);
     memcpy(&k, kb, r->klen);
-    if (k.ncolor > 8 || k.fs_variant > VKA_PW_FS_VARIANT_MAX || (k.samples != 1 && k.samples != 2 && k.samples != 4 && k.samples != 8)) return 0;
-    if (k.topo > VKA_PW_TOPO_MAX || k.poly_mode > VKA_PW_POLY_MAX || k.alpha_func > 8 || k.logic_op > VKA_PW_LOGIC_MAX) return 0;
+    if (k.ncolor > 8 || k.fs_variant > VKA_PW_W34_FS_VAR_MAX || (k.samples != 1 && k.samples != 2 && k.samples != 4 && k.samples != 8)) return 0;
+    if (k.topo > VKA_PW_W34_TOPO_MAX || k.poly_mode > VKA_PW_W34_POLY_MAX || k.alpha_func > 8 || k.logic_op > VKA_PW_W34_LOGIC_MAX) return 0;
     if (k.depth_clamp > 1 || k.a2c > 1 || k.logic_en > 1 || k.gl_depth > 1 || k.gs_fx > 1 || k.vin_static > 1) return 0;
     for (int i = 0; i < 8; i++) {
-        int bad_op = (fault_mode != 3) && (k.att[i].op > VKA_PW_BLENDOP_MAX || k.att[i].opa > VKA_PW_BLENDOP_MAX);
-        if (k.att[i].en > 1 || k.att[i].src > VKA_PW_BLENDF_MAX || k.att[i].dst > VKA_PW_BLENDF_MAX ||
-            k.att[i].srca > VKA_PW_BLENDF_MAX || k.att[i].dsta > VKA_PW_BLENDF_MAX || bad_op) return 0;
+        int bad_op = (fault_mode != 3) && (k.att[i].op > VKA_PW_W34_BLENDOP_MAX || k.att[i].opa > VKA_PW_W34_BLENDOP_MAX);
+        if (k.att[i].en > 1 || k.att[i].src > VKA_PW_W34_BLENDF_MAX || k.att[i].dst > VKA_PW_W34_BLENDF_MAX ||
+            k.att[i].srca > VKA_PW_W34_BLENDF_MAX || k.att[i].dsta > VKA_PW_W34_BLENDF_MAX || bad_op) return 0;
     }
     if (k.vin_static && r->klen > pfx) {
         for (int i = 0; i < 32; i++) if (k.va[i].used > 1 || (k.va[i].used && k.va[i].binding > 32)) return 0;
@@ -310,15 +321,26 @@ static inline int vka_pw_rec_ok_fast(const pwrec *r, const uint8_t *kb, int faul
     }
     return 1;
 }
+static inline int vka_pw_next_fast_raw(const uint8_t *d, size_t len, size_t *o,
+                                       vka_pwrec_w34 *r, const uint8_t **kb, int *ok, int fault_mode) {
+    if (!d || *o > len || len - *o < sizeof(vka_pwrec_w34)) return 0;
+    memcpy(r, d + *o, sizeof *r);
+    if (r->klen > sizeof(vka_gkey) || *o + vka_pw_size_w34(r) > len) return 0;
+    *kb = d + *o + sizeof *r;
+    *ok = vka_pw_rec_ok_fast_raw(r, *kb, fault_mode);
+    *o += vka_pw_size_w34(r);
+    return 1;
+}
+#endif
 
+#if defined(VKA_PWLIST_H) && !defined(VKA_PCACHE_FAST_PW_H)
+#define VKA_PCACHE_FAST_PW_H
+_Static_assert(sizeof(pwrec) == sizeof(vka_pwrec_w34), "pwrec layout");
 static inline int vka_pw_next_fast(const uint8_t *d, size_t len, size_t *o,
                                    pwrec *r, const uint8_t **kb, int *ok, int fault_mode) {
-    if (!d || *o + sizeof(pwrec) > len) return 0;
-    memcpy(r, d + *o, sizeof *r);
-    if (r->klen > sizeof(vka_gkey) || *o + vka_pw_size(r) > len) return 0;
-    *kb = d + *o + sizeof *r;
-    *ok = vka_pw_rec_ok_fast(r, *kb, fault_mode);
-    *o += vka_pw_size(r);
-    return 1;
+    vka_pwrec_w34 rw;
+    int rc = vka_pw_next_fast_raw(d, len, o, &rw, kb, ok, fault_mode);
+    if (rc) memcpy(r, &rw, sizeof *r);
+    return rc;
 }
 #endif

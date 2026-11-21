@@ -1,27 +1,72 @@
 // Unit, parity, TSan & benchmark harness for Wave 34 pipeline cache fast paths.
-#include "../../gfx/vk_android/vka_pwlist.h"
+#include "../../gfx/vk_android/vka_gkey.h"
 #include "../../gfx/vk_android/vka_pckeep.h"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 _Atomic int g_vka_pcache_fast_state;
 _Atomic int g_vka_w34_fault;
 
+typedef struct { char magic[8]; uint32_t gkey_size, n, layout, pad; } w34_pwhdr2;
+_Static_assert(sizeof(w34_pwhdr2) == 24u, "w34_pwhdr2 size");
 
 static uint64_t w34_hash_sh8(const uintptr_t sh[8]) {
     uint64_t h = UINT64_C(1469598103934665603);
     for (size_t i = 0; i < 8u; i++) { h = (h ^ (uint64_t)sh[i]) * UINT64_C(0x9E3779B97F4A7C15); h ^= h >> 29; }
     return h ^ (h >> 32);
 }
-
-static uint64_t w34_hash_u64(const uint64_t *w, size_t n) {
-    uint64_t h = UINT64_C(1469598103934665603);
-    for (size_t i = 0; i < n; i++) { h = (h ^ w[i]) * UINT64_C(0x9E3779B97F4A7C15); h ^= h >> 29; }
+static uint64_t w34_hash_bytes(const void *p, size_t n, uint64_t h) {
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * UINT64_C(1099511628211);
     return h ^ (h >> 32);
 }
 
+static uint32_t w34_pw_layout_ref(void) {
+    static const uint32_t o[] = {offsetof(vka_gkey, dfmt), offsetof(vka_gkey, ncolor), offsetof(vka_gkey, samples),
+        offsetof(vka_gkey, topo), offsetof(vka_gkey, poly_mode), offsetof(vka_gkey, fs_variant),
+        offsetof(vka_gkey, alpha_func), offsetof(vka_gkey, gs_fx), offsetof(vka_gkey, vin_u),
+        offsetof(vka_gkey, tex_u), offsetof(vka_gkey, att), offsetof(vka_gkey, vin_static),
+        offsetof(vka_gkey, va), offsetof(vka_gkey, vb), sizeof(vka_gkey), 3u};
+    return (uint32_t)w34_hash_bytes(o, sizeof o, UINT64_C(1469598103934665603));
+}
+
+static int w34_pw_rec_ok_ref(const vka_pwrec_w34 *r, const uint8_t *kb) {
+    if (r->kind > VKA_PW_W34_MESH || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
+    if (r->kind == VKA_PW_W34_CS) return r->klen == 0;
+    if (r->kind == VKA_PW_W34_MESH && (!r->key[1] || r->key[3] || r->key[4] || r->inst[0] || r->inst[1])) return 0;
+    if (r->klen < offsetof(vka_gkey, va)) return 0;
+    vka_gkey k;
+    memset(&k, 0, sizeof k);
+    memcpy(&k, kb, r->klen);
+    if (k.ncolor > 8 || k.fs_variant > VKA_PW_W34_FS_VAR_MAX || (k.samples != 1 && k.samples != 2 && k.samples != 4 && k.samples != 8)) return 0;
+    if (k.topo > VKA_PW_W34_TOPO_MAX || k.poly_mode > VKA_PW_W34_POLY_MAX || k.alpha_func > 8 || k.logic_op > VKA_PW_W34_LOGIC_MAX) return 0;
+    if (k.depth_clamp > 1 || k.a2c > 1 || k.logic_en > 1 || k.gl_depth > 1 || k.gs_fx > 1 || k.vin_static > 1) return 0;
+    for (int i = 0; i < 8; i++) {
+        if (k.att[i].en > 1 || k.att[i].src > VKA_PW_W34_BLENDF_MAX || k.att[i].dst > VKA_PW_W34_BLENDF_MAX ||
+            k.att[i].srca > VKA_PW_W34_BLENDF_MAX || k.att[i].dsta > VKA_PW_W34_BLENDF_MAX ||
+            k.att[i].op > VKA_PW_W34_BLENDOP_MAX || k.att[i].opa > VKA_PW_W34_BLENDOP_MAX) return 0;
+    }
+    if (k.vin_static) {
+        for (int i = 0; i < 32; i++) if (k.va[i].used > 1 || (k.va[i].used && k.va[i].binding > 32)) return 0;
+        for (int i = 0; i < 33; i++) if (k.vb[i].used > 1) return 0;
+    }
+    return 1;
+}
+
+static int w34_pw_next_ref(const uint8_t *d, size_t len, size_t *o,
+                           vka_pwrec_w34 *r, const uint8_t **kb, int *ok) {
+    if (*o > len || len - *o < sizeof(vka_pwrec_w34)) return 0;
+    memcpy(r, d + *o, sizeof *r);
+    if (r->klen > sizeof(vka_gkey) || *o + vka_pw_size_w34(r) > len) return 0;
+    *kb = d + *o + sizeof *r;
+    *ok = w34_pw_rec_ok_ref(r, *kb);
+    *o += vka_pw_size_w34(r);
+    return 1;
+}
 static uint64_t w34_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -50,32 +95,35 @@ static void w34_check_pck_parity(void) {
     char *t0 = vka_pck_format(0x72c5210a46e5abcdull, 9u, keep, 128u, run, 128u, &l0);
     vka_pcache_fast_reset_for_test(1);
     char *t1 = vka_pck_format(0x72c5210a46e5abcdull, 9u, keep, 128u, run, 128u, &l1);
-    assert(t0 && t1 && l0 == l1 && memcmp(t0, t1, l0) == 0);
+    if (!t0 || !t1 || l0 != l1 || memcmp(t0, t1, l0) != 0) abort();
     vka_pck_stamp s0 = {0}, s1 = {0};
     w34_pck_legacy_parse(t0, l0, &s0);
     vka_pcache_fast_reset_for_test(1);
     vka_pck_parse(t1, l1, &s1);
     assert(s0.lib == s1.lib && s0.table == s1.table && s0.dead == s1.dead && s0.n == s1.n);
+    if (!s0.n || !s0.ent || !s1.ent) abort();
     assert(memcmp(s0.ent, s1.ent, s0.n * sizeof *s0.ent) == 0);
     vka_pck_free(&s0); vka_pck_free(&s1); free(t0); free(t1);
 }
 
 static size_t w34_make_pw(uint8_t *buf, uint32_t count) {
     size_t kl = offsetof(vka_gkey, va);
-    pwhdr2 h = {0};
-    memcpy(h.magic, VKA_PW_MAGIC2, 8u);
-    h.gkey_size = sizeof(vka_gkey); h.n = count; h.layout = vka_pw_layout();
+    w34_pwhdr2 h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.magic, "NXVKPW2", 8u);
+    h.gkey_size = sizeof(vka_gkey); h.n = count; h.layout = w34_pw_layout_ref();
     memcpy(buf, &h, sizeof h);
     size_t o = sizeof h;
-    vka_gkey k = {0};
+    vka_gkey k;
+    memset(&k, 0, sizeof k);
     k.cfmt[0] = 37u; k.dfmt = 126u; k.ncolor = 1u; k.samples = 1u; k.topo = 3u;
     for (uint32_t i = 0; i < count; i++) {
-        pwrec r = {.kind = VKA_PW_GFX, .klen = (uint32_t)kl, .key = {0x100u + i, 0x200u + i}};
+        vka_pwrec_w34 r = {.kind = VKA_PW_W34_GFX, .klen = (uint32_t)kl, .key = {0x100u + i, 0x200u + i}};
         k.att[0].mask = (uint8_t)((i & 15u) | 1u);
         memcpy(buf + o, &r, sizeof r);
-        memset(buf + o + sizeof r, 0, vka_pw_size(&r) - sizeof r);
+        memset(buf + o + sizeof r, 0, vka_pw_size_w34(&r) - sizeof r);
         memcpy(buf + o + sizeof r, &k, kl);
-        o += vka_pw_size(&r);
+        o += vka_pw_size_w34(&r);
     }
     return o;
 }
@@ -83,17 +131,10 @@ static size_t w34_make_pw(uint8_t *buf, uint32_t count) {
 static void w34_check_pw_and_lshort(void) {
     static uint8_t buf[8192];
     size_t len = w34_make_pw(buf, 16u);
-    size_t o0 = 0, o1 = 0, first0 = 0, first1 = 0;
-    uint32_t n0 = 0, n1 = 0;
-    assert(vka_pw_header(buf, len, &first0, &n0) == VKA_PW_OK);
-    assert(vka_pw_header(buf, len, &first1, &n1) == VKA_PW_OK);
-    o0 = first0; o1 = first1;
-    pwrec r0 = {0}, r1 = {0}; const uint8_t *kb0 = NULL, *kb1 = NULL; int ok0 = 0, ok1 = 0;
-    vka_gkey gk = {0}; gk.cfmt[0] = 37u; gk.dfmt = 126u; gk.ncolor = 1u; gk.samples = 1u; gk.topo = 3u; gk.att[0].mask = 0xfu;
-    pwrec gr = {.kind = VKA_PW_GFX, .klen = (uint32_t)offsetof(vka_gkey, va), .key = {0x11u, 0x22u}};
-    pwrec grb = gr; grb.bad = 1u; assert(vka_pw_hash(&gr, &gk) == vka_pw_hash(&grb, &gk));
-    while (vka_pw_next(buf, len, &o0, &r0, &kb0, &ok0)) {
-        assert(vka_pw_next_fast(buf, len, &o1, &r1, &kb1, &ok1, 0) == 1);
+    size_t o0 = sizeof(w34_pwhdr2), o1 = sizeof(w34_pwhdr2);
+    vka_pwrec_w34 r0 = {0}, r1 = {0}; const uint8_t *kb0 = NULL, *kb1 = NULL; int ok0 = 0, ok1 = 0;
+    while (w34_pw_next_ref(buf, len, &o0, &r0, &kb0, &ok0)) {
+        assert(vka_pw_next_fast_raw(buf, len, &o1, &r1, &kb1, &ok1, 0) == 1);
         assert(o0 == o1 && ok0 == ok1 && ok0 == 1 && r0.key[0] == r1.key[0]);
     }
     static vka_lshort_cache lc;
@@ -111,32 +152,28 @@ static void w34_check_fault(int fm) {
     vka_w34_set_fault(fm);
     if (fm == 1) {
         const char *u = "00000000000000aa\nkeep 1 dead 0 shaders 2\n0000000000000002 00000000000000b2\n0000000000000001 00000000000000b1\n";
-        vka_pck_stamp s = {0};
-        vka_pcache_fast_reset_for_test(1);
-        vka_pck_parse(u, strlen(u), &s);
-        assert(s.table && s.n == 2 && s.ent[0].key == 1u);
+        vka_pck_stamp s = {0}; vka_pcache_fast_reset_for_test(1); vka_pck_parse(u, strlen(u), &s);
+        if (!s.table || s.n != 2u || !s.ent || s.ent[0].key != 1u) abort();
         vka_pck_free(&s);
     } else if (fm == 2) {
-        vka_pck_ent k[1] = {{5u, 0x11u}}, r[1] = {{5u, 0x99u}};
-        size_t len = 0;
+        vka_pck_ent k[1] = {{5u, 0x11u}}, r[1] = {{5u, 0x99u}}; size_t len = 0;
         vka_pcache_fast_reset_for_test(1);
         char *txt = vka_pck_format(7u, 0u, k, 1u, r, 1u, &len);
+        if (!txt) abort();
         vka_pck_stamp s = {0}; vka_pck_parse(txt, len, &s);
-        assert(s.n == 1 && s.ent[0].hash == 0x99u);
+        if (s.n != 1u || !s.ent || s.ent[0].hash != 0x99u) abort();
         vka_pck_free(&s); free(txt);
     } else if (fm == 3) {
         static uint8_t fbuf[1024]; w34_make_pw(fbuf, 1u);
-        size_t off = sizeof(pwhdr2) + sizeof(pwrec);
-        vka_gkey g = {0}; g.ncolor = 1u; g.samples = 1u; g.att[0].op = 9u;
+        size_t off = sizeof(w34_pwhdr2) + sizeof(vka_pwrec_w34);
+        vka_gkey g; memset(&g, 0, sizeof g); g.ncolor = 1u; g.samples = 1u; g.att[0].op = 9u;
         memcpy(fbuf + off, &g, offsetof(vka_gkey, va));
-        size_t o = sizeof(pwhdr2); pwrec pr = {0}; const uint8_t *kb = NULL; int ok = 1;
-        assert(vka_pw_next_fast(fbuf, sizeof(pwhdr2) + sizeof(pwrec) + 200u, &o, &pr, &kb, &ok, fm) == 1);
+        size_t o = sizeof(w34_pwhdr2); vka_pwrec_w34 pr = {0}; const uint8_t *kb = NULL; int ok = 1;
+        assert(vka_pw_next_fast_raw(fbuf, sizeof(w34_pwhdr2) + sizeof(vka_pwrec_w34) + 200u, &o, &pr, &kb, &ok, fm) == 1);
         assert(ok == 0);
     } else if (fm == 4) {
-        static vka_lshort_cache lc;
-        uintptr_t sh[8] = {1u, 2u, 0, 0, 0, 0, 0, 0};
-        uint8_t in[24] = {9}, out[24] = {0};
-        uint64_t h = w34_hash_sh8(sh);
+        static vka_lshort_cache lc; uintptr_t sh[8] = {1u, 2u, 0, 0, 0, 0, 0, 0};
+        uint8_t in[24] = {9}, out[24] = {0}; uint64_t h = w34_hash_sh8(sh);
         vka_lshort_put(&lc, h, sh, 0u, in, sizeof in);
         assert(vka_lshort_get(&lc, h, sh, 1u, out, sizeof out, fm) == 0);
     } else if (fm == 5) {
@@ -153,13 +190,15 @@ static uint64_t w34_bench_once(const vka_pck_ent *keep, const vka_pck_ent *run,
     for (int it = 0; it < 20; it++) {
         size_t len = 0;
         char *txt = vka_pck_format(0xabcdu, 4u, keep, 2048u, run, 256u, &len);
+        if (!txt) abort();
         vka_pck_stamp s = {0}; vka_pck_parse(txt, len, &s);
+        if (!s.ent || !s.n) abort();
         sink += s.n + s.ent[s.n - 1u].hash;
         vka_pck_free(&s); free(txt);
     }
     for (int it = 0; it < 8; it++) {
-        size_t o = sizeof(pwhdr2); pwrec pr = {0}; const uint8_t *kb = NULL; int ok = 0;
-        while (fast ? vka_pw_next_fast(pw_buf, pw_len, &o, &pr, &kb, &ok, 0) : vka_pw_next(pw_buf, pw_len, &o, &pr, &kb, &ok)) {
+        size_t o = sizeof(w34_pwhdr2); vka_pwrec_w34 pr = {0}; const uint8_t *kb = NULL; int ok = 0;
+        while (fast ? vka_pw_next_fast_raw(pw_buf, pw_len, &o, &pr, &kb, &ok, 0) : w34_pw_next_ref(pw_buf, pw_len, &o, &pr, &kb, &ok)) {
             sink += (uint64_t)ok + pr.key[0];
         }
     }
@@ -175,7 +214,7 @@ static uint64_t w34_bench_once(const vka_pck_ent *keep, const vka_pck_ent *run,
             if ((q & 7u) == 0u) sink += (uint64_t)vka_lkey_eq_fast(lkA, lkB, 8u, 8u + 8u * 8u, 0);
         } else {
             uint64_t hh = w34_hash_sh8(sh);
-            uint64_t lk_h = w34_hash_u64(lkA, 385u);
+            uint64_t lk_h = w34_hash_bytes(lkA, sizeof lkA, UINT64_C(1469598103934665603));
             sink += (uint64_t)val[0] + (hh & 0u);
             if ((q & 7u) == 0u) sink += (uint64_t)(memcmp(lkA, lkB, sizeof lkA) == 0) + (lk_h & 0u);
         }
@@ -216,7 +255,7 @@ int main(void) {
 
     vka_pck_ent *keep = (vka_pck_ent *)calloc(2048u, sizeof *keep), *run = (vka_pck_ent *)calloc(256u, sizeof *run);
     uint8_t *pw_buf = (uint8_t *)calloc(1u, 2000u * 300u);
-    assert(keep && run && pw_buf);
+    if (!keep || !run || !pw_buf) abort();
     w34_make_stamp_ents(keep, keep, 2048u);
     for (size_t i = 0; i < 256u; i++) run[i] = (vka_pck_ent){0x500000ull + i * 3u, 0x77770001ull + i};
     size_t pw_len = w34_make_pw(pw_buf, 1500u);

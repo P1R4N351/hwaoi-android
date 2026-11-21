@@ -289,7 +289,7 @@ $(B)/t_imgmem_fast_w32: t_imgmem_fast_w32.c ../../gfx/vk_android/vka_imgmem_fast
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W32_TEST_HOOKS -I.. -o $@ t_imgmem_fast_w32.c -lpthread
 $(B)/t_shlib_fast_w33: t_shlib_fast_w33.c ../../gfx/vk_android/vka_shlib.c ../../gfx/vk_android/vka_shlib.h ../../gfx/vk_android/vka_spvpatch.c ../../gfx/vk_android/vka_spvpatch.h ../../gfx/vk_android/vka_shlib_fast.h $(B)/zstddeclib.o | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -Wno-misleading-indentation -DT_W33_TEST_HOOKS -I.. -o $@ t_shlib_fast_w33.c ../../gfx/vk_android/vka_shlib.c ../../gfx/vk_android/vka_spvpatch.c $(B)/zstddeclib.o -lpthread
-$(B)/t_pcache_fast_w34: t_pcache_fast_w34.c ../../gfx/vk_android/vka_pcache_fast.h ../../gfx/vk_android/vka_pckeep.h ../../gfx/vk_android/vka_pwlist.h ../../gfx/vk_android/vka_gkey.h | $(B)
+$(B)/t_pcache_fast_w34: t_pcache_fast_w34.c ../../gfx/vk_android/vka_pcache_fast.h ../../gfx/vk_android/vka_pckeep.h ../../gfx/vk_android/vka_gkey.h | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W34_TEST_HOOKS -I.. -o $@ t_pcache_fast_w34.c -lpthread
 run: $(B)/t_audio_stats
 $(B)/t_audio_device: t_audio_device.c ../hle_audio.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
