@@ -16,7 +16,7 @@ GAME_H = ../gen/$(GAME)/game_profile.h
 # reference to an undefined symbol only when it is named as allowed to stay undefined
 WEAK_HOST = -Wl,-U,_vka_swap_rb
 
-run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_time_fast_w25 $(B)/t_gate_fast_w26 $(B)/t_fs_lookup_fast_w27 $(B)/t_oe_fast_w28 $(B)/t_audren_fast_w29 $(B)/t_worker_fast_w30 $(B)/t_movie_fast_w31 $(B)/t_imgmem_fast_w32 $(B)/t_shlib_fast_w33 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
+run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_time_fast_w25 $(B)/t_gate_fast_w26 $(B)/t_fs_lookup_fast_w27 $(B)/t_oe_fast_w28 $(B)/t_audren_fast_w29 $(B)/t_worker_fast_w30 $(B)/t_movie_fast_w31 $(B)/t_imgmem_fast_w32 $(B)/t_shlib_fast_w33 $(B)/t_pcache_fast_w34 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
 	$(B)/t_language
 	$(B)/t_heap_size
 	$(B)/t_touch
@@ -44,6 +44,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_movie_fast_w31
 	$(B)/t_imgmem_fast_w32
 	$(B)/t_shlib_fast_w33
+	$(B)/t_pcache_fast_w34
 	$(B)/t_output_stream
 	$(B)/t_opus_hw
 	$(B)/t_audio_spsc
@@ -288,6 +289,8 @@ $(B)/t_imgmem_fast_w32: t_imgmem_fast_w32.c ../../gfx/vk_android/vka_imgmem_fast
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W32_TEST_HOOKS -I.. -o $@ t_imgmem_fast_w32.c -lpthread
 $(B)/t_shlib_fast_w33: t_shlib_fast_w33.c ../../gfx/vk_android/vka_shlib.c ../../gfx/vk_android/vka_shlib.h ../../gfx/vk_android/vka_spvpatch.c ../../gfx/vk_android/vka_spvpatch.h ../../gfx/vk_android/vka_shlib_fast.h $(B)/zstddeclib.o | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -Wno-misleading-indentation -DT_W33_TEST_HOOKS -I.. -o $@ t_shlib_fast_w33.c ../../gfx/vk_android/vka_shlib.c ../../gfx/vk_android/vka_spvpatch.c $(B)/zstddeclib.o -lpthread
+$(B)/t_pcache_fast_w34: t_pcache_fast_w34.c ../../gfx/vk_android/vka_pcache_fast.h ../../gfx/vk_android/vka_pckeep.h ../../gfx/vk_android/vka_pwlist.h ../../gfx/vk_android/vka_gkey.h | $(B)
+	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W34_TEST_HOOKS -I.. -o $@ t_pcache_fast_w34.c -lpthread
 run: $(B)/t_audio_stats
 $(B)/t_audio_device: t_audio_device.c ../hle_audio.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_audio_device.c ../hle_bigstack.c -framework AudioToolbox
@@ -571,7 +574,7 @@ $(B)/t_android_hangparts: t_android_hangparts.c $(VKA)/vka_hangparts.h | $(B)
 $(B)/t_android_auto: t_android_auto.c $(VKA)/vka_auto.h $(VKA)/vka_psogate.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_auto.c
 # The pipeline cache stamp: which file a run reads after a shader library update (vka_pckeep.h; vka_pso.c pc_open_once)
-$(B)/t_android_pckeep: t_android_pckeep.c $(VKA)/vka_pckeep.h | $(B)
+$(B)/t_android_pckeep: t_android_pckeep.c $(VKA)/vka_pckeep.h $(VKA)/vka_pcache_fast.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_pckeep.c
 # The prewarm list's records and the profiles' seed lists (vka_pwlist.h; vka_pso.c pw_*): a seed of another key layout fails here, not silently on the phone
 $(B)/t_android_pwlist: t_android_pwlist.c $(VKA)/vka_pwlist.h $(VKA)/vka_gkey.h $(wildcard ../../games/*/vk_prewarm.bin) | $(B)

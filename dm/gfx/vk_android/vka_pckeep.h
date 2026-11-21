@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vka_pcache_fast.h"
 
 typedef struct { uint64_t key, hash; } vka_pck_ent;
 typedef struct {
@@ -42,7 +43,14 @@ static inline int vka_pck_cmp_(const void *a, const void *b) { uint64_t x = ((co
 
 // The stamp's text (n bytes, not terminated) → *s. A stamp whose first line is no library id has lib 0; one whose list is cut or malformed has its library only (table 0)
 static inline void vka_pck_parse(const char *t, size_t n, vka_pck_stamp *s) {
+    _Static_assert(sizeof(vka_pck_ent) == sizeof(vka_pck_ent_w34), "vka_pck_ent size");
     memset(s, 0, sizeof *s);
+    if (vka_pcache_fast_on()) {
+        void *er = NULL;
+        if (vka_pck_parse_fast(t, n, &s->lib, &s->table, &s->dead, &er, &s->n, vka_pck_cmp_, vka_w34_fault())) {
+            s->ent = (vka_pck_ent *)er; return;
+        }
+    }
     char *b = malloc(n + 1); if (!b) return;
     memcpy(b, t, n); b[n] = 0;
     char *p = b, *nl = strchr(p, '\n'); if (nl) *nl = 0;
@@ -95,6 +103,7 @@ static inline int vka_pck_decide(const vka_pck_stamp *old, uint64_t cur, int kee
 
 // The stamp a save writes: lib, the stale estimate, the shaders the file kept (keep, by key) and those this run made (run, any order: their hashes win). malloc'd text; *len
 static inline char *vka_pck_format(uint64_t lib, uint64_t dead, const vka_pck_ent *keep, size_t nk, const vka_pck_ent *run, size_t nr, size_t *len) {
+    if (vka_pcache_fast_on()) return vka_pck_format_fast(lib, dead, keep, nk, run, nr, len, vka_pck_cmp_, vka_w34_fault());
     vka_pck_ent *k = malloc((nk ? nk : 1) * sizeof *k), *r = malloc((nr ? nr : 1) * sizeof *r), *all = malloc((nk + nr ? nk + nr : 1) * sizeof *all);
     if (!k || !r || !all) { free(k); free(r); free(all); return NULL; }
     memcpy(k, keep, nk * sizeof *k); memcpy(r, run, nr * sizeof *r);

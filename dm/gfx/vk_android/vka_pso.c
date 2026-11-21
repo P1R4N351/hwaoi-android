@@ -8,6 +8,7 @@
 #include "vka.h"
 #include "vka_memu_abi.h"
 #include "vka_pwlist.h"
+#include "vka_pcache_fast.h"
 #include "vka_psogate.h"
 #include "vka_pso_cache.h"
 #include "vk_prewarm_seed.h"   // the profile's seed list (dm/games/<id>/vk_prewarm.bin; dm/games/game.py seed): dm_vk_prewarm_seed, dm_vk_prewarm_seed_len (0: none)
@@ -36,6 +37,13 @@ _Static_assert(VKA_PW_TOPO_MAX == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST && VKA_PW_POL
 // A small map from a byte key to a value (layouts, pipelines): open addressing on the key's hash, keys copied
 typedef struct { uint64_t h; void *key; void *val; } ment;
 typedef struct { ment *e; size_t cap, n, klen; } kmap;
+static void *km_get_prefix(kmap *m, const void *key, uint64_t h, uint32_t n, size_t active) {
+    if (!m->cap) return NULL;
+    for (size_t i = h & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->e[i].key) return NULL;
+        if (m->e[i].h == h && vka_lkey_eq_fast(m->e[i].key, key, n, active, vka_w34_fault())) return m->e[i].val;
+    }
+}
 static void *km_get(kmap *m, const void *key, uint64_t h) {
     if (!m->cap) return NULL;
     for (size_t i = h & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) { if (!m->e[i].key) return NULL; if (m->e[i].h == h && !memcmp(m->e[i].key, key, m->klen)) return m->e[i].val; }
@@ -70,21 +78,27 @@ static uint64_t g_nlayouts;
 // The layout of a set of shaders, remembered by the shaders themselves: building the bindings key (3 KB) and hashing it was a third of the replay's CPU time at 5,500 draws a frame
 typedef struct { vka_shader *sh[VKA_NSTAGE]; uint64_t compute; } skey;
 static kmap g_lshort = {.klen = sizeof(skey)};
+static vka_lshort_cache g_lshort_fast;
 static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out);
 int vka_layout_of(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out) {
-    skey sk; memset(&sk, 0, sizeof sk);
-    for (int st = 0; st < VKA_NSTAGE; st++) if ((st == 5) == (compute != 0)) sk.sh[st] = sh[st];
+    _Static_assert(sizeof(vka_layout) <= 32u && VKA_NSTAGE <= 8, "vka_lshort_slot bounds");
+    skey sk; memset(&sk, 0, sizeof sk); uintptr_t sh_u[8] = {0};
+    for (int st = 0; st < VKA_NSTAGE; st++) if ((st == 5) == (compute != 0)) { sk.sh[st] = sh[st]; sh_u[st] = (uintptr_t)sh[st]; }
     sk.compute = compute != 0;
     uint64_t h = fnv(&sk, sizeof sk, 1469598103934665603ull);
+    int fast = vka_pcache_fast_on();
+    if (fast && vka_lshort_get(&g_lshort_fast, h, sh_u, (uint32_t)sk.compute, out, sizeof *out, vka_w34_fault()))
+        return out->layout != VK_NULL_HANDLE;
     pthread_mutex_lock(&g_mu);
     vka_layout *L = km_get(&g_lshort, &sk, h);
-    if (L) { *out = *L; pthread_mutex_unlock(&g_mu); return out->layout != VK_NULL_HANDLE; }
+    if (L) { *out = *L; if (fast) vka_lshort_put(&g_lshort_fast, h, sh_u, (uint32_t)sk.compute, out, sizeof *out); pthread_mutex_unlock(&g_mu); return out->layout != VK_NULL_HANDLE; }
     pthread_mutex_unlock(&g_mu);
     memset(out, 0, sizeof *out);
     int ok = layout_slow(sh, compute, out);
     L = malloc(sizeof *L); *L = *out;
     pthread_mutex_lock(&g_mu);
     if (!km_get(&g_lshort, &sk, h)) km_put(&g_lshort, &sk, h, L); else free(L);
+    if (fast) vka_lshort_put(&g_lshort_fast, h, sh_u, (uint32_t)sk.compute, out, sizeof *out);
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
@@ -112,9 +126,11 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
     }
     // Sorted by binding, so the same set of records gives the same key whatever the order of stages
     for (uint32_t i = 1; i < k.n; i++) for (uint32_t j = i; j > 0 && k.b[j - 1].binding > k.b[j].binding; j--) { typeof(k.b[0]) t = k.b[j]; k.b[j] = k.b[j - 1]; k.b[j - 1] = t; }
-    uint64_t h = fnv(&k, sizeof k, 1469598103934665603ull);
+    int fast = vka_pcache_fast_on();
+    size_t act = offsetof(lkey, b) + (size_t)k.n * sizeof k.b[0];
+    uint64_t h = fnv(&k, fast ? act : sizeof k, 1469598103934665603ull);
     pthread_mutex_lock(&g_mu);
-    vka_layout *L = km_get(&g_layouts, &k, h);
+    vka_layout *L = fast ? km_get_prefix(&g_layouts, &k, h, k.n, act) : km_get(&g_layouts, &k, h);
     if (L) { *out = *L; pthread_mutex_unlock(&g_mu); return out->layout != VK_NULL_HANDLE; }
     L = calloc(1, sizeof *L);
     L->ndesc = ndesc; L->push = V.push_desc && ndesc <= V.max_push;
@@ -991,7 +1007,8 @@ static int pw_take(const uint8_t *d, size_t len, uint32_t *skipped, const char *
     size_t o; uint32_t want, n = 0, took = 0; int e = vka_pw_header(d, len, &o, &want);
     if (e) { *why = e == VKA_PW_LAYOUT ? "another key layout (an older or newer host)" : e == VKA_PW_FORMAT ? "another format" : "too short"; return -1; }
     pwrec r; const uint8_t *kb; int ok;
-    while (n < want && vka_pw_next(d, len, &o, &r, &kb, &ok)) {
+    int fast = vka_pcache_fast_on(), wf = vka_w34_fault();
+    while (n < want && (fast ? vka_pw_next_fast(d, len, &o, &r, &kb, &ok, wf) : vka_pw_next(d, len, &o, &r, &kb, &ok))) {
         n++;
         if (!ok) { (*skipped)++; continue; }
         r.bad = 0;
