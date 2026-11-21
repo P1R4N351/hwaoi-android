@@ -16,6 +16,7 @@
 #include "romfs_image.h"
 #include "nup_image.h"
 #include "save_sync.h"
+#include "fs_lookup_fast.h"
 
 // Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
 #undef HLE_FORCE
@@ -64,7 +65,17 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_path_lock = PTHREAD_MUTEX_INITIALIZER;
 static void path_unlock(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }
 #define PATH_LOCK() pthread_mutex_t *path_guard __attribute__((cleanup(path_unlock))) = &g_path_lock; pthread_mutex_lock(path_guard)
-static uint8_t g_fmode[65536];              // fd → open mode
+static _Atomic uint8_t g_fmode[65536];      // fd → open mode
+static fs_lookup_mnt_table g_fs_mnt_fast;
+static fs_lookup_path_cache g_fs_path_fast = { .epoch = 1 };
+static void fs_fast_mnt_rebuild_locked(void) {
+    uint64_t ep = fs_lookup_mnt_begin(&g_fs_mnt_fast);
+    for (int i = 0; i < g_nmnt; i++) {
+        if (!g_mnt[i].name[0]) continue;
+        fs_lookup_mnt_insert(&g_fs_mnt_fast, ep, g_mnt[i].name, strlen(g_mnt[i].name), i);
+    }
+    fs_lookup_path_bump(&g_fs_path_fast);
+}
 static _Atomic uint16_t g_ftxn[65536];       // fd → 1-based canonical transaction index, or 0
 static _Atomic int g_save_writes;           // number of writes on the save mount (shared by the injection point and the commit log)
 static pthread_once_t g_save_test_once = PTHREAD_ONCE_INIT;
@@ -206,16 +217,37 @@ static inline int fs_fast_img_on(void) {
     int v = atomic_load_explicit(&g_fs_fast_img, memory_order_acquire);
     return v < 0 ? fs_fast_img_sync() : v;
 }
+static int img_path_fast_resolve(int i, const char *rest, int has_dot, int fast, int *mi, int64_t *k) {
+    char normed[1024]; *mi = i;
+    if (has_dot) { if (!norm_rest(rest, normed, sizeof normed)) { *k = -1; return 1; } rest = normed; }
+    romfs_img *img = g_mnt[i].img;
+    if (fast) {
+        size_t rlen = strlen(rest); int err_no = 0;
+        if (fs_lookup_path_get(&g_fs_path_fast, (uint32_t)i, (uintptr_t)img, rest, rlen, k, &err_no)) {
+            if (*k < 0 && err_no) errno = err_no;
+            return 1;
+        }
+        *k = img_find(img, rest);
+        fs_lookup_path_put(&g_fs_path_fast, (uint32_t)i, (uintptr_t)img, rest, rlen, *k, *k < 0 ? errno : 0);
+        return 1;
+    }
+    *k = img_find(img, rest); return 1;
+}
 static int img_path_fast(const char *p, int *mi, int64_t *k) {
     if (!fs_fast_img_on()) return 0;
-    char fwd[1024]; p = fwd_slashes(p, fwd, sizeof fwd); const char *c = p ? strchr(p, ':') : NULL; if (!c) return 0;
-    size_t ln = (size_t)(c - p); int nm = __atomic_load_n(&g_nmnt, __ATOMIC_ACQUIRE);
+    char fwd[1024]; const char *mname = NULL, *rest = NULL; size_t ln = 0; int has_dot = 0;
+    int fast = fs_lookup_fast_active();
+    if (fast) { if (!fs_lookup_split_path(p, fwd, sizeof fwd, &mname, &ln, &rest, &has_dot)) return 0; }
+    else { p = fwd_slashes(p, fwd, sizeof fwd); const char *c = p ? strchr(p, ':') : NULL; if (!c) return 0; mname = p; ln = (size_t)(c - p); rest = c + 1; has_dot = strstr(rest, "/.") != NULL; }
+    int nm = __atomic_load_n(&g_nmnt, __ATOMIC_ACQUIRE); int hit_i = -1;
+    if (fast && fs_lookup_mnt_find(&g_fs_mnt_fast, mname, ln, &hit_i) && hit_i >= 0 && hit_i < nm) {
+        if (!atomic_load_explicit(&g_mnt[hit_i].img_pub, memory_order_acquire)) return 0;
+        return img_path_fast_resolve(hit_i, rest, has_dot, fast, mi, k);
+    }
     for (int i = 0; i < nm; i++) {
         if (!atomic_load_explicit(&g_mnt[i].img_pub, memory_order_acquire)) continue;
-        if (strlen(g_mnt[i].name) != ln || strncmp(g_mnt[i].name, p, ln)) continue;
-        char normed[1024]; const char *rest = c + 1; *mi = i;
-        if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) { *k = -1; return 1; } rest = normed; }
-        *k = img_find(g_mnt[i].img, rest); return 1;
+        if (strlen(g_mnt[i].name) != ln || strncmp(g_mnt[i].name, mname, ln)) continue;
+        return img_path_fast_resolve(i, rest, has_dot, fast, mi, k);
     }
     return 0;
 }
@@ -307,6 +339,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn, int s
     if (g_mnt[s].img && !g_mnt[s].overlay[0] && !getenv("DM_ROMFS_OVERLAY"))
         atomic_store_explicit(&g_mnt[s].img_pub, 1, memory_order_release);
     int reused = s < g_nmnt; if (!reused) __atomic_store_n(&g_nmnt, g_nmnt + 1, __ATOMIC_RELEASE);
+    fs_fast_mnt_rebuild_locked();
     char shown[sizeof g_mnt[0].dir]; strlcpy(shown, txn ? g_mnt[s].dir : dir, sizeof shown); int ov = g_mnt[s].overlay[0] != 0;   // read under the lock: an Unmount and a later mount may take the entry again
     pthread_mutex_unlock(&g_lock);
     if (txn_err) front_save_failed(txn_err);
@@ -456,11 +489,15 @@ static int norm_rest(const char *rest, char *out, size_t n) {
 }
 // create only allows the last component to not exist yet; intermediate directories still need an exact match.
 static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create) {
-    char fwd[1024]; p = fwd_slashes(p, fwd, sizeof fwd); const char *c = strchr(p, ':');
-    if (!c) { errno = ENOENT; return 0; }
-    size_t ln = c - p;
-    for (int i = 0; i < g_nmnt; i++) {
-        if (strlen(g_mnt[i].name) != ln || strncmp(g_mnt[i].name, p, ln)) continue;
+    char fwd[1024]; const char *mname = NULL, *c_rest = NULL; size_t ln = 0; int dot = 0;
+    if (!fs_lookup_split_path(p, fwd, sizeof fwd, &mname, &ln, &c_rest, &dot)) { errno = ENOENT; return 0; }
+    int mi = -1;
+    if (!fs_lookup_mnt_find(&g_fs_mnt_fast, mname, ln, &mi) || mi < 0 || mi >= g_nmnt ||
+        strlen(g_mnt[mi].name) != ln || strncmp(g_mnt[mi].name, mname, ln)) {
+        mi = -1;
+        for (int i = 0; i < g_nmnt; i++) { if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, mname, ln)) { mi = i; break; } }
+    }
+    if (mi >= 0) { int i = mi; const char *c = c_rest - 1;
         if (ro) *ro = g_mnt[i].ro;
         char normed[1024]; const char *rest = c + 1;
         if (strstr(rest, "/.")) { if (!norm_rest(rest, normed, sizeof normed)) return 0; rest = normed; }   // only paths with "." components are normalized; the rest walk component by component as before
@@ -865,7 +902,7 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; with more than one user a save's na
     if (dm_account_users() < 2) return;
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
-        if (g_mnt[i].save && !strcmp(g_mnt[i].name, name)) { LOG("fs unmount %s (save %s)", name, g_mnt[i].commit[0] ? g_mnt[i].commit : g_mnt[i].dir); g_mnt[i].name[0] = 0; }
+        if (g_mnt[i].save && !strcmp(g_mnt[i].name, name)) { LOG("fs unmount %s (save %s)", name, g_mnt[i].commit[0] ? g_mnt[i].commit : g_mnt[i].dir); g_mnt[i].name[0] = 0; fs_fast_mnt_rebuild_locked(); }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -998,7 +1035,7 @@ static int64_t img_serve(mount_t *m, int64_t k, const char *path) {
 static int labels_open(const char *path, int mode);
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) { dm_thread_service_request();
     int mi; int64_t k; uint64_t fst0 = now_ns();
-    { int lf = labels_open(path, mode); if (lf >= 0) { g_fmode[lf] = (uint8_t)mode; *out = FH_OUT(lf); return RES_OK; } }
+    { int lf = labels_open(path, mode); if (lf >= 0) { atomic_store_explicit(&g_fmode[lf], (uint8_t)mode, memory_order_relaxed); *out = FH_OUT(lf); return RES_OK; } }
     if (img_path(path, &mi, &k)) {
         if (k < 0) return err_res("open", path);
         if (!g_mnt[mi].img->e[k].type) return RES_PATH_NOT_FOUND;
@@ -1024,11 +1061,16 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     struct stat st; fstat(fd, &st);
     if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
     if (ro && (fd = folder_zcheck(fd, &st, path)) < 0) return RES_PATH_NOT_FOUND;   // a damaged *.zs game file (above)
-    if (fd >= (int)sizeof g_fmode) die("fd beyond the table");
-    g_fmode[fd] = (uint8_t)mode; *out = FH_OUT(fd);
+    if (fd >= (int)(sizeof g_fmode / sizeof g_fmode[0])) die("fd beyond the table");
+    atomic_store_explicit(&g_fmode[fd], (uint8_t)mode, memory_order_relaxed); *out = FH_OUT(fd);
     if (fd == 0) LOG("[RED] fs open %s returned descriptor 0 (stdin was closed in this process): the guest sees a null handle", hp);
     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; uint16_t token = 0;
-      for (int i = 0; c && i < g_nmnt; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln) && g_mnt[i].txn_root >= 0) { token = (uint16_t)(g_mnt[i].txn_root + 1); break; }
+      int nm = __atomic_load_n(&g_nmnt, __ATOMIC_ACQUIRE); int mi_tx = -1;
+      if (c && fs_lookup_mnt_find(&g_fs_mnt_fast, path, ln, &mi_tx) && mi_tx >= 0 && mi_tx < nm) {
+          if (g_mnt[mi_tx].txn_root >= 0) token = (uint16_t)(g_mnt[mi_tx].txn_root + 1);
+      } else {
+          for (int i = 0; c && i < nm; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln) && g_mnt[i].txn_root >= 0) { token = (uint16_t)(g_mnt[i].txn_root + 1); break; }
+      }
       atomic_store(&g_ftxn[fd], token); }
     fslog_init();
     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
@@ -1136,9 +1178,9 @@ HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void,
         if (x->flags & IMG_ENT_ZSTD) nup_z_put(g_mnt[IMG_M(h)].img, x->a);
         return; }
     if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
-    g_fmode[(int)h & 0xffff] = 0; atomic_store(&g_ftxn[(int)h & 0xffff], 0);
+    atomic_store_explicit(&g_fmode[(int)h & 0xffff], 0, memory_order_relaxed); atomic_store(&g_ftxn[(int)h & 0xffff], 0);
     close((int)h); }
-HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { h = FH_IN(h); return IMG_H(h) ? MODE_READ : g_fmode[(int)h & 0xffff]; }
+HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { h = FH_IN(h); return IMG_H(h) ? MODE_READ : atomic_load_explicit(&g_fmode[(int)h & 0xffff], memory_order_relaxed); }
 
 // ---------- Xbox button labels (DM_XBOX_LABELS=1; off by default) ----------
 // The button prompts are drawn with Nintendo's NinDev-HardKey font: U+E0E0..E0E3 are A, B, X, Y. With an Xbox-style pad the labels on the buttons are the other way
@@ -1268,13 +1310,15 @@ static int lb_patch_archive(uint8_t *a, size_t n, int pairs) {   // the button f
 // The pairs to swap: A/B and X/Y with the face buttons by position; X/Y alone when A and B already go by label (DM_PAD_LABELLED=2: the confirm / cancel swap);
 // none with all four by label (DM_PAD_LABELLED=1), where the game's own letters already match
 static int labels_on(void) {
-    static int on = -1;
-    if (on < 0) {
+    static _Atomic int on = -1;
+    int cur = atomic_load_explicit(&on, memory_order_acquire);
+    if (cur < 0) {
         const char *e = getenv("DM_XBOX_LABELS"), *pl = getenv("DM_PAD_LABELLED"); int lab = pl ? atoi(pl) : 0;
-        on = e && atoi(e) > 0 ? (lab == 1 ? 0 : lab == 2 ? 2 : 3) : 0;
-        if (on) LOG("Xbox button labels on (DM_XBOX_LABELS): font archives are patched as the game opens them (%s)", on == 2 ? "X / Y; A and B go by label" : "A / B and X / Y");
+        cur = e && atoi(e) > 0 ? (lab == 1 ? 0 : lab == 2 ? 2 : 3) : 0;
+        if (atomic_exchange_explicit(&on, cur, memory_order_acq_rel) < 0 && cur)
+            LOG("Xbox button labels on (DM_XBOX_LABELS): font archives are patched as the game opens them (%s)", cur == 2 ? "X / Y; A and B go by label" : "A / B and X / Y");
     }
-    return on;
+    return cur;
 }
 static __thread int g_labels_busy;
 // An anonymous file for the patched archive: a memfd on Linux and Android; elsewhere (the Mac host has no memfd_create) an unlinked temporary file
@@ -1311,7 +1355,7 @@ static int labels_open(const char *path, int mode) {
         o[w++] = (uint8_t)hd; o[w++] = (uint8_t)(hd >> 8); o[w++] = (uint8_t)(hd >> 16); memcpy(o + w, a + b * 131072, len); w += len;
     }
     fd = lb_anon_fd();
-    if (fd < 0 || fd >= (int)sizeof g_fmode) { if (fd >= 0) close(fd); fd = -1; goto out; }
+    if (fd < 0 || fd >= (int)(sizeof g_fmode / sizeof g_fmode[0])) { if (fd >= 0) close(fd); fd = -1; goto out; }
     for (size_t put = 0; put < w;) { ssize_t k = write(fd, o + put, w - put); if (k <= 0) { close(fd); fd = -1; goto out; } put += (size_t)k; }
     LOG("Xbox button labels: %s served with %s swapped in %d font(s)", path, labels_on() == 2 ? "X/Y" : "A/B and X/Y", nf);
 out:

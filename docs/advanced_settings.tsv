@@ -90,6 +90,7 @@ DM_FS	developer	Diagnostics			text			both
 DM_FSLOG	developer	Diagnostics			text			both							
 DM_FSLOG_HASH	developer	Diagnostics			text			both							
 DM_FS_FAST_IMG	developer	Diagnostics			text			both							
+DM_FS_LOOKUP_FAST	developer	Game			text			both							
 DM_FULLSCREEN	internal	Game			text			both						Mac or iOS only	
 DM_GAME	developer	Game			text			both							
 DM_GAMES_DIR	developer	Diagnostics			text			both							

@@ -88,6 +88,7 @@ DM_FS	diagnostic	When set, logs file opens, paths not found or not mounted, and 
 DM_FSLOG	diagnostic	`=<file>` writes one TSV line per ReadFile: seconds since boot, guest path, offset, length and guest buffer address
 DM_FSLOG_HASH	diagnostic	With `DM_FSLOG`, adds a column with the FNV-1a 64 hash of the bytes read
 DM_FS_FAST_IMG	switch	`0` (read on mount, 1) disables the lock-free image-mount path lookup (`img_path_fast`), lock-free NUP zstd read pinning (`nup_z_pin_read`), and O(1) LRU eviction ring in `hle_fs.c` / `nup_image.h`
+DM_FS_LOOKUP_FAST	switch	`0` disables the lock-free mount hash table, single-pass path splitter, write-once monotonic RomFS/NUP path lookup cache, and atomic handle-mode / label switch state in `hle_fs.c` (default `1`)
 DM_FULLSCREEN	player	`1` (any value but `0`) starts the Mac window in fullscreen; `0` or unset, a window. The Mac settings window's Display mode
 DM_GAME	switch	Selects the game profile (a title ID under `dm/games` or `DM_GAMES_DIR`) for the Python tools and the rewriter; there is no default
 DM_GAMES_DIR	path	Profile folders outside the repository, separated by `:`, searched after `dm/games`; the NSP script points it at a provisional or derived profile
