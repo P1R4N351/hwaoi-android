@@ -77,4 +77,23 @@ class ScanFile(unittest.TestCase):
         for p in out: self.assertTrue(p.exists(), p)
 
 
+
+class Pacx4Layout(unittest.TestCase):
+    @staticmethod
+    def _hdr(roff, rstored, rlen, deps, ctab):
+        d = bytearray(0x30)
+        d[:8] = ss.PACX4
+        struct.pack_into('<6I', d, 0x10, roff, rstored, rlen, 0, deps, ctab)
+        return d
+
+    def test_pacx4_malformed_layouts_are_named(self):
+        short_hdr = ss.PACX4 + bytes(16)
+        cut_ctab = self._hdr(0x40, 8, 8, 0, 0x20) + struct.pack('<I', 2) + bytes(8)
+        short_root = self._hdr(0x40, 14, 14, 0, 12) + struct.pack('<3I', 1, 14, 14) + bytes(4) + b'PACx402LShader'
+        bad_lz4 = self._hdr(0x40, 4, 16, 0, 12) + struct.pack('<3I', 1, 4, 16) + bytes(4) + b'\xff\xff\xff\xff'
+        for name, data in (('short header', short_hdr), ('cut chunk table', cut_ctab), ('short root', short_root), ('corrupt lz4 chunk', bad_lz4)):
+            with self.subTest(name), self.assertRaisesRegex(SystemExit, r'^\[RED\] /a\.pac'):
+                ss.pacx4_parts(data, '/a.pac')
+
+
 if __name__ == '__main__': unittest.main()

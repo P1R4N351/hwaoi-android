@@ -177,8 +177,7 @@ dm/host/tests/t_fpslock.c	bugprone-float-loop-counter	1
 dm/host/tests/t_fpslock.c	clang-analyzer-core.NullDereference	1
 dm/host/tests/t_fpslock.c	clang-analyzer-security.FloatLoopCounter	1
 dm/host/tests/t_fs.c	bugprone-command-processor	2
-dm/host/tests/t_fs.c	clang-analyzer-core.CallAndMessage	3
-dm/host/tests/t_fs.c	clang-analyzer-core.uninitialized.Branch	1
+dm/host/tests/t_fs.c	clang-analyzer-core.CallAndMessage	2
 dm/host/tests/t_fs.c	clang-analyzer-unix.StdCLibraryFunctions	1
 dm/host/tests/t_fs.c	clang-analyzer-unix.Stream	7
 dm/host/tests/t_fs_case.c	clang-analyzer-core.CallAndMessage	2

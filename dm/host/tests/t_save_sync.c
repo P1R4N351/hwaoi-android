@@ -51,7 +51,7 @@ static int cloud_has(const char *cloud_file, const char *root, const char *file,
 }
 
 static Result write_save(const char *path, const char *s) {           // create -> open -> set size -> write -> close, as a game does
-    uint64_t h; h_fs_CreateFile(path, 0); Result r = h_fs_OpenFile(&h, path, MODE_WRITE); if (r) return r;
+    uint64_t h = 0; h_fs_CreateFile(path, 0); Result r = h_fs_OpenFile(&h, path, MODE_WRITE); if (r) return r;
     h_fs_SetFileSize(h, (int64_t)strlen(s));
     r = h_fs_WriteFile(h, 0, s, strlen(s), NULL); h_fs_CloseFile(h); return r;
 }
