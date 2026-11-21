@@ -358,7 +358,7 @@ static int md_vpx(mdec_t *d, const uint8_t *p, int n, int slot) {
     if ((int)last->d_w != d->w || (int)last->d_h != d->h) { if (!d->red_img++) LOG("[RED] movie: %s picture %u×%u does not match the output %d×%d (first case), cropping / padding with black", codec, last->d_w, last->d_h, d->w, d->h); }
     int rgba = d->fmt == MD_FMT_ABGR;
     size_t need = (size_t)d->w * d->h * (rgba ? 4 : 3) / (rgba ? 1 : 2);
-    if (d->out[slot].cap < need) { free(d->out[slot].frm); d->out[slot].frm = malloc(need); d->out[slot].cap = need; }   // a Configure after Reset may change the size
+    if (d->out[slot].cap < need) { free(d->out[slot].frm); d->out[slot].frm = calloc(1, need); d->out[slot].cap = d->out[slot].frm ? need : 0; if (!d->out[slot].frm) return 0; }   // a Configure after Reset may change the size
     if (rgba) md_rgba(last, d->out[slot].frm, d->w, d->h); else md_nv12(last, d->out[slot].frm, d->w, d->h);
     return 1;
 }
