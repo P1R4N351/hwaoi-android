@@ -98,5 +98,16 @@ class SpecFreeze(unittest.TestCase):
         self.assertIsNone(self.run_freeze(module(spec_op=True), 0, 1))   # a specialization constant operation is not folded here
 
 
+    def test_w35_op_enum_matches_nvn_obj(self):
+        import re
+        def extract(txt):
+            m = re.search(r'enum\s*\{\s*(OP_END.*?OP_COUNT_)\s*\};', txt, re.S)
+            assert m is not None
+            return [x.strip() for x in re.sub(r'//.*', '', m.group(1)).split(',') if x.strip()]
+        nvn = extract((REPO / 'dm/gfx/nvn/nvn_obj.h').read_text())
+        tst = extract((REPO / 'dm/host/tests/t_exec_fast_w35.c').read_text())
+        self.assertEqual(nvn, tst)
+
+
 if __name__ == '__main__':
     unittest.main()

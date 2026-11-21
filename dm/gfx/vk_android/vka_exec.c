@@ -19,6 +19,8 @@
 #include "vka_tstick.h"
 #include "vka_ktgl_cache.h"
 #include "vka_scr_fast.h"
+#define VKA_EXEC_HAVE_OPS 1
+#include "vka_exec_fast.h"
 
 typedef struct { uint64_t serial; p_set_rt rt; int has_rt; p_scissor sc; int has_sc; int64_t copy_stride, copy_img_stride; int rc_skip; vka_dstate d; } qstate;   // what a queue keeps between submissions (d: the draw state, vka_draw.c)
 static qstate S;
@@ -50,18 +52,26 @@ static double ms_now(void) { return (now_ns() % 1000000000000ull) / 1e6; }
 // samples-passed reports both read the constant 1 and a RENDER_IF_NOT_EQUAL block on an occlusion query was skipped, and a table of 64 timestamp reports dropped the rest
 // (nvn_mtl.m: Splatoon Raiders' 285 ink queries came before its conditional clears, and the clears wiped the lit scene)
 enum { RCK_TS = 1, RCK_CONST = 2, RCK_OQ = 3 };   // a timestamp report; a counter written as a constant; a counted samples-passed report
-typedef struct { uint64_t addr, sub; uint32_t kind; } rc_ent;
+typedef vka_rc_ent_w35 rc_ent;
 enum { RCM_MAX = 1u << 20 };   // addresses kept at most (24 MB): a condition on a report at an address past it reads memory
 static rc_ent *g_rcm; static uint32_t g_rcm_cap, g_rcm_n;
+static vka_rcm_front64 g_rcm_fc;
 static uint64_t g_n_sub;   // (the submission count, below)
 static int g_rc_rec;       // a submission (number g_n_sub) is being recorded: mtl_sub_begin to its commit
 static struct { uint64_t sub, fence; } g_rc_subf[64];   // the fences of the latest submissions by number (sub_commit)
 static rc_ent *rcm_find(uint64_t a) {
+    if (vka_exec_fast_on()) return vka_rcm_find_fast(g_rcm, g_rcm_cap, &g_rcm_fc, a, vka_w35_fault());
     if (!g_rcm_cap || !a) return NULL;
     for (uint32_t i = (uint32_t)(a >> 4) & (g_rcm_cap - 1);; i = (i + 1) & (g_rcm_cap - 1)) { if (g_rcm[i].addr == a) return &g_rcm[i]; if (!g_rcm[i].addr) return NULL; }
 }
 static void rc_note(uint64_t a, uint32_t kind) {   // a report recorded at a
     if (!a) return;
+    if (vka_exec_fast_on()) {
+        int oom = 0;
+        if (!vka_rcm_note_fast(&g_rcm, &g_rcm_cap, &g_rcm_n, RCM_MAX, &g_rcm_fc, a, g_n_sub, kind, vka_w35_fault(), &oom) && oom)
+            VRED_ONCE("render conditions: the report table cannot grow past %u addresses: conditions on reports at new addresses read memory", g_rcm_n);
+        return;
+    }
     rc_ent *e = rcm_find(a);
     if (!e) {
         if ((g_rcm_n + 1) * 2 > g_rcm_cap) {
@@ -1383,9 +1393,11 @@ static void not_yet(uint32_t op) {
     g_stat_skipped++;
     VRED_ONCE("DrawTexture (op %u) is not on Vulkan yet: skipped from now on", op);
 }
+static int rc_qmem_slow(void) { return VKA_ENV("DM_VK_RC_QUERY_MEM", 0); }
+static int rc_qmem_fast(void) { return vka_rc_qmem_sync_on(atomic_load_explicit(&vka_env_gen, memory_order_relaxed), rc_qmem_slow); }
 static int rc_known(uint64_t a, uint64_t *v) {   // a counter at a: 1 = known (*v), 0 = unknown (the condition draws; Render conditions, above)
     const rc_ent *e = rcm_find(a);
-    if (e && (e->kind == RCK_TS || VKA_ENV("DM_VK_RC_QUERY_MEM", 0) == 0)) {   // DM_VK_RC_QUERY_MEM=1: other counters' records read from memory, as before a9f7d1ac (A/B only)
+    if (e && (e->kind == RCK_TS || !(vka_exec_fast_on() ? rc_qmem_fast() : VKA_ENV("DM_VK_RC_QUERY_MEM", 0)))) {   // DM_VK_RC_QUERY_MEM=1: other counters' records read from memory, as before a9f7d1ac (A/B only)
         if (e->kind == RCK_CONST) return 0;
         if (!rc_sub_done(e->sub)) { if (e->kind != RCK_TS) return 0; *v = 0; return 1; }
     }
@@ -1509,7 +1521,7 @@ static void ind_scan_collect_both(const uint8_t *p, int want_m, uint64_t *mq, in
         if (h.op == OP_END) { if (!nret) break; p = ret[--nret]; continue; }
         if (h.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
         if (h.op == OP_CALL) { if (nret == 17) break; ret[nret++] = p + h.size; memcpy(&p, a, 8); continue; }
-        if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_UPDATE_UB) break;
+        if (vka_exec_fast_on() ? vka_op_ind_write_fast(h.op) : (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B || h.op == OP_UPDATE_UB)) break;
         if (h.op == OP_DRAW) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t);
             if (want_m && d->prim == NVN_PRIM_MESH && d->ind && !d->mdi_cnt && mdx_find(d->ind) < 0)
                 ind_push_unique(d->ind, &g_scan_seen[0], mq, mn, qmax, fast);
@@ -1744,6 +1756,7 @@ void vka_memu_stop_stats(char *b, size_t n, double frames) {
     memcpy(s0, g_memu_stop, sizeof s0);
 }
 static int memu_allowed(uint32_t op) {
+    if (vka_exec_fast_on()) return vka_op_memu_allowed_fast(op, vka_w35_fault());
     switch (op) {
     case OP_END: case OP_JUMP: case OP_BEGIN: case OP_CALL: case OP_DRAW: case OP_DRAW_IDX: case OP_SCISSOR: case OP_COPY_STRIDE: case OP_CLEAR_COLOR: case OP_CLEAR_DS:
     case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_FENCE_SYNC: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR:
@@ -1809,29 +1822,69 @@ static int mdi_rest(uint32_t op, const void *a, uint32_t size) {   // (a multi-d
     if (op == OP_DRAW_IDX) { if (size - 8 < sizeof(p_draw_idx)) return 0; const p_draw_idx *d = a; return d->mdi_cnt && d->mdi_i > 0 && vka_mdi_gpu(1, d->mdi_n, d->mdi_stride); }
     return 0;
 }
+static int exec_pre_pass(const op_hdr *h, const void *a) {
+    if (vka_exec_fast_on()) {
+        int wf = vka_w35_fault();
+        if (vka_op_need_settle_fast(h->op, wf)) vka_disp_settle(g_cb);
+        if (h->op == OP_DRAW || h->op == OP_DRAW_IDX) chunk_check();
+        if (vka_op_rp_nop_fast(h->op, wf)) return 0;
+        if (h->op == OP_SET_RT) { if (g_cb && !vka_pass_keep()) vka_rp_end(); else if (g_cb) vka_rp_set_rt((const p_set_rt *)a); return 0; }
+        if (h->op == OP_BARRIER) {
+            int bk = 0;
+            if (g_cb) { int32_t bits; memcpy(&bits, a, 4); bk = vka_rp_game_barrier((uint32_t)bits); if (!bk) vka_rp_end(); }
+            if (vka_memu_on()) { vka_memu_bar_met(bk); if (!bk) g_memu_cover = 0; }
+            return bk;
+        }
+        if (g_cb && !vka_state_op(&S.d, h->op, a)) vka_rp_end(); else if (!g_cb) vka_state_op(&S.d, h->op, a);
+        return 0;
+    }
+    switch (h->op) {
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_TEX: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_CLEAR_TEX: case OP_CLEAR_BUF: case OP_COPY_B2B: case OP_COPY_B2T:
+    case OP_COPY_T2B: case OP_COPY_T2T: case OP_UPDATE_UB: case OP_REPORT_COUNTER: vka_disp_settle(g_cb); break;
+    default: break;
+    }
+    if (h->op == OP_DRAW || h->op == OP_DRAW_IDX) chunk_check();
+    int bar_kept = 0;
+    switch (h->op) {
+    case OP_END: case OP_BEGIN: case OP_JUMP: case OP_CALL: case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_FENCE_SYNC: case OP_RENDER_COND: case OP_RESET_COUNTER: case OP_WAIT_EVENT: case OP_WAIT_SYNC:
+    case OP_SCISSOR: case OP_COPY_STRIDE: case OP_UPDATE_UB: case OP_DRAW: case OP_DRAW_IDX: case OP_CLEAR_COLOR: case OP_CLEAR_DS: break;
+    case OP_SET_RT: if (g_cb && !vka_pass_keep()) vka_rp_end(); else if (g_cb) vka_rp_set_rt((const p_set_rt *)a); break;
+    case OP_BARRIER: if (g_cb) { int32_t bits; memcpy(&bits, a, 4); bar_kept = vka_rp_game_barrier((uint32_t)bits); if (!bar_kept) vka_rp_end(); }
+                     if (vka_memu_on()) { vka_memu_bar_met(bar_kept); if (!bar_kept) g_memu_cover = 0; } break;
+    default: if (g_cb && !vka_state_op(&S.d, h->op, a)) vka_rp_end(); else if (!g_cb) vka_state_op(&S.d, h->op, a); break;
+    }
+    return bar_kept;
+}
+static void exec_report_counter(const void *a) {
+    uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
+    uint32_t q = 0;
+    if (g_sqp && g_cb && g_sq_n < SEGQ && (t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP)) {
+        q = (uint32_t)(g_sq_base + g_sq_n++) + 1;
+        struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w = {g_cb, t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q - 1};
+        if (!vka_enc_call(seg_write, &w, sizeof w)) seg_write(&w);
+        vka_rp_note_ts();
+    }
+    int counted = t == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_report(ad, (uint32_t)t);
+    if (q) g_slot_nq[g_sq_base / SEGQ] = g_sq_n;
+    if (!counted) post((pop){2, 0, q, (uint32_t)t, ad, q ? atomic_load(&g_slot_use[g_sq_base / SEGQ]) : 0});
+    if (DM_GAME_RENDER_COND) rc_note(ad, t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? RCK_TS : counted ? RCK_OQ : RCK_CONST);
+    if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0)
+        VLOG("sync report: frame %llu type %llu at draw %llu of the submission, part %d, recording at %.2f ms", (unsigned long long)g_frame,
+             (unsigned long long)t, (unsigned long long)(g_stat_draws - g_sub_draws0), g_nx + 1, ms_now());
+}
+static void exec_draw_idx_pre(const uint8_t *p) {
+    if (!vka_exec_fast_on()) { ind_before_draw(p, NULL); memu_before_draw(p, NULL); return; }
+    int skip = vka_exec_idx_skip_pre(vka_rp_on(), vka_memu_on(), vka_w35_fault());
+    if (skip == 0) ind_before_draw(p, NULL);
+    if (skip <= 1) memu_before_draw(p, NULL);
+}
 static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk holds where it goes on)
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         const void *a = p + 8;
         if ((h.op == OP_DRAW || h.op == OP_DRAW_IDX) && h.size >= 8 && mdi_rest(h.op, a, h.size)) { p += h.size; continue; }
-        if (g_memu_cover && !memu_allowed(h.op) && !(h.op == OP_BARRIER && memu_cross())) g_memu_cover = 0;   // (mesh draws through compute: the look-ahead stopped here)
-        int bar_kept = 0;   // a game barrier taken inside the open pass (vka_rp_game_barrier): no pass end, no full barrier
-        switch (h.op) {   // GPU work other than a dispatch: after the barrier the dispatches before it left pending (vka_draw.c "Dispatch order"), and before a part ends at a draw
-        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_TEX: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_CLEAR_TEX: case OP_CLEAR_BUF: case OP_COPY_B2B: case OP_COPY_B2T:
-        case OP_COPY_T2B: case OP_COPY_T2T: case OP_UPDATE_UB: case OP_REPORT_COUNTER: vka_disp_settle(g_cb); break;
-        default: break;
-        }
-        if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) chunk_check();   // before a draw that opens a new pass
-        switch (h.op) {   // a render pass a draw opened stays open across draws and state; anything else closes it first
-        case OP_END: case OP_BEGIN: case OP_JUMP: case OP_CALL: case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_FENCE_SYNC: case OP_RENDER_COND: case OP_RESET_COUNTER: case OP_WAIT_EVENT: case OP_WAIT_SYNC:
-        case OP_SCISSOR: case OP_COPY_STRIDE: case OP_UPDATE_UB: case OP_DRAW: case OP_DRAW_IDX: break;
-        case OP_SET_RT: if (g_cb && !vka_pass_keep()) vka_rp_end(); else if (g_cb) vka_rp_set_rt((const p_set_rt *)a); break;
-        case OP_BARRIER: if (g_cb) { int32_t bits; memcpy(&bits, a, 4); bar_kept = vka_rp_game_barrier((uint32_t)bits); if (!bar_kept) vka_rp_end(); }
-                         if (vka_memu_on()) { vka_memu_bar_met(bar_kept); if (!bar_kept) g_memu_cover = 0; }   // (the batch's entries past a barrier not taken in the pass go: vka_memu_draw.inc)
-                         break;
-        case OP_CLEAR_COLOR: case OP_CLEAR_DS: break;   // the pass is ended by the next draw over other targets, or the clear (vka_rp_clear)
-        default: if (g_cb && !vka_state_op(&S.d, h.op, a)) vka_rp_end(); else if (!g_cb) vka_state_op(&S.d, h.op, a); break;
-        }
+        if (g_memu_cover && !memu_allowed(h.op) && !(h.op == OP_BARRIER && memu_cross())) g_memu_cover = 0;
+        int bar_kept = exec_pre_pass(&h, a);
         switch (h.op) {
         case OP_END: return 0;
         case OP_BEGIN: break;
@@ -1848,21 +1901,7 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
                 return 1;
             }
             break;
-        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
-            uint32_t q = 0;
-            if (g_sqp && g_cb && g_sq_n < SEGQ && (t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP)) {
-                q = (uint32_t)(g_sq_base + g_sq_n++) + 1;
-                struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w = {g_cb, t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q - 1};
-                if (!vka_enc_call(seg_write, &w, sizeof w)) seg_write(&w);
-                vka_rp_note_ts();
-            }
-            int counted = t == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_report(ad, (uint32_t)t);   // (Occlusion queries: its record is written by oq_done)
-            if (q) g_slot_nq[g_sq_base / SEGQ] = g_sq_n;
-            if (!counted) post((pop){2, 0, q, (uint32_t)t, ad, q ? atomic_load(&g_slot_use[g_sq_base / SEGQ]) : 0});
-            if (DM_GAME_RENDER_COND) rc_note(ad, t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? RCK_TS : counted ? RCK_OQ : RCK_CONST);
-            if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0) VLOG("sync report: frame %llu type %llu at draw %llu of the submission, part %d, recording at %.2f ms", (unsigned long long)g_frame,
-                                                                           (unsigned long long)t, (unsigned long long)(g_stat_draws - g_sub_draws0), g_nx + 1, ms_now());
-            break; }
+        case OP_REPORT_COUNTER: exec_report_counter(a); break;
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_cur_fence ? g_cur_fence : vka_fence_last() + 1; s->fenced = 1; break; }   // the fence this submission commits with
         case OP_RENDER_COND: { const p_render_cond *rc = a;
             if (rc->mode >= 2) S.rc_skip = rc->mode == 3;
@@ -1887,7 +1926,7 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
                       if (!S.rc_skip && g_cb) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t); g_stat_draws++; ind_before_draw(p, d); memu_before_draw(p, d); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
                           vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, d, NULL); oq_lost(sk); } else if (!S.rc_skip && g_oq_count) g_oq_lost++; break;
         case OP_DRAW_IDX: if (S.rc_skip) vka_rtlog_skip(&S.rt, S.has_rt, &S.d, "skipped by a render condition");
-                          if (!S.rc_skip && g_cb) { p_draw_idx t; g_stat_draws++; ind_before_draw(p, NULL); memu_before_draw(p, NULL); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
+                          if (!S.rc_skip && g_cb) { p_draw_idx t; g_stat_draws++; exec_draw_idx_pre(p); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
                           vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, NULL, draw_idx_rec(a, h.size, &t)); oq_lost(sk); } else if (!S.rc_skip && g_oq_count) g_oq_lost++; break;
         case OP_DISPATCH: mdx_write(); qdx_write(); if (!S.rc_skip && g_cb) vka_dispatch(&S.d, a); break;
         case OP_DRAW_TEX: not_yet(h.op); if (!S.rc_skip && g_oq_count) { g_oq_lost++; g_oqs_skip++; } break;
