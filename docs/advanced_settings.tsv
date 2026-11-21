@@ -750,6 +750,7 @@ DM_VK_SPARSE_RES	developer	Graphics			text			both
 DM_VK_SPARSE_RES_MB	developer	Graphics			text			both							
 DM_VK_SPEC_FOLD	developer	Graphics			text			both							
 DM_VK_SPEC_MAPS_PCT	developer	Graphics			text			both							
+DM_VK_SPVPATCH_FAST	developer	Graphics			text			both							
 DM_VK_SPV_DIR	internal	Diagnostics			text			both						test harness	
 DM_VK_SPV_OVERRIDE	developer	Diagnostics			text			both							
 DM_VK_STATE_FAST	developer	Graphics			text			both							

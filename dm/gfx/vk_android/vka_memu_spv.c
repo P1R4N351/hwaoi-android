@@ -17,6 +17,7 @@
 // GPL-3.0-or-later: see vka_memu_abi.h.
 #include "vka_memu_spv.h"
 #include "vka_memu_abi.h"
+#include "vka_spvpatch_fast.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,10 @@ static void sb_put(sb_t *b, uint32_t x) {
     if (b->n == b->cap) { size_t c = b->cap ? 2 * b->cap : 1024; uint32_t *p = realloc(b->w, c * 4); if (!p) { b->oom = 1; return; } b->w = p; b->cap = c; }
     b->w[b->n++] = x;
 }
-static void sb_raw(sb_t *b, const uint32_t *x, size_t n) { for (size_t i = 0; i < n; i++) sb_put(b, x[i]); }
+static void sb_raw(sb_t *b, const uint32_t *x, size_t n) {
+    if (vka_spvpatch_fast_on()) { vka_sb_raw_fast(&b->w, &b->n, &b->cap, &b->oom, x, n); return; }
+    for (size_t i = 0; i < n; i++) sb_put(b, x[i]);
+}
 static void sb_ins(sb_t *b, uint32_t op, const uint32_t *a, uint32_t na) { sb_put(b, (na + 1) << 16 | op); sb_raw(b, a, na); }
 #define INS(b, op, ...) do { const uint32_t a_[] = {__VA_ARGS__}; sb_ins((b), (op), a_, (uint32_t)(sizeof a_ / sizeof a_[0])); } while (0)
 static void sb_str_ins(sb_t *b, uint32_t op, const uint32_t *pre, uint32_t npre, const char *s, const uint32_t *post, uint32_t npost) {   // an instruction with a string operand
@@ -693,6 +697,7 @@ uint64_t vka_memu_vs_locs(const vka_memu_layout *L) {
     return m;
 }
 int vka_memu_fs_input_locs(const uint32_t *w, size_t nw, uint64_t *mask) {
+    if (vka_spvpatch_fast_on()) return vka_memu_fs_input_locs_fast(w, nw, mask);
     mod_t m; char err[64]; *mask = 0;
     if (!mod_read(&m, w, nw, err, sizeof err)) { mod_free(&m); return 0; }
     int ok = 1;

@@ -9,6 +9,7 @@
 // nvn_mtl.m reaches the same bits by converting such attributes on the CPU into float32 bits (vconv_int); the Apple chain's dmsh_vin is the reverse case (integer inputs fed float formats).
 #include "vka_spvpatch.h"
 #include "vka_shlib_fast.h"
+#include "vka_spvpatch_fast.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -30,107 +31,99 @@ static int put_n(vec_t *v, const uint32_t *x, size_t n) {
     return 1;
 }
 
-uint32_t *vka_spv_vin_retype(const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask, size_t *out_nw, char *err, size_t errn) {
-#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
-    uint32_t *cls = NULL; vec_t o = {0};   // cls[id]: 0 untouched, 1 a retyped input or a chain into one, as uint, 2 as int (bit 4: the id is a pointer to a vec4)
-    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
-    uint32_t bound = w[3];
-    if (!(cls = calloc(bound, 4))) { snprintf(err, errn, "out of memory"); return NULL; }
-    if ((umask | smask) == 0 || (umask & smask)) FAIL("no input, or an input both uint and int");
-    // Pass 1: locations, the types, the Input variables
-    uint32_t *loc = calloc(bound, 4); if (!loc) FAIL("out of memory");
-    for (uint32_t i = 0; i < bound; i++) loc[i] = ~0u;
-    uint32_t t_f32 = 0, t_u32 = 0, t_i32 = 0, t_v4f = 0, t_v4u = 0, t_v4i = 0, p_in_v4f = 0;
-    uint32_t p_in[2][2] = {{0}};   // [uint/int][scalar/vec4] Input pointers that exist
-    size_t first_fn = nw;
+static int vin_scan_slow(
+    const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask,
+    uint32_t *cls, uint32_t *loc, uint32_t t_s[2], uint32_t t_v[2],
+    uint32_t p_in[2][2], uint32_t moved[32], int *nmoved, size_t *fn_at, char *err, size_t errn) {
+    uint32_t b = w[3], t_f32 = 0, t_v4f = 0, p_in_v4f = 0;
+    *fn_at = nw;
     for (size_t i = 5; i < nw;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > nw) { free(loc); FAIL("bad instruction at word %zu", i); }
-        if (op == OpDecorate && len >= 4 && w[i + 2] == DecLocation && w[i + 1] < bound) loc[w[i + 1]] = w[i + 3];
+        if (!len || i + len > nw) { snprintf(err, errn, "bad instruction at word %zu", i); return 0; }
+        if (op == OpDecorate && len >= 4 && w[i + 2] == DecLocation && w[i + 1] < b) loc[w[i + 1]] = w[i + 3];
         else if (op == OpTypeFloat && len >= 3 && w[i + 2] == 32) t_f32 = w[i + 1];
-        else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32) { if (w[i + 3]) t_i32 = w[i + 1]; else t_u32 = w[i + 1]; }
+        else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32) t_s[w[i + 3] ? 1 : 0] = w[i + 1];
         else if (op == OpTypeVector && len >= 4 && w[i + 3] == 4) {
-            if (w[i + 2] == t_f32 && t_f32) t_v4f = w[i + 1]; else if (w[i + 2] == t_u32 && t_u32) t_v4u = w[i + 1]; else if (w[i + 2] == t_i32 && t_i32) t_v4i = w[i + 1]; }
-        else if (op == OpTypePointer && len >= 4 && w[i + 2] == SCInput) {
+            if (w[i + 2] == t_f32 && t_f32) t_v4f = w[i + 1];
+            else if (w[i + 2] == t_s[0] && t_s[0]) t_v[0] = w[i + 1];
+            else if (w[i + 2] == t_s[1] && t_s[1]) t_v[1] = w[i + 1];
+        } else if (op == OpTypePointer && len >= 4 && w[i + 2] == SCInput) {
             uint32_t t = w[i + 3];
             if (t == t_v4f && t) p_in_v4f = w[i + 1];
-            for (int c = 0; c < 2; c++) { if (t == (c ? t_i32 : t_u32) && t) p_in[c][0] = w[i + 1]; if (t == (c ? t_v4i : t_v4u) && t) p_in[c][1] = w[i + 1]; }
-        }
-        else if (op == OpFunction && first_fn == nw) first_fn = i;
+            for (int c = 0; c < 2; c++) {
+                if (t == t_s[c] && t) p_in[c][0] = w[i + 1];
+                if (t == t_v[c] && t) p_in[c][1] = w[i + 1];
+            }
+        } else if (op == OpFunction && *fn_at == nw) *fn_at = i;
         i += len;
     }
-    if (!t_f32 || !t_v4f || !p_in_v4f) { free(loc); FAIL("no vec4 float input type"); }
-    // New ids for the types the module lacks
-    uint32_t nb = bound;
-    int need_c[2] = {(umask != 0), (smask != 0)};
-    uint32_t t_s[2] = {t_u32, t_i32}, t_v[2] = {t_v4u, t_v4i};
-    uint32_t mk_s[2] = {0}, mk_v[2] = {0}, mk_p[2][2] = {{0}};
-    for (int c = 0; c < 2; c++) if (need_c[c]) {
-        if (!t_s[c]) t_s[c] = mk_s[c] = nb++;
-        if (!t_v[c]) t_v[c] = mk_v[c] = nb++;
-        if (!p_in[c][0]) p_in[c][0] = mk_p[c][0] = nb++;
-        if (!p_in[c][1]) p_in[c][1] = mk_p[c][1] = nb++;
-    }
-    // The input variables to retype: Location in a mask, type pointer-to-vec4-float
-    uint32_t moved[32]; int nmoved = 0, found = 0;
-    for (size_t i = 5; i < first_fn;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (op == OpVariable && len >= 4 && w[i + 3] == SCInput && w[i + 2] < bound && w[i + 1] == p_in_v4f) {
+    if (!t_f32 || !t_v4f || !p_in_v4f) { snprintf(err, errn, "no vec4 float input type"); return 0; }
+    uint32_t found = 0; *nmoved = 0;
+    for (size_t i = 5; i < *fn_at; i += w[i] >> 16) {
+        if ((w[i] & 0xffff) == OpVariable && (w[i] >> 16) >= 4 && w[i + 3] == SCInput && w[i + 2] < b && w[i + 1] == p_in_v4f) {
             uint32_t id = w[i + 2], l = loc[id];
-            if (l < 32 && ((umask | smask) >> l & 1)) { cls[id] = (umask >> l & 1 ? 1 : 2) | 16; if (nmoved < 32) moved[nmoved++] = id; found |= 1u << l; }
+            if (l < 32 && ((umask | smask) >> l & 1)) { cls[id] = (umask >> l & 1 ? 1u : 2u) | 16u; if (*nmoved < 32) moved[(*nmoved)++] = id; found |= 1u << l; }
         }
-        i += len;
     }
-    free(loc);
-    if ((uint32_t)found != (umask | smask)) FAIL("inputs %#x are not vec4 float Input variables", (umask | smask) & ~(uint32_t)found);
-    // Pass 2: copy, retyping. The globals up to the first function, minus the moved variables; then the new types and the variables; then the functions
-    if (!put_n(&o, w, 5)) FAIL("out of memory");
+    if (found != (umask | smask)) { snprintf(err, errn, "inputs %#x are not vec4 float Input variables", (umask | smask) & ~found); return 0; }
+    return 1;
+}
+
+static int vin_emit_slow_body(
+    const uint32_t *w, size_t nw, size_t first_fn, uint32_t b, uint32_t *cls,
+    const uint32_t p_in[2][2], const uint32_t t_s[2], const uint32_t t_v[2],
+    const int need_c[2], const uint32_t mk_s[2], const uint32_t mk_v[2], const uint32_t mk_p[2][2],
+    const uint32_t moved[32], int nmoved, uint32_t *nb, vec_t *o, char *err, size_t errn) {
+    if (!put_n(o, w, 5)) { snprintf(err, errn, "out of memory"); return 0; }
     for (size_t i = 5; i < nw;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
-        if (i == first_fn) {
-            for (int c = 0; c < 2; c++) if (need_c[c]) {
-                if (mk_s[c]) { uint32_t x[4] = {4u << 16 | OpTypeInt, mk_s[c], 32, (uint32_t)c}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-                if (mk_v[c]) { uint32_t x[4] = {4u << 16 | OpTypeVector, mk_v[c], t_s[c], 4}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-                if (mk_p[c][0]) { uint32_t x[4] = {4u << 16 | OpTypePointer, mk_p[c][0], SCInput, t_s[c]}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-                if (mk_p[c][1]) { uint32_t x[4] = {4u << 16 | OpTypePointer, mk_p[c][1], SCInput, t_v[c]}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
+        if (i == first_fn && !vka_vin_emit_hdr(&o->w, &o->n, &o->cap, need_c, mk_s, mk_v, mk_p, t_s, t_v, p_in, cls, moved, nmoved)) { snprintf(err, errn, "out of memory"); return 0; }
+        if (op == OpVariable && len >= 4 && w[i + 2] < b && cls[w[i + 2]] && i < first_fn) { i += len; continue; }
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < b && cls[w[i + 3]]) {
+            int c = (int)(cls[w[i + 3]] & 3) - 1; uint32_t r = w[i + 2]; int vec = len == 4;
+            if (r >= b || (!vec && len != 5)) { snprintf(err, errn, r >= b ? "bad id" : "an access chain of %u indexes into a retyped input", len - 4); return 0; }
+            cls[r] = (uint32_t)(c + 1) | (vec ? 16u : 0u);
+            if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
+            o->w[o->n - len + 1] = p_in[c][vec]; i += len; continue;
+        }
+        if (op == OpLoad && len >= 4 && w[i + 3] < b && cls[w[i + 3]]) {
+            int c = (int)(cls[w[i + 3]] & 3) - 1, vec = (cls[w[i + 3]] & 16) != 0;
+            uint32_t ft = w[i + 1], r = w[i + 2], tmp = (*nb)++, x[4] = {4u << 16 | OpBitcast, ft, r, tmp};
+            if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
+            o->w[o->n - len + 1] = vec ? t_v[c] : t_s[c]; o->w[o->n - len + 2] = tmp;
+            if (!put_n(o, x, 4)) { snprintf(err, errn, "out of memory"); return 0; }
+            i += len; continue;
+        }
+        if (!vka_vin_special_ok(op) && i >= first_fn)
+            for (uint32_t k = 1; k < len; k++) if (!(op == OpExtInst && k == 4) && w[i + k] < b && cls[w[i + k]] && op != OpVariable) {
+                snprintf(err, errn, "opcode %u uses a retyped input (id %u)", op, w[i + k]); return 0;
             }
-            for (int k = 0; k < nmoved; k++) { uint32_t x[4] = {4u << 16 | OpVariable, p_in[(cls[moved[k]] & 3) - 1][1], moved[k], SCInput}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-        }
-        if (op == OpVariable && len >= 4 && w[i + 2] < bound && cls[w[i + 2]] && i < first_fn) { i += len; continue; }   // re-emitted above
-        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < bound && cls[w[i + 3]]) {
-            int c = (cls[w[i + 3]] & 3) - 1; uint32_t rt = w[i + 1], r = w[i + 2];
-            // The chain's result: a component (pointer to float) or the vector itself (no index)
-            if (r >= bound) FAIL("bad id");
-            int vec = len == 4;
-            if (!vec && len != 5) FAIL("an access chain of %u indexes into a retyped input", len - 4);
-            (void)rt;
-            cls[r] = (uint32_t)(c + 1) | (vec ? 16 : 0);
-            if (!put_n(&o, in, len)) FAIL("out of memory");
-            o.w[o.n - len + 1] = p_in[c][vec];
-            i += len; continue;
-        }
-        if (op == OpLoad && len >= 4 && w[i + 3] < bound && cls[w[i + 3]]) {
-            int c = (cls[w[i + 3]] & 3) - 1, vec = (cls[w[i + 3]] & 16) != 0;
-            uint32_t ft = w[i + 1], r = w[i + 2], tmp = nb++;
-            if (!put_n(&o, in, len)) FAIL("out of memory");
-            o.w[o.n - len + 1] = vec ? t_v[c] : t_s[c]; o.w[o.n - len + 2] = tmp;
-            uint32_t x[4] = {4u << 16 | OpBitcast, ft, r, tmp}; if (!put_n(&o, x, 4)) FAIL("out of memory");
-            i += len; continue;
-        }
-        // Any other use of a retyped variable or chain (a call argument, a copy): not understood, refused. Debug names, decorations and the entry point's interface are fine
-        if (op != OpName && op != OpMemberName && op != OpEntryPoint && op != OpDecorate && op != OpMemberDecorate && op != OpDecorateId && op != OpDecorateString && op != OpMemberDecorateString
-            && i >= first_fn)
-            for (uint32_t k = 1; k < len; k++) if (!(op == OpExtInst && k == 4) && w[i + k] < bound && cls[w[i + k]] && op != OpVariable) FAIL("opcode %u uses a retyped input (id %u)", op, w[i + k]);
-        if (!put_n(&o, in, len)) FAIL("out of memory");
+        if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
         i += len;
     }
-    o.w[3] = nb;
+    return 1;
+}
+
+uint32_t *vka_spv_vin_retype(const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask, size_t *out_nw, char *err, size_t errn) {
+    if (vka_spvpatch_fast_on()) return vka_spv_vin_retype_fast(w, nw, umask, smask, out_nw, err, errn);
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    if ((umask | smask) == 0 || (umask & smask)) { snprintf(err, errn, "no input, or an input both uint and int"); return NULL; }
+    uint32_t b = w[3], *cls = calloc(b, 4), *loc = malloc((size_t)b * 4);
+    if (!cls || !loc) { free(cls); free(loc); snprintf(err, errn, "out of memory"); return NULL; }
+    for (uint32_t i = 0; i < b; i++) loc[i] = ~0u;
+    uint32_t t_s[2] = {0}, t_v[2] = {0}, p_in[2][2] = {{0}}, moved[32] = {0}; int nmoved = 0; size_t first_fn = nw;
+    int ok = vin_scan_slow(w, nw, umask, smask, cls, loc, t_s, t_v, p_in, moved, &nmoved, &first_fn, err, errn);
+    free(loc);
+    uint32_t nb = b, mk_s[2] = {0}, mk_v[2] = {0}, mk_p[2][2] = {{0}}; int need_c[2] = {(umask != 0), (smask != 0)};
+    if (ok) for (int c = 0; c < 2; c++) if (need_c[c]) {
+        if (!t_s[c]) t_s[c] = mk_s[c] = nb++; if (!t_v[c]) t_v[c] = mk_v[c] = nb++;
+        if (!p_in[c][0]) p_in[c][0] = mk_p[c][0] = nb++; if (!p_in[c][1]) p_in[c][1] = mk_p[c][1] = nb++;
+    }
+    vec_t o = {0};
+    if (ok) ok = vin_emit_slow_body(w, nw, first_fn, b, cls, p_in, t_s, t_v, need_c, mk_s, mk_v, mk_p, moved, nmoved, &nb, &o, err, errn);
     free(cls);
-    *out_nw = o.n; return o.w;
-fail:
-    free(cls); free(o.w);
-    return NULL;
-#undef FAIL
+    if (!ok) { free(o.w); return NULL; }
+    o.w[3] = nb; *out_nw = o.n; return o.w;
 }
 
 // vka_spv_subgroup_single: subgroup operations in a stage the device has none for. The Adreno 840 lists subgroup operations for the fragment and compute stages only
@@ -159,19 +152,47 @@ int vka_spv_subgroup_rows(const uint32_t *w, size_t nw) {
     }
     return 0;
 }
+static int sg_emit_slow_body(
+    const uint32_t *w, size_t nw, size_t first_fn, uint32_t bound, uint32_t t_u32, uint32_t t_v4u, uint32_t t_bool,
+    uint32_t mk_bool, uint32_t mk_v4, uint32_t c0, uint32_t c1, uint32_t cv0, uint32_t cv1, uint32_t ctrue,
+    const uint8_t *bi, uint8_t *chain, const int32_t *cval, uint32_t *nb, vec_t *o, int *changed, char *err, size_t errn) {
+    if (!put_n(o, w, 5)) { snprintf(err, errn, "out of memory"); return 0; }
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
+        if (i == first_fn && !vka_sg_emit_consts(&o->w, &o->n, &o->cap, mk_bool, mk_v4, t_u32, t_v4u, t_bool, c0, c1, cv0, cv1, ctrue)) { snprintf(err, errn, "out of memory"); return 0; }
+        if (i >= first_fn && (op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < bound && bi[w[i + 3]]) {
+            if (len != 5 || w[i + 4] >= bound || cval[w[i + 4]] < 0) { snprintf(err, errn, "an access chain into a subgroup mask with a non-constant index"); return 0; }
+            int k = bi[w[i + 3]] & 3; chain[w[i + 2]] = (uint8_t)(k == 2 && cval[w[i + 4]] == 0 ? 2 : 1); i += len; continue;
+        }
+        if (i >= first_fn && op == OpLoad && len >= 4 && w[i + 3] < bound && (bi[w[i + 3]] || chain[w[i + 3]])) {
+            uint32_t v = chain[w[i + 3]] ? (chain[w[i + 3]] == 2 ? c1 : c0) : (bi[w[i + 3]] & 4) ? ((bi[w[i + 3]] & 3) == 2 ? cv1 : cv0) : ((bi[w[i + 3]] & 3) == 2 ? c1 : c0);
+            uint32_t x[4] = {4u << 16 | OpCopyObject, w[i + 1], w[i + 2], v};
+            if (!put_n(o, x, 4)) { snprintf(err, errn, "out of memory"); return 0; }
+            i += len; *changed = 1; continue;
+        }
+        if (i >= first_fn && op >= OpGNUElect && op <= OpGNUShuffleDown) {
+            if (!vka_sg_rewrite_op(op, in, len, t_v4u, t_u32, c0, c1, ctrue, nb, &o->w, &o->n, &o->cap, err, errn)) return 0;
+            i += len; *changed = 1; continue;
+        }
+        if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
+        i += len;
+    }
+    return 1;
+}
+
 uint32_t *vka_spv_subgroup_single(const uint32_t *w, size_t nw, size_t *out_nw, int *changed, char *err, size_t errn) {
-#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
-    uint8_t *bi = NULL, *chain = NULL; int32_t *cval = NULL; vec_t o = {0}; *changed = 0;
+    if (vka_spvpatch_fast_on()) return vka_spv_subgroup_single_fast(w, nw, out_nw, changed, err, errn);
+    *changed = 0;
     if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
     uint32_t bound = w[3], nb = bound;
-    bi = calloc(bound, 1); chain = calloc(bound, 1); cval = malloc((size_t)bound * 4);
-    if (!bi || !chain || !cval) FAIL("out of memory");
+    uint8_t *bi = calloc(bound, 1), *chain = calloc(bound, 1); int32_t *cval = malloc((size_t)bound * 4);
+    if (!bi || !chain || !cval) { free(bi); free(chain); free(cval); snprintf(err, errn, "out of memory"); return NULL; }
     for (uint32_t i = 0; i < bound; i++) cval[i] = -1;
     uint32_t t_u32 = 0, t_v4u = 0, t_bool = 0; size_t first_fn = nw; int any = 0;
     for (size_t i = 5; i < nw;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > nw) FAIL("bad instruction at word %zu", i);
-        if (op == OpDecorate && len >= 4 && w[i + 2] == DecBuiltIn && w[i + 1] < bound && bi_kind(w[i + 3])) bi[w[i + 1]] = (uint8_t)bi_kind(w[i + 3]) | (w[i + 3] >= BIEq ? 4 : 0);   // bit 2: a vec4 mask
+        if (!len || i + len > nw) { free(bi); free(chain); free(cval); snprintf(err, errn, "bad instruction at word %zu", i); return NULL; }
+        if (op == OpDecorate && len >= 4 && w[i + 2] == DecBuiltIn && w[i + 1] < bound && bi_kind(w[i + 3])) { bi[w[i + 1]] = (uint8_t)bi_kind(w[i + 3]) | (w[i + 3] >= BIEq ? 4 : 0); any = 1; }
         else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32 && !w[i + 3]) t_u32 = w[i + 1];
         else if (op == OpTypeBool && len >= 2) t_bool = w[i + 1];
         else if (op == OpTypeVector && len >= 4 && w[i + 3] == 4 && w[i + 2] == t_u32 && t_u32) t_v4u = w[i + 1];
@@ -180,61 +201,13 @@ uint32_t *vka_spv_subgroup_single(const uint32_t *w, size_t nw, size_t *out_nw, 
         else if (op >= OpGNUElect && op <= OpGNUShuffleDown) any = 1;
         i += len;
     }
-    for (uint32_t i = 0; i < bound && !any; i++) any = bi[i] != 0;
-    if (!any) { free(bi); free(chain); free(cval); return NULL; }   // nothing to do
-    if (!t_u32) FAIL("no 32-bit unsigned type");
+    if (!any || !t_u32) { free(bi); free(chain); free(cval); if (any) snprintf(err, errn, "no 32-bit unsigned type"); return NULL; }
     uint32_t mk_v4 = t_v4u ? 0 : nb++, mk_bool = t_bool ? 0 : nb++; if (!t_v4u) t_v4u = mk_v4; if (!t_bool) t_bool = mk_bool;
-    uint32_t c0 = nb++, c1 = nb++, cv0 = nb++, cv1 = nb++, ctrue = nb++;   // uint 0, uint 1, uvec4(0), uvec4(1, 0, 0, 0), true
-    if (!put_n(&o, w, 5)) FAIL("out of memory");
-    for (size_t i = 5; i < nw;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
-        if (i == first_fn) {
-            if (mk_bool) { uint32_t x[2] = {2u << 16 | OpTypeBool, mk_bool}; if (!put_n(&o, x, 2)) FAIL("out of memory"); }
-            if (mk_v4) { uint32_t x[4] = {4u << 16 | OpTypeVector, mk_v4, t_u32, 4}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-            uint32_t x[] = {4u << 16 | OpConstant, t_u32, c0, 0, 4u << 16 | OpConstant, t_u32, c1, 1, 7u << 16 | OpConstantComposite, t_v4u, cv0, c0, c0, c0, c0,
-                            7u << 16 | OpConstantComposite, t_v4u, cv1, c1, c0, c0, c0, 3u << 16 | OpConstantTrue, t_bool, ctrue};
-            if (!put_n(&o, x, sizeof x / 4)) FAIL("out of memory");
-        }
-        if (i >= first_fn) {
-            if ((op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < bound && bi[w[i + 3]]) {   // a component of a mask
-                if (len != 5 || w[i + 4] >= bound || cval[w[i + 4]] < 0) FAIL("an access chain into a subgroup mask with a non-constant index");
-                int k = bi[w[i + 3]] & 3; chain[w[i + 2]] = (uint8_t)(k == 2 && cval[w[i + 4]] == 0 ? 2 : 1);   // bit 0 only for eq / le / ge
-                i += len; continue;   // dropped: its loads become constants
-            }
-            if (op == OpLoad && len >= 4 && w[i + 3] < bound && (bi[w[i + 3]] || chain[w[i + 3]])) {
-                uint32_t v = chain[w[i + 3]] ? (chain[w[i + 3]] == 2 ? c1 : c0) : (bi[w[i + 3]] & 4) ? ((bi[w[i + 3]] & 3) == 2 ? cv1 : cv0) : ((bi[w[i + 3]] & 3) == 2 ? c1 : c0);
-                uint32_t x[4] = {4u << 16 | OpCopyObject, w[i + 1], w[i + 2], v}; if (!put_n(&o, x, 4)) FAIL("out of memory");
-                i += len; *changed = 1; continue;
-            }
-            if (op >= OpGNUElect && op <= OpGNUShuffleDown) {
-                uint32_t rt = w[i + 1], r = w[i + 2], v;
-                switch (op) {
-                case OpGNUElect: case OpGNUAllEqual: v = ctrue; break;
-                case OpGNUAll: case OpGNUAny: case OpGNUBroadcast: case OpGNUBroadcastFirst: case OpGNUShuffle: case OpGNUShuffleXor: case OpGNUShuffleUp: case OpGNUShuffleDown:
-                    if (len < 5) FAIL("short subgroup instruction %u", op);
-                    v = w[i + 4]; break;
-                case OpGNUBallot: {
-                    if (len < 5 || rt != t_v4u) FAIL("a ballot of an unexpected type");
-                    uint32_t tmp = nb++;
-                    uint32_t x[] = {6u << 16 | OpSelect, t_u32, tmp, w[i + 4], c1, c0, 7u << 16 | OpCompositeConstruct, t_v4u, r, tmp, c0, c0, c0};
-                    if (!put_n(&o, x, sizeof x / 4)) FAIL("out of memory");
-                    i += len; *changed = 1; continue; }
-                default: FAIL("subgroup instruction %u not rewritten", op);
-                }
-                uint32_t x[4] = {4u << 16 | OpCopyObject, rt, r, v}; if (!put_n(&o, x, 4)) FAIL("out of memory");
-                i += len; *changed = 1; continue;
-            }
-        }
-        if (!put_n(&o, in, len)) FAIL("out of memory");
-        i += len;
-    }
-    o.w[3] = nb;
+    uint32_t c0 = nb++, c1 = nb++, cv0 = nb++, cv1 = nb++, ctrue = nb++; vec_t o = {0};
+    int ok = sg_emit_slow_body(w, nw, first_fn, bound, t_u32, t_v4u, t_bool, mk_bool, mk_v4, c0, c1, cv0, cv1, ctrue, bi, chain, cval, &nb, &o, changed, err, errn);
     free(bi); free(chain); free(cval);
-    *out_nw = o.n; return o.w;
-fail:
-    free(bi); free(chain); free(cval); free(o.w);
-    return NULL;
-#undef FAIL
+    if (!ok) { free(o.w); return NULL; }
+    o.w[3] = nb; *out_nw = o.n; return o.w;
 }
 
 // vka_spv_gs_claim: a geometry shader that writes memory, made to write it once per primitive. The Adreno 840 runs a geometry shader several times for each primitive (three
@@ -398,113 +371,66 @@ int vka_spv_gs_claim(const uint32_t *w, size_t nw, uint32_t binding, uint32_t **
 // through an access chain) stores the OpBitcast of its value, and each load of one is bit-cast back. The bits reach the target unchanged, as on the Switch.
 // Mario Kart World's fragment dcb0504c844f1ecc (DrivePassShaderDefault, paired with task-less mesh programs: by their shape ShadingRateWrite) writes its UINT target 0 this way
 enum { SCOutput = 3 };
-uint32_t *vka_spv_fout_retype(const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask, size_t *out_nw, char *err, size_t errn) {
-#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
-    uint32_t *cls = NULL, *loc = NULL, *ty = NULL; vec_t o = {0};   // cls[id]: 1 uint / 2 int, bit 4 the whole variable (else a component chain); ty: for each float type id its components (1..4), 0 none
-    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
-    uint32_t bound = w[3];
-    if ((umask | smask) == 0 || (umask & smask)) { snprintf(err, errn, "no output, or an output both uint and int"); return NULL; }
-    if (!(cls = calloc(bound, 4)) || !(loc = calloc(bound, 4)) || !(ty = calloc(bound, 4))) FAIL("out of memory");
-    for (uint32_t i = 0; i < bound; i++) loc[i] = ~0u;
-    uint32_t t_f32 = 0, t_int[2] = {0}, t_ivec[2][5] = {{0}}, p_out_int[2][5] = {{0}};   // [uint/int][components]; the existing types
-    uint32_t *ptee = calloc(bound, 4); if (!ptee) FAIL("out of memory");                // Output pointer type → its pointee
-    size_t first_fn = nw;
-    for (size_t i = 5; i < nw;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (!len || i + len > nw) { free(ptee); FAIL("bad instruction at word %zu", i); }
-        if (op == OpDecorate && len >= 4 && w[i + 2] == DecLocation && w[i + 1] < bound) loc[w[i + 1]] = w[i + 3];
-        else if (op == OpTypeFloat && len >= 3 && w[i + 2] == 32 && w[i + 1] < bound) { t_f32 = w[i + 1]; ty[t_f32] = 1; }
-        else if (op == OpTypeInt && len >= 4 && w[i + 2] == 32) t_int[w[i + 3] ? 1 : 0] = w[i + 1];
-        else if (op == OpTypeVector && len >= 4 && w[i + 3] >= 2 && w[i + 3] <= 4 && w[i + 1] < bound) {
-            if (w[i + 2] == t_f32 && t_f32) ty[w[i + 1]] = w[i + 3];
-            for (int c = 0; c < 2; c++) if (w[i + 2] == t_int[c] && t_int[c]) t_ivec[c][w[i + 3]] = w[i + 1];
-        }
-        else if (op == OpTypePointer && len >= 4 && w[i + 2] == SCOutput && w[i + 1] < bound) {
-            ptee[w[i + 1]] = w[i + 3];
-            for (int c = 0; c < 2; c++) { if (w[i + 3] == t_int[c] && t_int[c]) p_out_int[c][1] = w[i + 1]; for (int n = 2; n <= 4; n++) if (w[i + 3] == t_ivec[c][n] && t_ivec[c][n]) p_out_int[c][n] = w[i + 1]; }
-        }
-        else if (op == OpFunction && first_fn == nw) first_fn = i;
-        i += len;
-    }
-    for (int c = 0; c < 2; c++) t_ivec[c][1] = t_int[c];
-    // The output variables to retype: Location in a mask, a pointer to a float or float vector
-    uint32_t moved[32], mcomp[32]; int nmoved = 0; uint32_t found = 0, need[2] = {0};   // need[c]: bit n = the integer type of n components (and its pointers) is used
-    for (size_t i = 5; i < first_fn;) {
-        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (op == OpVariable && len >= 4 && w[i + 3] == SCOutput && w[i + 1] < bound && w[i + 2] < bound) {
-            uint32_t id = w[i + 2], l = loc[id], pt = ptee[w[i + 1]], n = pt < bound ? ty[pt] : 0;
-            if (l < 32 && ((umask | smask) >> l & 1)) {
-                if (!n) { free(ptee); FAIL("output %u is not a float or float vector", l); }
-                if (len > 4) { free(ptee); FAIL("output %u has an initializer", l); }   // (the translator emits none; re-emitted without it, unwritten components would change)
-                if (nmoved == 32) { free(ptee); FAIL("too many outputs"); }
-                int c = umask >> l & 1 ? 0 : 1;
-                cls[id] = (uint32_t)(c + 1) | 16; mcomp[nmoved] = n; moved[nmoved++] = id;
-                found |= 1u << l; need[c] |= 1u << n | 2u;   // (the scalar for component chains)
-            }
-        }
-        i += len;
-    }
-    free(ptee);
-    if (found != (umask | smask)) FAIL("outputs %#x are not float Output variables", (umask | smask) & ~found);
-    // New ids for the types the module lacks
-    uint32_t nb = bound, mk_t[2][5] = {{0}}, mk_p[2][5] = {{0}};
-    for (int c = 0; c < 2; c++) for (int n = 1; n <= 4; n++) if (need[c] >> n & 1) {
-        if (!t_ivec[c][n]) t_ivec[c][n] = mk_t[c][n] = nb++;
-        if (!p_out_int[c][n]) p_out_int[c][n] = mk_p[c][n] = nb++;
-    }
-    if ((need[0] && !t_ivec[0][1]) || (need[1] && !t_ivec[1][1])) FAIL("no scalar type");
-    // Pass 2: copy, retyping (the new types and the moved variables go right before the first function, as in vka_spv_vin_retype)
-    if (!put_n(&o, w, 5)) FAIL("out of memory");
+static int fout_emit_slow_body(
+    const uint32_t *w, size_t nw, size_t first_fn, uint32_t bound, uint32_t *cls,
+    const uint32_t t_ivec[2][5], const uint32_t p_out_int[2][5], const uint32_t mk_t[2][5], const uint32_t mk_p[2][5],
+    const uint32_t moved[32], const uint32_t mcomp[32], int nmoved, uint32_t *nb, vec_t *o, char *err, size_t errn) {
+    if (!put_n(o, w, 5)) { snprintf(err, errn, "out of memory"); return 0; }
     for (size_t i = 5; i < nw;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
-        if (i == first_fn) {
-            for (int c = 0; c < 2; c++) {
-                if (mk_t[c][1]) { uint32_t x[4] = {4u << 16 | OpTypeInt, mk_t[c][1], 32, (uint32_t)c}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-                for (int n = 2; n <= 4; n++) if (mk_t[c][n]) { uint32_t x[4] = {4u << 16 | OpTypeVector, mk_t[c][n], t_ivec[c][1], (uint32_t)n}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-                for (int n = 1; n <= 4; n++) if (mk_p[c][n]) { uint32_t x[4] = {4u << 16 | OpTypePointer, mk_p[c][n], SCOutput, t_ivec[c][n]}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-            }
-            for (int k = 0; k < nmoved; k++) { uint32_t x[4] = {4u << 16 | OpVariable, p_out_int[(cls[moved[k]] & 3) - 1][mcomp[k]], moved[k], SCOutput}; if (!put_n(&o, x, 4)) FAIL("out of memory"); }
-        }
-        if (op == OpVariable && len >= 4 && w[i + 2] < bound && cls[w[i + 2]] && i < first_fn) { i += len; continue; }   // re-emitted above
+        if (i == first_fn && !vka_fout_emit_hdr(&o->w, &o->n, &o->cap, mk_t, mk_p, t_ivec, p_out_int, cls, moved, mcomp, nmoved)) { snprintf(err, errn, "out of memory"); return 0; }
+        if (op == OpVariable && len >= 4 && w[i + 2] < bound && cls[w[i + 2]] && i < first_fn) { i += len; continue; }
         if ((op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < bound && cls[w[i + 3]]) {
-            int c = (cls[w[i + 3]] & 3) - 1; uint32_t r = w[i + 2];
-            if (r >= bound) FAIL("bad id");
-            if (len != 5 || !(cls[w[i + 3]] & 16)) FAIL("an access chain of %u indexes into a retyped output", len - 4);
-            cls[r] = (uint32_t)(c + 1);   // a component: pointer to the integer scalar
-            if (!put_n(&o, in, len)) FAIL("out of memory");
-            o.w[o.n - len + 1] = p_out_int[c][1];
-            i += len; continue;
+            int c = (int)(cls[w[i + 3]] & 3) - 1; uint32_t r = w[i + 2];
+            if (r >= bound || len != 5 || !(cls[w[i + 3]] & 16)) { snprintf(err, errn, r >= bound ? "bad id" : "an access chain of %u indexes into a retyped output", len - 4); return 0; }
+            cls[r] = (uint32_t)(c + 1);
+            if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
+            o->w[o->n - len + 1] = p_out_int[c][1]; i += len; continue;
         }
         if (op == OpStore && len >= 3 && w[i + 1] < bound && cls[w[i + 1]]) {
-            uint32_t p = w[i + 1], c = (cls[p] & 3) - 1, n = 1;
-            if (cls[p] & 16) { for (int k = 0; k < nmoved; k++) if (moved[k] == p) n = mcomp[k]; }
-            uint32_t tmp = nb++;
-            uint32_t x[4] = {4u << 16 | OpBitcast, t_ivec[c][n], tmp, w[i + 2]}; if (!put_n(&o, x, 4)) FAIL("out of memory");
-            if (!put_n(&o, in, len)) FAIL("out of memory");
-            o.w[o.n - len + 2] = tmp;
-            i += len; continue;
+            uint32_t p = w[i + 1], c = (cls[p] & 3) - 1, n = vka_fout_ncomp(cls, moved, mcomp, nmoved, p), tmp = (*nb)++;
+            uint32_t x[4] = {4u << 16 | OpBitcast, t_ivec[c][n], tmp, w[i + 2]};
+            if (!put_n(o, x, 4) || !put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
+            o->w[o->n - len + 2] = tmp; i += len; continue;
         }
         if (op == OpLoad && len >= 4 && w[i + 3] < bound && cls[w[i + 3]]) {
-            uint32_t p = w[i + 3], c = (cls[p] & 3) - 1, n = 1, ft = w[i + 1], r = w[i + 2], tmp = nb++;
-            if (cls[p] & 16) { for (int k = 0; k < nmoved; k++) if (moved[k] == p) n = mcomp[k]; }
-            if (!put_n(&o, in, len)) FAIL("out of memory");
-            o.w[o.n - len + 1] = t_ivec[c][n]; o.w[o.n - len + 2] = tmp;
-            uint32_t x[4] = {4u << 16 | OpBitcast, ft, r, tmp}; if (!put_n(&o, x, 4)) FAIL("out of memory");
+            uint32_t p = w[i + 3], c = (cls[p] & 3) - 1, n = vka_fout_ncomp(cls, moved, mcomp, nmoved, p), ft = w[i + 1], r = w[i + 2], tmp = (*nb)++;
+            uint32_t x[4] = {4u << 16 | OpBitcast, ft, r, tmp};
+            if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
+            o->w[o->n - len + 1] = t_ivec[c][n]; o->w[o->n - len + 2] = tmp;
+            if (!put_n(o, x, 4)) { snprintf(err, errn, "out of memory"); return 0; }
             i += len; continue;
         }
-        if (op != OpName && op != OpMemberName && op != OpEntryPoint && op != OpDecorate && op != OpMemberDecorate && op != OpDecorateId && op != OpDecorateString && op != OpMemberDecorateString
-            && i >= first_fn)
-            for (uint32_t k = 1; k < len; k++) if (!(op == OpExtInst && k == 4) && w[i + k] < bound && cls[w[i + k]]) FAIL("opcode %u uses a retyped output (id %u)", op, w[i + k]);
-        if (!put_n(&o, in, len)) FAIL("out of memory");
+        if (!vka_vin_special_ok(op) && i >= first_fn)
+            for (uint32_t k = 1; k < len; k++) if (!(op == OpExtInst && k == 4) && w[i + k] < bound && cls[w[i + k]]) { snprintf(err, errn, "opcode %u uses a retyped output (id %u)", op, w[i + k]); return 0; }
+        if (!put_n(o, in, len)) { snprintf(err, errn, "out of memory"); return 0; }
         i += len;
     }
-    o.w[3] = nb;
-    free(cls); free(loc); free(ty);
-    *out_nw = o.n; return o.w;
-fail:
-    free(cls); free(loc); free(ty); free(o.w);
-    return NULL;
-#undef FAIL
+    return 1;
+}
+
+uint32_t *vka_spv_fout_retype(const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask, size_t *out_nw, char *err, size_t errn) {
+    if (vka_spvpatch_fast_on()) return vka_spv_fout_retype_fast(w, nw, umask, smask, out_nw, err, errn);
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    if ((umask | smask) == 0 || (umask & smask)) { snprintf(err, errn, "no output, or an output both uint and int"); return NULL; }
+    vka_retype_tbl tbl;
+    tbl.bound = w[3]; tbl.use_heap = 1;
+    tbl.cls = calloc(w[3], 4); tbl.loc = malloc((size_t)w[3] * 4); tbl.ty = calloc(w[3], 4); tbl.ptee = calloc(w[3], 4);
+    if (!tbl.cls || !tbl.loc || !tbl.ty || !tbl.ptee) { vka_retype_tbl_free(&tbl); snprintf(err, errn, "out of memory"); return NULL; }
+    for (uint32_t i = 0; i < w[3]; i++) tbl.loc[i] = ~0u;
+    uint32_t t_ivec[2][5] = {{0}}, p_out_int[2][5] = {{0}}, moved[32] = {0}, mcomp[32] = {0}, need[2] = {0};
+    int nmoved = 0; size_t first_fn = nw;
+    int ok = vka_fout_scan_fast(w, nw, umask, smask, &tbl, t_ivec, p_out_int, moved, mcomp, &nmoved, need, &first_fn, err, errn);
+    uint32_t nb = w[3], mk_t[2][5] = {{0}}, mk_p[2][5] = {{0}};
+    if (ok) for (int c = 0; c < 2; c++) for (int n = 1; n <= 4; n++) if (need[c] >> n & 1) {
+        if (!t_ivec[c][n]) t_ivec[c][n] = mk_t[c][n] = nb++; if (!p_out_int[c][n]) p_out_int[c][n] = mk_p[c][n] = nb++;
+    }
+    if (ok && ((need[0] && !t_ivec[0][1]) || (need[1] && !t_ivec[1][1]))) { snprintf(err, errn, "no scalar type"); ok = 0; }
+    vec_t o = {0};
+    if (ok) ok = fout_emit_slow_body(w, nw, first_fn, w[3], tbl.cls, t_ivec, p_out_int, mk_t, mk_p, moved, mcomp, nmoved, &nb, &o, err, errn);
+    vka_retype_tbl_free(&tbl);
+    if (!ok) { free(o.w); return NULL; }
+    o.w[3] = nb; *out_nw = o.n; return o.w;
 }
 
 // vka_spv_spec_freeze: Qualcomm's Adreno 840 driver (Vulkan 1.4, driver 2150932524) reads SubgroupLocalInvocationId as 0 in every invocation of a compute or mesh shader
@@ -514,6 +440,7 @@ fail:
 // decorations are dropped. A malloc'd copy (*out_nw words); NULL when the module reads no lane built-in or has no SpecId (nothing to do), or has a specialization constant
 // composite or operation (not folded here)
 uint32_t *vka_spv_spec_freeze(const uint32_t *w, size_t nw, uint32_t spec_id, uint32_t value, size_t *out_nw) {
+    if (vka_spvpatch_fast_on()) return vka_spv_spec_freeze_fast(w, nw, spec_id, value, out_nw);
     if (nw < 5 || w[0] != 0x07230203) return NULL;
     enum { MAXSPEC = 16 }; uint32_t sid[MAXSPEC], sval[MAXSPEC]; int ns = 0, lane = 0;
     for (size_t i = 5; i < nw;) {
@@ -821,12 +748,18 @@ fail:
 // right before; else vertex 0), or a null value when the vertex shader does not write that location either (undefined on the hardware too). *copied / *nulled: the locations.
 // NULL with err empty: nothing to add
 enum { OpTypeArrayL = 28, OpConstantNullL = 46, OpEmitVertexL = 218, OpEmitStreamVertexL = 220, OpMemberDecorateL = 72, BIPositionL = 0, DecComponentL = 2 };
-typedef struct { const uint32_t *w; size_t n; uint32_t bound, *op, *a1, *a2, *a3; } spvmod_t;   // per id declared before the first function: its opcode and operands (smod_open)
+typedef struct { const uint32_t *w; size_t n; uint32_t bound, *op, *a1, *a2, *a3; int heap; uint32_t sop[VKA_SPV_SMOD_STACK], sa1[VKA_SPV_SMOD_STACK], sa2[VKA_SPV_SMOD_STACK], sa3[VKA_SPV_SMOD_STACK]; } spvmod_t;
 static int smod_open(spvmod_t *m, const uint32_t *w, size_t n) {
-    memset(m, 0, sizeof *m); m->w = w; m->n = n;
+    m->w = w; m->n = n; m->op = m->a1 = m->a2 = m->a3 = NULL; m->heap = 0;
     if (n < 5 || w[0] != 0x07230203) return 0;
     m->bound = w[3];
-    if (!(m->op = calloc(m->bound, 4)) || !(m->a1 = calloc(m->bound, 4)) || !(m->a2 = calloc(m->bound, 4)) || !(m->a3 = calloc(m->bound, 4))) return 0;
+    if (vka_spvpatch_fast_on() && m->bound <= VKA_SPV_SMOD_STACK) {
+        m->op = m->sop; m->a1 = m->sa1; m->a2 = m->sa2; m->a3 = m->sa3;
+        if (m->bound) { memset(m->op, 0, m->bound * 4u); memset(m->a1, 0, m->bound * 4u); memset(m->a2, 0, m->bound * 4u); memset(m->a3, 0, m->bound * 4u); }
+    } else {
+        m->heap = 1;
+        if (!(m->op = calloc(m->bound, 4)) || !(m->a1 = calloc(m->bound, 4)) || !(m->a2 = calloc(m->bound, 4)) || !(m->a3 = calloc(m->bound, 4))) return 0;
+    }
     for (size_t i = 5; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > n) return 0;
@@ -841,7 +774,7 @@ static int smod_open(spvmod_t *m, const uint32_t *w, size_t n) {
     }
     return 1;
 }
-static void smod_close(spvmod_t *m) { free(m->op); free(m->a1); free(m->a2); free(m->a3); }
+static void smod_close(spvmod_t *m) { if (m->heap) { free(m->op); free(m->a1); free(m->a2); free(m->a3); } }
 // A type's signature: kind (1 float, 2 int, 3 uint, all 32-bit) << 4 | components; 0 = not a 32-bit scalar or vector
 static uint32_t smod_sig(const spvmod_t *m, uint32_t t) {
     if (t >= m->bound) return 0;
@@ -853,8 +786,10 @@ static uint32_t smod_sig(const spvmod_t *m, uint32_t t) {
 }
 // The user Input or Output variables (sc) by Location: sig[loc] their type's signature (0 none, 0xff a location whose variable has another type or a Component)
 static void smod_io(const spvmod_t *m, uint32_t sc, uint8_t sig[32]) {
+    uint8_t scomp[VKA_SPV_SMOD_STACK], *comp; uint32_t sloc[VKA_SPV_SMOD_STACK], *loc; int heap = !(vka_spvpatch_fast_on() && m->bound <= VKA_SPV_SMOD_STACK);
     memset(sig, 0, 32);
-    uint8_t *comp = calloc(m->bound, 1); uint32_t *loc = malloc(m->bound * 4); if (!comp || !loc) { free(comp); free(loc); return; }
+    if (heap) { comp = calloc(m->bound, 1); loc = malloc(m->bound * 4); } else { comp = scomp; loc = sloc; if (m->bound) memset(comp, 0, m->bound); }
+    if (!comp || !loc) { if (heap) { free(comp); free(loc); } return; }
     for (uint32_t i = 0; i < m->bound; i++) loc[i] = ~0u;
     for (size_t i = 5; i < m->n;) {
         uint32_t op = m->w[i] & 0xffff, len = m->w[i] >> 16;
@@ -867,7 +802,7 @@ static void smod_io(const spvmod_t *m, uint32_t sc, uint8_t sig[32]) {
         uint32_t pt = m->a1[v], s = pt < m->bound && m->op[pt] == OpTypePointer ? smod_sig(m, m->a2[pt]) : 0;
         sig[loc[v]] = comp[v] || !s ? 0xff : (uint8_t)s;
     }
-    free(comp); free(loc);
+    if (heap) { free(comp); free(loc); }
 }
 uint32_t *vka_spv_gs_link(const uint32_t *gw, size_t gn, const uint32_t *vw, size_t vn, const uint32_t *fw, size_t fn, uint32_t *copied, uint32_t *nulled, size_t *out_nw, char *err, size_t errn) {
 #define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
