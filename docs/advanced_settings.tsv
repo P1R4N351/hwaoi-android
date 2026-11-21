@@ -112,6 +112,7 @@ DM_GRAPHICS_SCALE	developer	Game			text			both
 DM_GRAPHICS_SIZE	developer	Game			text			both							
 DM_GUEST_BASE	developer	Diagnostics			text			both							
 DM_GUEST_SPAWN_TEST	developer	Diagnostics			text			both							
+DM_HID_FAST	developer	Input			text			both							
 DM_HID_LOG	developer	Diagnostics			text			both							
 DM_HID_MAP	internal	Input			text			both						Mac or iOS only	
 DM_HID_PADS	internal	Input			text			both						Mac or iOS only	
@@ -815,4 +816,3 @@ DM_XCODE_PROJECT_DIR	developer	Diagnostics			text			both
 DM_XV_FILE	developer	Diagnostics			text			both							
 DM_YIELD_BACKOFF	developer	Game			text			both							
 DM_ZBIC_LIB	developer	Diagnostics			text			both							
-name	developer	Diagnostics			text			both							
