@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include "vk_android.h"
 #include "../nvn/nvn_mtl.h"
+#include "vka_present_fast.h"
 #include "vka_present_rot.h"
 #include "vka_present_fsr.h"
 #include "vka_present_scale.h"
@@ -33,6 +34,10 @@ __attribute__((weak)) void dm_guest_frame_tick(void) {}
 // ---------- The window ----------
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pcv = PTHREAD_COND_INITIALIZER;
+static vka_pq_sync g_pq_sync;
+static void pcv_wait(void) { g_pq_sync.waiters++; pthread_cond_wait(&g_pcv, &g_pmu); g_pq_sync.waiters--; }
+static int pcv_timedwait(const struct timespec *dl) { g_pq_sync.waiters++; int rc = pthread_cond_timedwait(&g_pcv, &g_pmu, dl); g_pq_sync.waiters--; return rc; }
+static void pcv_wake(void) { if (vka_pq_should_wake(g_pq_sync.waiters, vka_present_fast_on())) pthread_cond_broadcast(&g_pcv); }
 static ANativeWindow *g_win_new; static uint64_t g_win_gen, g_win_ack;   // set by nxhost_set_window; the present thread takes it and acknowledges the generation
 static int g_thread_up;
 static void *selftest_main(void *arg);
@@ -45,10 +50,10 @@ void nxhost_set_window(ANativeWindow *w) {
     pthread_mutex_lock(&g_pmu);
     if (g_win_new) ANativeWindow_release(g_win_new);   // never taken by the present thread
     g_win_new = w; uint64_t gen = ++g_win_gen;
-    pthread_cond_broadcast(&g_pcv);
+    pcv_wake();
     if (!w && g_thread_up) {   // surfaceDestroyed: the swapchain must be gone before the launcher returns
         struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 2;
-        while (g_win_ack < gen) if (pthread_cond_timedwait(&g_pcv, &g_pmu, &dl)) { VRED("the present thread did not let the window go within 2 s"); break; }
+        while (g_win_ack < gen) if (pcv_timedwait(&dl)) { VRED("the present thread did not let the window go within 2 s"); break; }
     }
     pthread_mutex_unlock(&g_pmu);
     VLOG("window %p%s", (void *)w, w ? "" : " (none: presents are dropped)");
@@ -66,6 +71,10 @@ static VkCommandPool g_ppool; static unsigned g_fi;
 static uint64_t g_refresh_ns, g_last_desired, g_drawable_ns;
 static int g_recreate;
 static struct { uint64_t n; double t; } g_pres[PRING];
+static vka_pres_ring512 g_pres_fast;
+static vka_pres_dset_memo g_pres_dset_memo;
+static uint64_t g_fsr_mid_rev[NFRAME], g_fsr_mid_next;
+static vka_pres_cfg g_pres_cfg;
 static VkSurfaceTransformFlagBitsKHR g_pre = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;   // the swapchain's preTransform
 static VkImageView g_sview[MAXIMG];   // the swapchain images as colour attachments (pre-rotation, FSR, the overlay)
 // Device scaling (DM_VK_PRESENT_SCALE=device): a picture scaled up gets a swapchain whose extent is the window's size divided by the picture's scale, so the picture fills
@@ -90,9 +99,38 @@ static struct { ROT_FNS(VKA_DECL) } rk;   // loaded here: the replay's table (vk
 static struct { int state; VkFormat fmt; VkPipeline pipe; VkPipelineLayout lay; VkDescriptorSetLayout dsl; VkDescriptorPool pool; VkDescriptorSet set[NFRAME]; VkSampler samp[2]; } g_rot;
 static int rot_rotates(VkSurfaceTransformFlagBitsKHR t) { return t == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || t == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR || t == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR; }
 static int rot_quarter(VkSurfaceTransformFlagBitsKHR t) { return t == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR || t == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR; }
-static int stretch_wanted(void) { return VKA_ENV("DM_VK_STRETCH", 0) != 0; }   // Game settings › Display: Stretch to screen
-static int picture_size(void) { return vka_fit_size(VKA_ENV("DM_VK_PICTURE_SIZE", 100)); }   // the in-game panel's Picture size, % of the fitted (or stretched) size
-static int rot_wanted(void) { return VKA_ENV("DM_VK_PRETRANSFORM", 1) != 0; }   // live: a change makes a new swapchain (present_one)
+static const char *const g_ps_names_cfg[6] = {"nearest", "bilinear", "bicubic", "fsr1", "sgsr1", "device"};
+static void pres_cfg_load(vka_pres_cfg *c) {
+    static int told = -1; int i;
+    c->stretch = VKA_ENV("DM_VK_STRETCH", 0) != 0;
+    c->pic_pct = vka_fit_size(VKA_ENV("DM_VK_PICTURE_SIZE", 100));
+    c->rot = VKA_ENV("DM_VK_PRETRANSFORM", 1) != 0;
+    c->ps = -1;
+    char b[32];
+    if (vka_env_str("DM_VK_PRESENT_SCALE", b, sizeof b) && b[0]) {
+        for (i = 0; i < 6; i++) if (!strcasecmp(b, g_ps_names_cfg[i])) c->ps = i;
+        if (c->ps < 0) VRED_ONCE("DM_VK_PRESENT_SCALE=%s is not nearest, bilinear, bicubic, fsr1, sgsr1 or device: DM_VK_FSR and DM_VK_PRESENT_NEAREST decide", b);
+    }
+    if (c->ps != told) { told = c->ps; if (c->ps >= 0) VLOG("present scaling: %s (DM_VK_PRESENT_SCALE)", g_ps_names_cfg[c->ps]); else VLOG("present scaling: DM_VK_FSR and DM_VK_PRESENT_NEAREST (DM_VK_PRESENT_SCALE unset)"); }
+    c->fsr_env = VKA_ENV("DM_VK_FSR", 0) != 0; c->near_env = VKA_ENV("DM_VK_PRESENT_NEAREST", 0) != 0;
+    c->ownfmt = VKA_ENV("DM_VK_PRESENT_OWNFMT", 1) != 0; c->prewait = VKA_ENV("DM_VK_PRESENT_PREWAIT", 1) != 0;
+    c->fr_on = VKA_ENV("DM_VK_FRAME_RATE", 1) != 0;
+    int f_h = VKA_ENV("DM_VK_FRAME_RATE_HOLD", 5000);
+    c->fr_hold_ms = f_h > 0 ? (uint64_t)f_h : 0u;
+    int aw = 0, ah = 0;
+    if (vka_parse_aspect_fast(getenv("DM_VK_PICTURE_ASPECT"), &aw, &ah, 0)) { c->aspect_w = aw; c->aspect_h = ah; } else { c->aspect_w = 0; c->aspect_h = 0; }
+    c->fsr_sharp = VKA_ENVF("DM_VK_FSR_SHARP", 0.25);
+    float st = (float)c->fsr_sharp, rcas = st < 0 ? 0.0f : exp2f(-st);
+    memcpy(&c->rcas_con0_bits, &rcas, sizeof c->rcas_con0_bits);
+    c->gate_wait_turnip_ns = (uint64_t)(VKA_ENVF("DM_VK_PRESENT_GATE_WAIT", 30.0) * 1e6);
+    c->gate_wait_other_ns = (uint64_t)(VKA_ENVF("DM_VK_PRESENT_GATE_WAIT", 0.0) * 1e6);
+}
+static const vka_pres_cfg *pres_cfg_get(void) {
+    return vka_pres_cfg_sync(&g_pres_cfg, atomic_load_explicit(&vka_env_gen, memory_order_relaxed), pres_cfg_load, 0);
+}
+static int stretch_wanted(void) { return vka_present_fast_on() ? pres_cfg_get()->stretch : VKA_ENV("DM_VK_STRETCH", 0) != 0; }
+static int picture_size(void) { return vka_present_fast_on() ? pres_cfg_get()->pic_pct : vka_fit_size(VKA_ENV("DM_VK_PICTURE_SIZE", 100)); }
+static int rot_wanted(void) { return vka_present_fast_on() ? pres_cfg_get()->rot : VKA_ENV("DM_VK_PRETRANSFORM", 1) != 0; }
 // rk's functions, loaded once for the rotated copy and the FSR passes: 1 = loaded
 static int rk_load(void) {
     static int ok = -1;
@@ -193,12 +231,12 @@ static const VkComponentMapping g_swz_rb = {.r = VK_COMPONENT_SWIZZLE_B, .g = VK
 // device: the display hardware scales instead (see "Device scaling" at swap_create). Present thread only
 enum { PS_NEAREST, PS_BILINEAR, PS_BICUBIC, PS_FSR1, PS_SGSR1, PS_DEVICE, PS_N };
 static const char *const g_ps_names[PS_N] = {"nearest", "bilinear", "bicubic", "fsr1", "sgsr1", "device"};
-static int present_scale(void) {   // a PS_ value, or -1: unset (or not one of the names)
+static int present_scale(void) {
+    if (vka_present_fast_on()) return pres_cfg_get()->ps;
     static uint32_t gen; static int v = -1, told = -1;
     uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
     if (g == gen) return v;
-    gen = g; v = -1;
-    char b[32];
+    gen = g; v = -1; char b[32];
     if (vka_env_str("DM_VK_PRESENT_SCALE", b, sizeof b) && b[0]) {
         for (int i = 0; i < PS_N; i++) if (!strcasecmp(b, g_ps_names[i])) v = i;
         if (v < 0) VRED_ONCE("DM_VK_PRESENT_SCALE=%s is not nearest, bilinear, bicubic, fsr1, sgsr1 or device: DM_VK_FSR and DM_VK_PRESENT_NEAREST decide", b);
@@ -206,9 +244,9 @@ static int present_scale(void) {   // a PS_ value, or -1: unset (or not one of t
     if (v != told) { told = v; if (v >= 0) VLOG("present scaling: %s (DM_VK_PRESENT_SCALE)", g_ps_names[v]); else VLOG("present scaling: DM_VK_FSR and DM_VK_PRESENT_NEAREST (DM_VK_PRESENT_SCALE unset)"); }
     return v;
 }
-static int fsr_wanted(void) { int ps = present_scale(); return ps < 0 ? VKA_ENV("DM_VK_FSR", 0) != 0 : ps == PS_FSR1; }
-static int nearest_wanted(void) { int ps = present_scale(); return ps < 0 ? VKA_ENV("DM_VK_PRESENT_NEAREST", 0) != 0 : ps == PS_NEAREST; }
-static int one_pass_wanted(void) { int ps = present_scale(); return ps == PS_BICUBIC || ps == PS_SGSR1 ? ps : -1; }   // scale_copy's scaler, or -1
+static int fsr_wanted(void) { int ps = present_scale(); return ps < 0 ? (vka_present_fast_on() ? pres_cfg_get()->fsr_env : VKA_ENV("DM_VK_FSR", 0) != 0) : ps == PS_FSR1; }
+static int nearest_wanted(void) { int ps = present_scale(); return ps < 0 ? (vka_present_fast_on() ? pres_cfg_get()->near_env : VKA_ENV("DM_VK_PRESENT_NEAREST", 0) != 0) : ps == PS_NEAREST; }
+static int one_pass_wanted(void) { int ps = present_scale(); return ps == PS_BICUBIC || ps == PS_SGSR1 ? ps : -1; }
 
 // The letterboxed picture [dx, dx + dw) x [dy, dy + dh) of the display (what the user sees, g_ext turned back by g_pre) from the texture's crop, drawn into swapchain image idx
 // turned by g_pre: the preTransform is the turn applied to the content before presentation, so ROTATE_90 draws the picture a quarter turn clockwise, and the display's
@@ -223,9 +261,12 @@ static void rot_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, 
     vk.vkCmdBeginRendering(cb, &ri);
     VkImageView view = ok ? vka_view(im, g_pfmt ? g_pfmt : raw_unorm_twin(im->f.vk), VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, vka_swap_rb() ? &g_swz_rb : NULL) : VK_NULL_HANDLE;
     if (view) {
-        VkDescriptorImageInfo ii = {g_rot.samp[linear && !nearest_wanted()], view, VK_IMAGE_LAYOUT_GENERAL};   // nearest_wanted: the launcher's Upscaler or Screen scaling, nearest neighbor
-        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_rot.set[k], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
-        vk.vkUpdateDescriptorSets(V.dev, 1, &w, 0, NULL);
+        int si = linear && !nearest_wanted();
+        if (!vka_present_fast_on() || vka_pres_rot_need_write(&g_pres_dset_memo, k, im->serial, (uint64_t)(uintptr_t)im->img, (uint64_t)(uintptr_t)view, si, 0)) {
+            VkDescriptorImageInfo ii = {g_rot.samp[si], view, VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_rot.set[k], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+            vk.vkUpdateDescriptorSets(V.dev, 1, &w, 0, NULL);
+        }
         float W = (float)g_ext.width, H = (float)g_ext.height;   // the image; the display is H x W for a quarter turn
         VkViewport v = {0, 0, 0, 0, 0, 1};
         float a, b, c, d;   // display-local (ul, vl) = (a px + b py + e, c px + d py + f) for the viewport's own (px, py)
@@ -329,6 +370,7 @@ static void fsr_free(unsigned k) {
     if (g_fsr.mid[k]) vk.vkDestroyImage(V.dev, g_fsr.mid[k], NULL);
     if (g_fsr.mem[k]) vk.vkFreeMemory(V.dev, g_fsr.mem[k], NULL);
     g_fsr.view[k] = VK_NULL_HANDLE; g_fsr.mid[k] = VK_NULL_HANDLE; g_fsr.mem[k] = VK_NULL_HANDLE; g_fsr.mw[k] = g_fsr.mh[k] = 0;
+    g_fsr_mid_rev[k] = 0u; vka_pres_dset_clear_mid(&g_pres_dset_memo, k);
 }
 // Frame k's intermediate image at w x h: made again when the size changes (frame k's fence is waited for, so nothing reads the old one). 1 = ready
 static int fsr_mid(unsigned k, uint32_t w, uint32_t h) {
@@ -345,46 +387,77 @@ static int fsr_mid(unsigned k, uint32_t w, uint32_t h) {
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_fsr.mid[k], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (!r) r = vk.vkCreateImageView(V.dev, &vi, NULL, &g_fsr.view[k]);
     if (r) { VRED_ONCE("FSR: intermediate image %ux%u: %d; the picture is blitted", w, h, r); return 0; }
-    g_fsr.mw[k] = w; g_fsr.mh[k] = h;
+    g_fsr.mw[k] = w; g_fsr.mh[k] = h; g_fsr_mid_rev[k] = ++g_fsr_mid_next;
     return 1;
 }
 static uint32_t fsr_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 // The texture's crop [cx, cx + cw) x [cy, cy + ch) scaled to [dx, dx + dw) x [dy, dy + dh) of swapchain image idx, the rest black. The constants are AMD's FsrEasuConOffset and
 // FsrRcasCon (ffx_fsr1.h) in C; for a lower-left origin (the texture stored bottom-up) EASU's rows are read from the bottom: con0's y scale negated and its offset from the crop's top.
 // 0 = nothing recorded (the texture has no view to sample): the caller blits
+static void fsr_update_sets(unsigned k, const vka_img *im, VkImageView src_v) {
+    int fast = vka_present_fast_on();
+    int w0 = !fast || vka_pres_fsr_src_need_write(&g_pres_dset_memo, k, im->serial, (uint64_t)(uintptr_t)im->img, (uint64_t)(uintptr_t)src_v, 0);
+    int w1 = !fast || vka_pres_fsr_mid_need_write(&g_pres_dset_memo, k, g_fsr_mid_rev[k], 0);
+    VkDescriptorImageInfo ii[2] = {{g_fsr.samp, src_v, VK_IMAGE_LAYOUT_GENERAL}, {g_fsr.samp, g_fsr.view[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet w[2]; unsigned nw = 0;
+    if (w0) w[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][0], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]};
+    if (w1) w[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][1], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[1]};
+    if (nw) vk.vkUpdateDescriptorSets(V.dev, nw, w, 0, NULL);
+}
+static int fsr_draw_easu_sc(VkCommandBuffer cb, unsigned k, uint32_t idx, const float easu[16], int dx, int dy, int dw, int dh) {
+    uint32_t pc[16]; for (int i = 0; i < 16; i++) pc[i] = fsr_bits(easu[i]);
+    float e2 = easu[2] - dx * easu[0], e3 = easu[3] - dy * easu[1]; pc[2] = fsr_bits(e2); pc[3] = fsr_bits(e3);
+    VkViewport vd = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; VkRect2D sd = {{0, 0}, g_ext};
+    vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo cd = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_sview[idx], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = {.color = {{0, 0, 0, 1}}}};
+    VkRenderingInfo rd = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = sd, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &cd};
+    vk.vkCmdBeginRendering(cb, &rd);
+    rk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.easu_sc);
+    rk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.lay, 0, 1, &g_fsr.set[k][0], 0, NULL);
+    rk.vkCmdPushConstants(cb, g_fsr.lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    rk.vkCmdSetViewport(cb, 0, 1, &vd); rk.vkCmdSetScissor(cb, 0, 1, &sd); rk.vkCmdDraw(cb, 3, 1, 0, 0);
+    vk.vkCmdEndRendering(cb);
+    vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    return 1;
+}
+static void fsr_draw_rcas(VkCommandBuffer cb, unsigned k, uint32_t idx, int dx, int dy, int dw, int dh) {
+    int W = (int)g_ext.width, H = (int)g_ext.height, m[6]; VkViewport v;
+    switch (g_pre) {
+    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:  v = (VkViewport){(float)(W - dy - dh), (float)dx, (float)dh, (float)dw, 0, 1}; memcpy(m, (int[6]){0, -1, 1, 0, -dx, W - 1 - dy}, sizeof m); break;
+    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: v = (VkViewport){(float)dy, (float)(H - dx - dw), (float)dh, (float)dw, 0, 1}; memcpy(m, (int[6]){0, 1, -1, 0, H - 1 - dx, -dy}, sizeof m); break;
+    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: v = (VkViewport){(float)(W - dx - dw), (float)(H - dy - dh), (float)dw, (float)dh, 0, 1}; memcpy(m, (int[6]){-1, 0, 0, -1, W - 1 - dx, H - 1 - dy}, sizeof m); break;
+    default:                                      v = (VkViewport){(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; memcpy(m, (int[6]){1, 0, 0, 1, -dx, -dy}, sizeof m); break;
+    }
+    uint32_t pc[16] = {0};
+    if (vka_present_fast_on()) pc[0] = pres_cfg_get()->rcas_con0_bits;
+    else { float st = (float)VKA_ENVF("DM_VK_FSR_SHARP", 0.25); pc[0] = fsr_bits(st < 0 ? 0.0f : exp2f(-st)); }
+    memcpy(&pc[4], m, sizeof m);
+    VkRect2D sc = {{0, 0}, g_ext};
+    vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_sview[idx], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = {.color = {{0, 0, 0, 1}}}};
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = sc, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vk.vkCmdBeginRendering(cb, &ri);
+    rk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.rcas);
+    rk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.lay, 0, 1, &g_fsr.set[k][1], 0, NULL);
+    rk.vkCmdPushConstants(cb, g_fsr.lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    rk.vkCmdSetViewport(cb, 0, 1, &v); rk.vkCmdSetScissor(cb, 0, 1, &sc); rk.vkCmdDraw(cb, 3, 1, 0, 0);
+    vk.vkCmdEndRendering(cb);
+    vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+}
 static int fsr_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
     VkImageView src = vka_view(im, g_pfmt ? g_pfmt : raw_unorm_twin(im->f.vk), VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL);
     if (!src) { VRED_ONCE("FSR: window texture serial %llu (format %#x) has no view to sample: blitted", (unsigned long long)im->serial, im->d.format); return 0; }
-    vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
-    VkDescriptorImageInfo ii[2] = {{g_fsr.samp, src, VK_IMAGE_LAYOUT_GENERAL}, {g_fsr.samp, g_fsr.view[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-    VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][0], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
-                                 {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][1], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[1]}};
-    vk.vkUpdateDescriptorSets(V.dev, 2, w, 0, NULL);
+    vka_barrier(cb);
+    fsr_update_sets(k, im, src);
     float sx = (float)cw / dw, sy = (float)ch / dh, rw = 1.0f / im->w, rh = 1.0f / im->h;
     float easu[16] = {sx, sy, 0.5f * sx - 0.5f + cx, 0.5f * sy - 0.5f + cy, rw, rh, rw, -rh, -rw, 2 * rh, rw, 2 * rh, 0, 4 * rh, 0, 0};
     if (vka_origin_ll()) { easu[1] = -sy; easu[3] = cy + ch - 0.5f * sy - 0.5f; }
-    uint32_t pc[16];
-    for (int i = 0; i < 16; i++) pc[i] = fsr_bits(easu[i]);
-    // Sharpening off (DM_VK_FSR_SHARP below 0) and no turn: EASU draws straight into the letterbox of the swapchain image, no intermediate image and no RCAS pass. Its fragment
-    // coordinates then start at the letterbox corner, so the constants' offsets move by (dx, dy) in output pixels
-    if (VKA_ENVF("DM_VK_FSR_SHARP", 0.25) < 0 && g_fsr.easu_sc && (g_pre == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR || !g_pre)) {
-        float e2 = easu[2] - dx * easu[0], e3 = easu[3] - dy * easu[1]; pc[2] = fsr_bits(e2); pc[3] = fsr_bits(e3);
-        VkViewport vd = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; VkRect2D sd = {{0, 0}, g_ext};
-        vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        VkRenderingAttachmentInfo cd = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_sview[idx], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = {.color = {{0, 0, 0, 1}}}};   // the bars
-        VkRenderingInfo rd = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = sd, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &cd};
-        vk.vkCmdBeginRendering(cb, &rd);
-        rk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.easu_sc);
-        rk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.lay, 0, 1, &g_fsr.set[k][0], 0, NULL);
-        rk.vkCmdPushConstants(cb, g_fsr.lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
-        rk.vkCmdSetViewport(cb, 0, 1, &vd);
-        rk.vkCmdSetScissor(cb, 0, 1, &sd);
-        rk.vkCmdDraw(cb, 3, 1, 0, 0);
-        vk.vkCmdEndRendering(cb);
-        vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        return 1;
-    }
+    double fsr_s = vka_present_fast_on() ? pres_cfg_get()->fsr_sharp : VKA_ENVF("DM_VK_FSR_SHARP", 0.25);
+    if (fsr_s < 0 && g_fsr.easu_sc && (g_pre == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR || !g_pre))
+        return fsr_draw_easu_sc(cb, k, idx, easu, dx, dy, dw, dh);
+    uint32_t pc[16]; for (int i = 0; i < 16; i++) pc[i] = fsr_bits(easu[i]);
     VkViewport v = {0, 0, (float)dw, (float)dh, 0, 1}; VkRect2D sc = {{0, 0}, {(uint32_t)dw, (uint32_t)dh}};
     vka_img_barrier(cb, g_fsr.mid[k], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_fsr.view[k], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -394,41 +467,12 @@ static int fsr_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, i
     rk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.easu);
     rk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.lay, 0, 1, &g_fsr.set[k][0], 0, NULL);
     rk.vkCmdPushConstants(cb, g_fsr.lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
-    rk.vkCmdSetViewport(cb, 0, 1, &v);
-    rk.vkCmdSetScissor(cb, 0, 1, &sc);
-    rk.vkCmdDraw(cb, 3, 1, 0, 0);
+    rk.vkCmdSetViewport(cb, 0, 1, &v); rk.vkCmdSetScissor(cb, 0, 1, &sc); rk.vkCmdDraw(cb, 3, 1, 0, 0);
     vk.vkCmdEndRendering(cb);
     vka_img_barrier(cb, g_fsr.mid[k], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // RCAS: con0 = FsrRcasCon's (its packed half at word 1 is for the 16-bit path, unused here); words 4-9 turn the swapchain pixel q back to the picture's,
-    // q.x * (4, 5) + q.y * (6, 7) + (8, 9): rot_copy's turns in whole pixels (ROTATE_90: the picture's (x, y) = (q.y - dx, W - 1 - dy - q.x)), the viewport as rot_copy's
-    int W = (int)g_ext.width, H = (int)g_ext.height, m[6];
-    switch (g_pre) {
-    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:  v = (VkViewport){(float)(W - dy - dh), (float)dx, (float)dh, (float)dw, 0, 1}; memcpy(m, (int[6]){0, -1, 1, 0, -dx, W - 1 - dy}, sizeof m); break;
-    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: v = (VkViewport){(float)dy, (float)(H - dx - dw), (float)dh, (float)dw, 0, 1}; memcpy(m, (int[6]){0, 1, -1, 0, H - 1 - dx, -dy}, sizeof m); break;
-    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: v = (VkViewport){(float)(W - dx - dw), (float)(H - dy - dh), (float)dw, (float)dh, 0, 1}; memcpy(m, (int[6]){-1, 0, 0, -1, W - 1 - dx, H - 1 - dy}, sizeof m); break;
-    default:                                      v = (VkViewport){(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; memcpy(m, (int[6]){1, 0, 0, 1, -dx, -dy}, sizeof m); break;
-    }
-    memset(pc, 0, sizeof pc);
-    { float st = (float)VKA_ENVF("DM_VK_FSR_SHARP", 0.25);   // below 0: no sharpening at all (RCAS's strength 0 leaves every pixel as EASU made it; the pass still places and turns it)
-      pc[0] = fsr_bits(st < 0 ? 0.0f : exp2f(-st)); }
-    memcpy(&pc[4], m, sizeof m);
-    sc = (VkRect2D){{0, 0}, g_ext};
-    vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    ca = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_sview[idx], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = {.color = {{0, 0, 0, 1}}}};   // the bars
-    ri.renderArea = sc;
-    vk.vkCmdBeginRendering(cb, &ri);
-    rk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.rcas);
-    rk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.lay, 0, 1, &g_fsr.set[k][1], 0, NULL);
-    rk.vkCmdPushConstants(cb, g_fsr.lay, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
-    rk.vkCmdSetViewport(cb, 0, 1, &v);
-    rk.vkCmdSetScissor(cb, 0, 1, &sc);
-    rk.vkCmdDraw(cb, 3, 1, 0, 0);
-    vk.vkCmdEndRendering(cb);
-    vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    fsr_draw_rcas(cb, k, idx, dx, dy, dw, dh);
     return 1;
 }
-
 // ---------- One-pass scalers: bicubic and SGSR 1 straight into the swapchain image (vka_present_scale.h) ----------
 // DM_VK_PRESENT_SCALE=bicubic (Catmull-Rom, 9 bilinear fetches) or sgsr1 (Qualcomm's SGSR 1, the neural upscaler's filter as a fragment pass): one draw over the letterbox of
 // the swapchain image, the bars cleared by the same pass, turned for pre-rotation as RCAS is; no intermediate image. The FSR passes' layout, sets and sampler (fsr_base);
@@ -454,9 +498,11 @@ static int scale_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im,
     if (!src) { VRED_ONCE("present scaling: window texture serial %llu (format %#x) has no view to sample: drawn bilinear", (unsigned long long)im->serial, im->d.format); return 0; }
     if (g_one.told != which) { g_one.told = which; VLOG("present scaling %s on: one pass into the swapchain image", which == PS_SGSR1 ? "SGSR 1" : "bicubic (Catmull-Rom)"); }
     vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
-    VkDescriptorImageInfo ii = {g_fsr.samp, src, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][0], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
-    vk.vkUpdateDescriptorSets(V.dev, 1, &wr, 0, NULL);
+    if (!vka_present_fast_on() || vka_pres_fsr_src_need_write(&g_pres_dset_memo, k, im->serial, (uint64_t)(uintptr_t)im->img, (uint64_t)(uintptr_t)src, 0)) {
+        VkDescriptorImageInfo ii = {g_fsr.samp, src, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][0], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+        vk.vkUpdateDescriptorSets(V.dev, 1, &wr, 0, NULL);
+    }
     int W = (int)g_ext.width, H = (int)g_ext.height;
     struct { int32_t m[6]; float pad[2], uv[4], tex[4]; } pc; memset(&pc, 0, sizeof pc);
     VkViewport v;
@@ -664,7 +710,7 @@ static void swap_destroy(int surface_too) {
     g_nimg = 0;
     if (g_swap) vk.vkDestroySwapchainKHR(V.dev, g_swap, NULL);
     g_swap = VK_NULL_HANDLE;
-    if (surface_too && g_surf) { vk.vkDestroySurfaceKHR(V.inst, g_surf, NULL); g_surf = VK_NULL_HANDLE; }
+    if (surface_too) { vka_pres_dset_reset(&g_pres_dset_memo); if (g_surf) { vk.vkDestroySurfaceKHR(V.inst, g_surf, NULL); g_surf = VK_NULL_HANDLE; } }
 }
 static int swap_create(void) {
     VkSurfaceCapabilitiesKHR caps; VkResult r = vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, g_surf, &caps);
@@ -752,7 +798,7 @@ static void window_take(void) {   // g_pmu held
         else swap_create();
     }
     pthread_mutex_lock(&g_pmu);
-    g_win_ack = gen; pthread_cond_broadcast(&g_pcv);
+    g_win_ack = gen; pcv_wake();
 }
 
 // ---------- The present queue ----------
@@ -760,7 +806,7 @@ typedef struct { tex_t t; double period; int crop[4], has_crop; uint64_t ticket,
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in, g_pq_read, g_pq_done, g_pq_fill;   // tickets: reserved, taken by the present thread, shown; filled (a ticket is reserved by the game's present, filled when the replay reaches it: vka_worker.c)
 
-static void pres_note(uint64_t n, double t) { if (!n) return; g_pres[n % PRING].n = n; g_pres[n % PRING].t = t; }
+static void pres_note(uint64_t n, double t) { if (!n) return; g_pres[n % PRING].n = n; g_pres[n % PRING].t = t; vka_pres_ring_note(&g_pres_fast, n, t); }
 static void timing_poll(void) {
     if (!V.display_timing || !g_swap || !vk.vkGetPastPresentationTimingGOOGLE) return;
     VkPastPresentationTimingGOOGLE pt[16]; uint32_t n = 16;
@@ -792,9 +838,10 @@ static void suboptimal(void) {
 static void frame_rate(double period) {
     int fps = period > 0 ? (int)(1 / period + 0.5) : 0;
     if (fps < 10 || fps > 240 || !g_win) return;
-    if (!VKA_ENV("DM_VK_FRAME_RATE", 1)) return;
+    int fast = vka_present_fast_on(); const vka_pres_cfg *cfg = fast ? pres_cfg_get() : NULL;
+    if (!(fast ? cfg->fr_on : VKA_ENV("DM_VK_FRAME_RATE", 1))) return;
     {   static int top; static uint64_t top_t;   // the highest rate within the hold; when the game last ran at it
-        uint64_t now = now_ns(), hold = (uint64_t)VKA_ENV("DM_VK_FRAME_RATE_HOLD", 5000) * 1000000ull;
+        uint64_t now = now_ns(), hold = (fast ? cfg->fr_hold_ms : (uint64_t)VKA_ENV("DM_VK_FRAME_RATE_HOLD", 5000)) * 1000000ull;
         if (fps >= top || !hold || now - top_t > hold) { top = fps; top_t = now; }
         fps = top;
     }
@@ -825,19 +872,20 @@ static void refresh_poll(void) {
 static VkFormat present_fmt(const pq_item *it, const vka_img *im) {
     if (!im) return VK_FORMAT_UNDEFINED;
     VkFormat own = raw_unorm_twin(im->f.vk); vka_fmt wf;
-    if (it->src || !VKA_ENV("DM_VK_PRESENT_OWNFMT", 1) || !vka_fmt_of(it->t.d.format, &wf)) return own;
+    int own_on = vka_present_fast_on() ? pres_cfg_get()->ownfmt : VKA_ENV("DM_VK_PRESENT_OWNFMT", 1);
+    if (it->src || !own_on || !vka_fmt_of(it->t.d.format, &wf)) return own;
     VkFormat w = raw_unorm_twin(wf.vk);
     if (w == own || !(vkfl_has(&im->fl, im->f.vk, w) || vkfl_has(&im->fl, im->f.vk, wf.vk))) return own;
     static int told; if (!told++) VLOG("present: window texture serial %llu (NVN format %#x, VkFormat %d) shares an image of VkFormat %d: presented through a view in its own format",
                                       (unsigned long long)it->t.serial, it->t.d.format, wf.vk, im->f.vk);
     return w;
 }
-static int present_one(const pq_item *it) {
+static int present_frame_prep(const pq_item *it, vka_img **im_out, int *ownfmt_out, unsigned *k_out, uint32_t *idx_out) {
     if (!g_surf || vka_hung()) return 0;
     { static int rw = -1; int w = rot_wanted(); if (rw >= 0 && w != rw) { VLOG("DM_VK_PRETRANSFORM=%d: new swapchain", w); g_recreate = 1; } rw = w; }
-    if (!g_swap || g_recreate) { if (g_swap) { swap_destroy(0); } if (!swap_create()) return 0; }
+    if (!g_swap || g_recreate) { if (g_swap) swap_destroy(0); if (!swap_create()) return 0; }
     vka_img *im = it->src ? vka_tex_ref(it->src) : vka_tex_acquire(it->t.serial);
-    g_pfmt = present_fmt(it, im); int ownfmt = im && g_pfmt != raw_unorm_twin(im->f.vk);   // a view in the window texture's format: sampled, never blitted (a blit reads the image's format)
+    g_pfmt = present_fmt(it, im); int ownfmt = im && g_pfmt != raw_unorm_twin(im->f.vk);
     unsigned k = g_fi++ % NFRAME;
     if (!g_fr[k].cb) {
         if (!g_ppool) { VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qf}; vk.vkCreateCommandPool(V.dev, &pi, NULL, &g_ppool); }
@@ -845,114 +893,109 @@ static int present_one(const pq_item *it) {
         VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT}; VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vk.vkAllocateCommandBuffers(V.dev, &ai, &g_fr[k].cb); vk.vkCreateFence(V.dev, &fi, NULL, &g_fr[k].fence); vk.vkCreateSemaphore(V.dev, &sci, NULL, &g_fr[k].acq);
     }
-    // The frame's last copy done, bounded: after a GPU hang (vka_dev.c) nothing more is presented
-    for (VkResult w; !vka_hung() && (w = vk.vkWaitForFences(V.dev, 1, &g_fr[k].fence, VK_TRUE, 100000000ull)) == VK_TIMEOUT;) {}
+    for (unsigned wi = 0; wi < 60000u && !vka_hung() && vk.vkWaitForFences(V.dev, 1, &g_fr[k].fence, VK_TRUE, 100000000ull) == VK_TIMEOUT; wi++) {}
     if (vka_hung()) { VRED_ONCE("GPU hang: nothing more is presented"); vka_tex_drop(im); return 0; }
     if (g_fr[k].held) { vka_tex_drop(g_fr[k].held); g_fr[k].held = NULL; }
-    if (g_fsr.mid[k] && !fsr_wanted()) fsr_free(k);   // FSR switched off live: frame k's fence is signalled, so its intermediate image is no longer read
+    if (g_fsr.mid[k] && !fsr_wanted()) fsr_free(k);
     uint32_t idx; uint64_t t0 = now_ns();
     VkResult r = vk.vkAcquireNextImageKHR(V.dev, g_swap, 1000000000ull, g_fr[k].acq, VK_NULL_HANDLE, &idx);
     g_drawable_ns += now_ns() - t0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { g_recreate = 1; vka_tex_drop(im); return 0; }
-    if (r == VK_SUBOPTIMAL_KHR) suboptimal();   // presented this once; the next present recreates when the size or the rotation changed
+    if (r == VK_SUBOPTIMAL_KHR) suboptimal();
     if (r && r != VK_SUBOPTIMAL_KHR) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("vkAcquireNextImageKHR %d", r); vka_tex_drop(im); return 0; }
-    vk.vkResetFences(V.dev, 1, &g_fr[k].fence);
-    VkCommandBuffer cb = g_fr[k].cb; vk.vkResetCommandBuffer(cb, 0);
+    vk.vkResetFences(V.dev, 1, &g_fr[k].fence); vk.vkResetCommandBuffer(g_fr[k].cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    vk.vkBeginCommandBuffer(cb, &bi);
-    int cx = 0, cy = 0, cw = im ? (int)im->w : 1, ch = im ? (int)im->h : 1;
-    if (it->has_crop && it->crop[2] > 0 && it->crop[3] > 0) { cx = it->crop[0]; cy = it->crop[1]; cw = it->crop[2]; ch = it->crop[3]; }
-    int ew = (int)(rot_quarter(g_pre) ? g_ext.height : g_ext.width), eh = (int)(rot_quarter(g_pre) ? g_ext.width : g_ext.height);   // the display, as the user sees it
-    // Fit (keep aspect) or stretch to the whole display (DM_VK_STRETCH), at DM_VK_PICTURE_SIZE % of that, placed by nxhost_picture_place; all live (the in-game panel
-    // sends the switches through DM_CTL and gives the launcher's touch mapping the same rectangle, PictureFit.rect)
-    // DM_VK_PICTURE_ASPECT=<w>:<h> (live; the launcher's Aspect ratio 4:3 sets 4:3): the picture's shape on screen when it is fitted, in place of the crop's own (a native 4:3
-    // mod lays its 4:3 picture out in the game's 16:9 frame: shown at 4:3 it fills a 4:3 screen and gets side bars on a 16:9 one). Stretch still fills the screen
-    int fw = cw; { const char *pa = getenv("DM_VK_PICTURE_ASPECT"); int aw = 0, ah = 0; if (pa && sscanf(pa, "%d:%d", &aw, &ah) == 2 && aw > 0 && ah > 0) fw = (int)((long)ch * aw / ah); }
-    int dev = atomic_load(&g_dev_on), fr[4];
-    if (dev) vka_fit_rect(g_win_ew, g_win_eh, fw, ch, stretch_wanted(), picture_size(), g_place_x, g_place_y, fr);   // device scaling: placed on the whole window, then carried into the buffer
-    else vka_fit_rect(ew, eh, fw, ch, stretch_wanted(), picture_size(), g_place_x, g_place_y, fr);
-    {   // Device scaling: the buffer the picture would fill 1:1, asked for when it differs by more than 2 pixels (a new swapchain at the next present); off: back to the window's size
+    vk.vkBeginCommandBuffer(g_fr[k].cb, &bi);
+    *im_out = im; *ownfmt_out = ownfmt; *k_out = k; *idx_out = idx;
+    return 1;
+}
+static void present_fit_box(const pq_item *it, const vka_img *im, int cx, int cy, int cw, int ch, int ew, int eh, int fr[4]) {
+    int fw = cw; (void)it; (void)cx; (void)cy;
+    if (vka_present_fast_on()) {
+        const vka_pres_cfg *cfg = pres_cfg_get();
+        if (cfg->aspect_w > 0 && cfg->aspect_h > 0) fw = (int)((long)ch * cfg->aspect_w / cfg->aspect_h);
+    } else { const char *pa = getenv("DM_VK_PICTURE_ASPECT"); int aw = 0, ah = 0; if (pa && sscanf(pa, "%d:%d", &aw, &ah) == 2 && aw > 0 && ah > 0) fw = (int)((long)ch * aw / ah); }
+    int dev = atomic_load(&g_dev_on);
+    vka_fit_rect(dev ? g_win_ew : ew, dev ? g_win_eh : eh, fw, ch, stretch_wanted(), picture_size(), g_place_x, g_place_y, fr);
+    {
         int want = present_scale() == PS_DEVICE && im && !g_dev_refused, wwin = dev ? g_win_ew : ew, hwin = dev ? g_win_eh : eh;
         uint32_t bw = 0, bh = 0;
-        if (want && (fr[2] > cw || fr[3] > ch)) {   // scaled up: a smaller buffer; the same size or smaller: the window's own, the present scales as bilinear does
+        if (want && (fr[2] > cw || fr[3] > ch)) {
             double sx = fr[2] > cw ? (double)cw / fr[2] : 1, sy = fr[3] > ch ? (double)ch / fr[3] : 1;
             bw = (uint32_t)(wwin * sx + 0.5); bh = (uint32_t)(hwin * sy + 0.5);
         }
         uint32_t cur_w = dev ? (uint32_t)ew : 0, cur_h = dev ? (uint32_t)eh : 0;
         if ((bw ? (bw + 2 < cur_w || bw > cur_w + 2 || bh + 2 < cur_h || bh > cur_h + 2) : dev) && !g_recreate) { g_dev_want_w = bw; g_dev_want_h = bh; g_recreate = 1; }
     }
-    if (dev) {   // the whole window's rectangle in buffer pixels; within 2 pixels of the crop's size it is the crop's size (a copy, no scaling)
+    if (dev) {
         double fx = (double)ew / g_win_ew, fy = (double)eh / g_win_eh;
         int bx = (int)(fr[0] * fx + 0.5), by = (int)(fr[1] * fy + 0.5), bw = (int)(fr[2] * fx + 0.5), bh = (int)(fr[3] * fy + 0.5);
-        if (abs(bw - cw) <= 2) bw = cw;
-        if (abs(bh - ch) <= 2) bh = ch;
-        if (bw > ew) bw = ew;
-        if (bh > eh) bh = eh;
-        if (bx + bw > ew) bx = ew - bw;
-        if (by + bh > eh) by = eh - bh;
+        if (abs(bw - cw) <= 2) bw = cw; if (abs(bh - ch) <= 2) bh = ch;
+        if (bw > ew) bw = ew; if (bh > eh) bh = eh;
+        if (bx + bw > ew) bx = ew - bw; if (by + bh > eh) by = eh - bh;
         fr[0] = bx; fr[1] = by; fr[2] = bw; fr[3] = bh;
     }
+}
+static void present_record_img(const pq_item *it, VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, int ownfmt, int cx, int cy, int cw, int ch, int ew, int eh, const int fr[4]) {
     int dx = fr[0], dy = fr[1], dw = fr[2], dh = fr[3];
-    static VkFormat s_last_fmt; static VkFormatProperties s_last_fp;
-    VkFormatProperties fp = {0};
-    if (im) {
-        if (im->f.vk != s_last_fmt) { vk.vkGetPhysicalDeviceFormatProperties(V.pd, im->f.vk, &s_last_fp); s_last_fmt = im->f.vk; }
-        fp = s_last_fp;
-    }
+    static VkFormat s_last_fmt; static VkFormatProperties s_last_fp; VkFormatProperties fp = {0};
+    if (im) { if (im->f.vk != s_last_fmt) { vk.vkGetPhysicalDeviceFormatProperties(V.pd, im->f.vk, &s_last_fp); s_last_fmt = im->f.vk; } fp = s_last_fp; }
     int blit = im && im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind == 0 && im->samples == 1 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
-    // FSR (or a one-pass scaler: DM_VK_PRESENT_SCALE bicubic, sgsr1) in place of the blit or the rotated copy for a picture scaled up; switched on live, the swapchain has no
-    // attachment views yet: blitted once, and the next swapchain has them. A view that failed on a swapchain made for FSR is not asked for again: each present would make a
-    // new swapchain (a queue idle) and fail the same way
     int one = one_pass_wanted(), scaler = fsr_wanted() || one >= 0;
-    int fsr = blit > 0 && scaler && (dw > cw || dh > ch) && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT)
-              && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
-    if (!fsr && scaler && im) { static int told; if (!told++) VLOG("%s wanted but not used: blit %d, picture %dx%d -> %dx%d, usage %#x, linear filter %d", one >= 0 ? g_ps_names[one] : "FSR", blit, cw, ch, dw, dh,
-                                                           (unsigned)im->usage, (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0); }
-    if (fsr && !g_sview[idx]) {
-        if (!g_sview_fsr) g_recreate = 1;
-        else VRED_ONCE("FSR: swapchain image %u has no attachment view: blitted", idx);
-        fsr = 0;
-    }
-    if (fsr && one >= 0 && scale_copy(cb, k, idx, im, one, cx, cy, cw, ch, dx, dy, dw, dh)) {
-        blit = -1;
-    } else if (fsr && one < 0 && fsr_ready(g_swap_fmt) && fsr_mid(k, (uint32_t)dw, (uint32_t)dh) && fsr_copy(cb, k, idx, im, cx, cy, cw, ch, dx, dy, dw, dh)) {
-        blit = -1;
-    } else if (rot_rotates(g_pre) || vka_swap_rb() || (ownfmt && g_sview[idx])) {
+    int fsr = blit > 0 && scaler && (dw > cw || dh > ch) && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+    if (!fsr && scaler && im) { static int told; if (!told++) VLOG("%s wanted but not used: blit %d, picture %dx%d -> %dx%d, usage %#x, linear filter %d", one >= 0 ? g_ps_names[one] : "FSR", blit, cw, ch, dw, dh, (unsigned)im->usage, (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0); }
+    if (fsr && !g_sview[idx]) { if (!g_sview_fsr) g_recreate = 1; else VRED_ONCE("FSR: swapchain image %u has no attachment view: blitted", idx); fsr = 0; }
+    if (fsr && one >= 0 && scale_copy(cb, k, idx, im, one, cx, cy, cw, ch, dx, dy, dw, dh)) blit = -1;
+    else if (fsr && one < 0 && fsr_ready(g_swap_fmt) && fsr_mid(k, (uint32_t)dw, (uint32_t)dh) && fsr_copy(cb, k, idx, im, cx, cy, cw, ch, dx, dy, dw, dh)) blit = -1;
+    else if (rot_rotates(g_pre) || vka_swap_rb() || (ownfmt && g_sview[idx])) {
         int ok = im && im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind == 0 && im->samples == 1 && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && g_sview[idx];
-        if (ok) vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
+        if (ok) vka_barrier(cb);
         else if (im) VRED_ONCE("window texture serial %llu (format %#x) cannot be sampled for the rotated copy: presented black", (unsigned long long)im->serial, im->d.format);
         rot_copy(cb, k, idx, im, ok, cx, cy, cw, ch, dx, dy, dw, dh, !!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
         blit = -1;
     } else vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    if (blit < 0) {}
-    else if (!blit || dw < ew || dh < eh) {   // the bars: dx or dy is 0 for a picture against an edge
+    if (blit < 0) {} else if (!blit || dw < ew || dh < eh) {
         VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vk.vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
-        vka_barrier(cb);
+        vk.vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg); vka_barrier(cb);
     }
     if (blit > 0) {
-        vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
-        int y0 = cy, y1 = cy + ch; if (vka_origin_ll()) { y0 = cy + ch; y1 = cy; }   // lower-left origin: the window texture is stored bottom-up
+        vka_barrier(cb); int y0 = cy, y1 = cy + ch; if (vka_origin_ll()) { y0 = cy + ch; y1 = cy; }
         VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, y0, 0}, {cx + cw, y1, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
-        vk.vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
-                          (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) && !nearest_wanted() ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        vk.vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) && !nearest_wanted() ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     } else if (im && !blit) VRED_ONCE("window texture serial %llu (format %#x) cannot be blitted to the swapchain: presented black", (unsigned long long)im->serial, im->d.format);
     if (blit >= 0) vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    ovl_draw(cb, k, idx);   // the launcher's overlay over the picture (generated frames too)
-    if (!it->src) vka_ctl_shot_record(cb, im, g_pfmt, cx, cy, cw, ch);   // the game's own frames only
+    ovl_draw(cb, k, idx);
+    if (!it->src) vka_ctl_shot_record(cb, im, g_pfmt, cx, cy, cw, ch);
     vk.vkEndCommandBuffer(cb);
-    VkSemaphore ws[2] = {g_fr[k].acq, V.tl}; uint64_t wv[2] = {0, it->fence}; VkPipelineStageFlags st[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};   // the image's first barrier is ALL_COMMANDS
-    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 2, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = it->fence ? 2 : 1, .pWaitSemaphores = ws, .pWaitDstStageMask = st,
-                       .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_sdone[idx]};
-    if (!it->fence) ti.waitSemaphoreValueCount = 1;
+}
+static void present_drain_gate(void) {
+    uint64_t gw_ns = vka_present_fast_on()
+        ? (V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? pres_cfg_get()->gate_wait_turnip_ns : pres_cfg_get()->gate_wait_other_ns)
+        : (uint64_t)(VKA_ENVF("DM_VK_PRESENT_GATE_WAIT", V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? 30.0 : 0.0) * 1e6);
+    uint64_t gw_t0 = now_ns(); int gw_had = 0, gw_left = 0;
+    for (unsigned gwi = 0; gwi < 1000000u; gwi++) {
+        pthread_mutex_lock(&V.qmu);
+        gw_left = vka_hung() ? 0 : vka_gate_pending();
+        if (!gw_left || !gw_ns || now_ns() - gw_t0 >= gw_ns || gwi + 1u == 1000000u) break;
+        pthread_mutex_unlock(&V.qmu);
+        gw_had = 1; vka_gate_drain(gw_ns - (now_ns() - gw_t0));
+    }
+    static uint64_t n, nw, nl, sum, mx; uint64_t w = gw_had ? now_ns() - gw_t0 : 0;
+    n++; nw += gw_had; nl += gw_left > 0; sum += w; if (w > mx) mx = w;
+    if (n == 600) {
+        if (nw || nl) VLOG("present: %llu of %llu frames waited for a gate to open (%.2f ms on average, %.1f at most), %llu went on with one still pending%s",
+            (unsigned long long)nw, (unsigned long long)n, nw ? sum / 1e6 / nw : 0.0, mx / 1e6, (unsigned long long)nl, gw_ns ? "" : " (DM_VK_PRESENT_GATE_WAIT=0: not waited for)");
+        n = nw = nl = sum = mx = 0;
+    }
+}
+static int present_submit_swap(const pq_item *it, VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im) {
+    VkSemaphore ws[2] = {g_fr[k].acq, V.tl}; uint64_t wv[2] = {0, it->fence}; VkPipelineStageFlags st[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = it->fence ? 2u : 1u, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = it->fence ? 2u : 1u, .pWaitSemaphores = ws, .pWaitDstStageMask = st, .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_sdone[idx]};
     frame_rate(it->period); refresh_poll();
     uint64_t want = 0, period = (uint64_t)((it->hold > 0 ? it->hold : it->period) * 1e9);
-    // With frame generation every image gets a time too, at least one refresh after the one before: a game frame and its generated frames are handed over back to back,
-    // and with their hold under 1.5 refreshes (4x at 25 fps: 10 ms) they went out untimed, two landed in one refresh and the compositor dropped one (on the Portal
-    // about 48 of 105 a second, mostly generated frames, so the screen showed little more than the game's own rate)
     if (g_fg_on && g_refresh_ns && period < g_refresh_ns) period = g_refresh_ns;
-    if (g_refresh_ns && (period > g_refresh_ns * 3 / 2 || g_fg_on)) {   // hold each image for its present period: the panel refreshes faster than the game presents
+    if (g_refresh_ns && (period > g_refresh_ns * 3 / 2 || g_fg_on)) {
         uint64_t now = now_ns(); want = g_last_desired ? g_last_desired + period : now;
         if (want < now) want = now;
         g_last_desired = want; want -= g_refresh_ns / 2;
@@ -960,39 +1003,17 @@ static int present_one(const pq_item *it) {
     VkPresentTimeGOOGLE pt = {(uint32_t)it->ticket, want};
     VkPresentTimesInfoGOOGLE ptv = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1, .pTimes = &pt};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = V.display_timing ? &ptv : NULL, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_sdone[idx], .swapchainCount = 1, .pSwapchains = &g_swap, .pImageIndices = &idx};
-    // The frame done on the GPU before the queue lock is taken: a submission that waits for a timeline value still pending can block inside vkQueueSubmit until it is
-    // signalled (Turnip on KGSL emulates timeline semaphores: 25-35 ms a frame with the lock held, so every replay submission behind it waited; Ocarina of Time's note).
-    // The copy cannot start before the frame ends anyway; only a value already handed to the queue is waited for here (a later one is handled under the lock below)
-    // Test switch DM_VK_PRESENT_PREWAIT=0: no wait here (as before), for A/B runs
-    if (it->fence && !vka_hung() && VKA_ENV("DM_VK_PRESENT_PREWAIT", 1) && it->fence <= __atomic_load_n(&V.tl_queued, __ATOMIC_ACQUIRE)) {
-        VkResult vka_tl_wait(VkSemaphore s, uint64_t v, uint64_t timeout_ns); vka_tl_wait(V.tl, it->fence, vka_hang_ns());   // a timeout: the submission below waits as before, and the hang handling sees it
+    int prewait = vka_present_fast_on() ? pres_cfg_get()->prewait : (VKA_ENV("DM_VK_PRESENT_PREWAIT", 1) != 0);
+    if (it->fence && !vka_hung() && prewait && it->fence <= __atomic_load_n(&V.tl_queued, __ATOMIC_ACQUIRE)) {
+        VkResult vka_tl_wait(VkSemaphore s, uint64_t v, uint64_t timeout_ns); vka_tl_wait(V.tl, it->fence, vka_hang_ns());
     }
-    // No gate pending when the copy goes to the queue (vka_dev.c vka_gate_drain): on Turnip the driver would hold the copy back behind the gated work while Android
-    // already shows the image. DM_VK_PRESENT_GATE_WAIT=<ms> (live; 30 on Turnip, 0 = off elsewhere): the longest wait, after which the present goes on as before
-    uint64_t gw_ns = (uint64_t)(VKA_ENVF("DM_VK_PRESENT_GATE_WAIT", V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? 30.0 : 0.0) * 1e6), gw_t0 = now_ns(); int gw_had = 0, gw_left = 0;
-    for (;;) {
-        pthread_mutex_lock(&V.qmu);
-        gw_left = vka_hung() ? 0 : vka_gate_pending();
-        if (!gw_left || !gw_ns || now_ns() - gw_t0 >= gw_ns) break;
-        pthread_mutex_unlock(&V.qmu);   // (the replay's gated submission and its opening need no lock of ours, but its other submissions take this one)
-        gw_had = 1; vka_gate_drain(gw_ns - (now_ns() - gw_t0));
-    }
-    { static uint64_t n, nw, nl, sum, mx; uint64_t w = gw_had ? now_ns() - gw_t0 : 0;   // (under the queue lock)
-      n++; nw += gw_had; nl += gw_left > 0; sum += w; if (w > mx) mx = w;
-      if (n == 600) { if (nw || nl) VLOG("present: %llu of %llu frames waited for a gate to open (%.2f ms on average, %.1f at most), %llu went on with one still pending%s", (unsigned long long)nw, (unsigned long long)n,
-                                         nw ? sum / 1e6 / nw : 0.0, mx / 1e6, (unsigned long long)nl, gw_ns ? "" : " (DM_VK_PRESENT_GATE_WAIT=0: not waited for)");
-                      n = nw = nl = sum = mx = 0; } }
-    // Never a wait for a value no earlier submission signals: the queue runs its batches in order, so the copy would wait for a submission queued behind it, and neither ever
-    // runs (mtl_present takes vka_fence_queued for that; this holds it under the queue lock)
+    present_drain_gate();
     if (wv[1] > V.tl_queued) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("present ticket %llu waited for fence %llu, %llu is the last handed to the queue: waits for that", (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); wv[1] = V.tl_queued; }
-    // Test switch DM_VK_TEST_HANG=<mode>,<ticket>: at that present the copy waits for a timeline value no earlier batch signals, as the present did before it took
-    // vka_fence_queued. Mode 1: the next fence (a later submission signals it: the wait-before-signal on one queue); mode 2: a value nothing ever signals (a sure stall, for
-    // the hang handling). Not set in the product
     { static int mode = -1, at; if (mode < 0) { const char *e = getenv("DM_VK_TEST_HANG"); mode = 0; if (e && sscanf(e, "%d,%d", &mode, &at) < 1) mode = 0; if (at <= 0) at = 600; }
       if (mode && it->ticket == (uint64_t)at && it->fence) { wv[1] = mode == 1 ? vka_fence_last() + 1 : V.tl_queued + 1000000000ull;
           VRED("DM_VK_TEST_HANG=%d: present ticket %llu waits for fence %llu (%llu handed to the queue)", mode, (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); } }
     void vka_qhold_add(int k, uint64_t ns); uint64_t th0 = now_ns();
-    r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, g_fr[k].fence);
+    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, g_fr[k].fence);
     uint64_t th1 = now_ns();
     VkResult pr = r ? r : vk.vkQueuePresentKHR(V.q, &pi);
     vka_qhold_add(0, th1 - th0); vka_qhold_add(1, now_ns() - th1);
@@ -1007,13 +1028,22 @@ static int present_one(const pq_item *it) {
     timing_poll();
     return 1;
 }
-
+static int present_one(const pq_item *it) {
+    vka_img *im = NULL; int ownfmt = 0; unsigned k = 0; uint32_t idx = 0;
+    if (!present_frame_prep(it, &im, &ownfmt, &k, &idx)) return 0;
+    int cx = 0, cy = 0, cw = im ? (int)im->w : 1, ch = im ? (int)im->h : 1;
+    if (it->has_crop && it->crop[2] > 0 && it->crop[3] > 0) { cx = it->crop[0]; cy = it->crop[1]; cw = it->crop[2]; ch = it->crop[3]; }
+    int ew = (int)(rot_quarter(g_pre) ? g_ext.height : g_ext.width), eh = (int)(rot_quarter(g_pre) ? g_ext.width : g_ext.height);
+    int fr[4]; present_fit_box(it, im, cx, cy, cw, ch, ew, eh, fr);
+    present_record_img(it, g_fr[k].cb, k, idx, im, ownfmt, cx, cy, cw, ch, ew, eh, fr);
+    return present_submit_swap(it, g_fr[k].cb, k, idx, im);
+}
 void vka_perf_thread(int nice); void vka_perf_frame(double period_s);   // vka_perf.c
 static void *present_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-present"); vka_fp_host("vk-present"); vka_perf_thread(-8);
     pthread_mutex_lock(&g_pmu);
     for (;;) {
-        while (g_pq_read == g_pq_fill && g_win_ack == g_win_gen) pthread_cond_wait(&g_pcv, &g_pmu);
+        while (g_pq_read == g_pq_fill && g_win_ack == g_win_gen) pcv_wait();
         if (g_win_ack != g_win_gen) { window_take(); continue; }
         pq_item it = g_pq[g_pq_read % PQ]; g_pq_read++;
         pthread_mutex_unlock(&g_pmu);
@@ -1029,8 +1059,8 @@ static void *present_main(void *arg) {
         if (!shown || !V.display_timing) pres_note(it.ticket, shown ? now_ns() / 1e9 : -1);
         vka_fps_note(shown, 0);
         pthread_mutex_lock(&g_pmu);
-        if (it.ticket > g_pq_done) g_pq_done = it.ticket;
-        pthread_cond_broadcast(&g_pcv);
+        if (it.ticket > g_pq_done) { g_pq_done = it.ticket; atomic_store_explicit(&g_pq_sync.done_sh, g_pq_done, memory_order_release); }
+        pcv_wake();
     }
     return NULL;
 }
@@ -1045,9 +1075,9 @@ void vka_present_init(void) {
 // has handed every submission before it to the queue (vka_present_fill, the replay's thread). Without the replay worker both run at once (mtl_present)
 uint64_t vka_present_reserve(void) {
     pthread_mutex_lock(&g_pmu);
-    if (!g_thread_up) { uint64_t tk = ++g_pq_in; g_pq_read = g_pq_done = g_pq_fill = tk; pres_note(tk, -1); pthread_mutex_unlock(&g_pmu); return tk; }
-    while (g_pq_in - g_pq_read >= PQ) pthread_cond_wait(&g_pcv, &g_pmu);
-    uint64_t tk = ++g_pq_in;
+    if (!g_thread_up) { uint64_t tk = ++g_pq_in; g_pq_read = g_pq_done = g_pq_fill = tk; pres_note(tk, -1); atomic_store_explicit(&g_pq_sync.in_sh, tk, memory_order_release); atomic_store_explicit(&g_pq_sync.done_sh, tk, memory_order_release); pthread_mutex_unlock(&g_pmu); return tk; }
+    while (g_pq_in - g_pq_read >= PQ) pcv_wait();
+    uint64_t tk = ++g_pq_in; atomic_store_explicit(&g_pq_sync.in_sh, tk, memory_order_release);
     pthread_mutex_unlock(&g_pmu);
     return tk;
 }
@@ -1067,20 +1097,20 @@ void vka_present_fill(uint64_t tk, const tex_t *t, double period_s, const int cr
         if (k <= 3 || !(k & (k - 1))) VLOG("present ticket %llu came while fence %llu was still being recorded (%llu queued): the present waits for %llu (%llu such presents)",
                                            (unsigned long long)tk, (unsigned long long)res, (unsigned long long)it->fence, (unsigned long long)it->fence, (unsigned long long)k); }
     g_pq_fill = tk;
-    pthread_cond_broadcast(&g_pcv);
+    pcv_wake();
     pthread_mutex_unlock(&g_pmu);
 }
 uint64_t vka_present_inline(const tex_t *t, double period_s, const int crop[4]) { uint64_t tk = vka_present_reserve(); vka_present_fill(tk, t, period_s, crop); return tk; }
-void mtl_present_wait(uint64_t tk) { pthread_mutex_lock(&g_pmu); while (g_pq_done < tk) pthread_cond_wait(&g_pcv, &g_pmu); pthread_mutex_unlock(&g_pmu); }
-void mtl_present_flush(void) { pthread_mutex_lock(&g_pmu); uint64_t h = g_pq_in; pthread_mutex_unlock(&g_pmu); mtl_present_wait(h); }
+void mtl_present_wait(uint64_t tk) { if (vka_present_fast_on() && vka_pq_already_done(&g_pq_sync, tk, 0)) return; pthread_mutex_lock(&g_pmu); while (g_pq_done < tk) pcv_wait(); pthread_mutex_unlock(&g_pmu); }
+void mtl_present_flush(void) { uint64_t h; if (vka_present_fast_on()) h = atomic_load_explicit(&g_pq_sync.in_sh, memory_order_acquire); else { pthread_mutex_lock(&g_pmu); h = g_pq_in; pthread_mutex_unlock(&g_pmu); } mtl_present_wait(h); }
 // The acquire sync of a window image (hle_nvn.c WindowAcquireTexture): the fence of the commits that drew it when it was last presented, not every commit so far. By the time
 // the acquire returns, the present of that image has been handed to the queue (mtl_present_wait of its ticket), its copy waiting for that fence; the game's later
 // submissions come after it on the one queue and begin with a full barrier, so they cannot write the image before the copy has read it. Waiting for every commit made the
 // game wait for its own last frame at each acquire: Donkey Kong Bananza's level blocked ~64 ms a frame in SyncWait, recording (~45 ms) and GPU (~30 ms) one after the other
 uint64_t mtl_acquire_fence(uint64_t presented) { return presented; }
-double mtl_presented_time(uint64_t n) { return g_pres[n % PRING].n == n ? g_pres[n % PRING].t : 0; }
+double mtl_presented_time(uint64_t n) { return vka_present_fast_on() ? vka_pres_ring_read(&g_pres_fast, n, 0) : (g_pres[n % PRING].n == n ? g_pres[n % PRING].t : 0); }
 // The present tickets reserved and shown (the layer's frame history, hle_vi.c ListFrameHistory, as nvn_mtl.m's)
-void mtl_present_progress(uint64_t *queued, uint64_t *done) { pthread_mutex_lock(&g_pmu); *queued = g_pq_in; *done = g_pq_done; pthread_mutex_unlock(&g_pmu); }
+void mtl_present_progress(uint64_t *queued, uint64_t *done) { if (vka_present_fast_on()) { *queued = atomic_load_explicit(&g_pq_sync.in_sh, memory_order_acquire); *done = atomic_load_explicit(&g_pq_sync.done_sh, memory_order_acquire); return; } pthread_mutex_lock(&g_pmu); *queued = g_pq_in; *done = g_pq_done; pthread_mutex_unlock(&g_pmu); }
 int mtl_has_window(void) { return g_surf != VK_NULL_HANDLE; }
 int mtl_display_hz(void) { return !g_surf ? 0 : g_refresh_ns ? (int)(1e9 / g_refresh_ns + 0.5) : 60; }
 uint64_t vka_refresh_ns(void) { return g_refresh_ns; }   // the panel's refresh period (display timing; 0 = not known). Present thread
