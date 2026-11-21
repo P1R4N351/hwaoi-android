@@ -13,6 +13,7 @@
 //   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
 #include "hle.h"
 #include "hle_audio_fast.h"
+#include "audren_fast.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -96,17 +97,19 @@ static int16_t g_frame[FRAME_MAX * 2]; static int g_frame_n;   // the latest fra
 static _Atomic uint64_t g_frames, g_nonsilent;
 enum { CQ = 4 }; static int16_t g_cq[CQ][FRAME_MAX * 2]; static int g_cq_n[CQ]; static _Atomic uint32_t g_cq_head, g_cq_tail;   // output queue of catch-up frames
 static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cq_cv = PTHREAD_COND_INITIALIZER;   // the render thread signals each frame it takes off the queue (catch-up pacing)
-static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
+static _Atomic uint32_t g_cq_waiters;
+static void cq_popped(void) { if (!audren_cq_should_wake(&g_cq_waiters)) return; pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
 // The render lock (recursive): the render thread holds it from its choice (a queued catch-up frame, or a render of its own) through the render, an update from its catch-up render
 // through queuing it, so the two never cross. The thread used to decide on an empty queue, wait for the catch-up render in progress, and append its own, later, frame first: two 5 ms
 // blocks swapped, a click
 static pthread_mutex_t g_render_mu; static pthread_once_t g_render_mu_once = PTHREAD_ONCE_INIT;
-static void render_mu_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_render_mu, &a); pthread_mutexattr_destroy(&a); }
+static _Atomic int g_render_mu_ready;
+static void render_mu_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_render_mu, &a); pthread_mutexattr_destroy(&a); atomic_store_explicit(&g_render_mu_ready, 1, memory_order_release); }
 // A guest thread that waits for this lock counts as blocked (dm_host_mutex_lock, hle_thread.c's same-core wake handoff): the render thread holds it through the SDK's signal of
 // the game's renderer event, the signal wakes the game's sound thread (a higher priority on the same core), and the handoff waits until that thread blocks. The sound thread's update
 // then waited for this lock for its catch-up render (a timer-driven update just before the event's own, nothing rendered since the one before), a wait the host counted as running:
 // neither side ever went on, the renderer stopped for good and the game's cutscene clock with it (Metroid Dread: the game's 45,692nd render)
-static void render_lock(void) { pthread_once(&g_render_mu_once, render_mu_init); dm_host_mutex_lock(&g_render_mu); }
+static void render_lock(void) { if (!(audren_fast_active() && atomic_load_explicit(&g_render_mu_ready, memory_order_acquire))) pthread_once(&g_render_mu_once, render_mu_init); dm_host_mutex_lock(&g_render_mu); }
 static void render_unlock(void) { pthread_mutex_unlock(&g_render_mu); }
 
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
@@ -182,21 +185,22 @@ static __thread int t_in_open;
 // substitutes stores the object in that slot instead (SDK 3 sdk+0x17dffc, SDK 12 sdk+0x4d274), and ExecuteAudioRendererRendering signals it after every render, so the game's
 // object had to outlive the renderer, which Horizon never asks of it. LEGO Star Wars: The Skywalker Saga (SDK 12) passes one on its stack, Little Nightmares (SDK 3) reuses its
 // memory, and the render thread's first SignalSystemEvent aborted on a state byte (+0x28) that was no longer the event's. The SDK now gets one of these, alive until Close
-static struct { void *obj; uint8_t ev[0x80] __attribute__((aligned(16))); } g_rev[4];   // obj: the renderer (handle[0]) it belongs to, NULL when free
+static audren_rev_slot g_rev[4];   // obj: the renderer (handle[0]) it belongs to, NULL when free
 static pthread_mutex_t g_rev_mu = PTHREAD_MUTEX_INITIALIZER;
 static void *rev_take(void) {
     pthread_mutex_lock(&g_rev_mu); void *ev = NULL;
-    for (int i = 0; i < 4 && !ev; i++) if (!g_rev[i].obj) { g_rev[i].obj = (void *)1; memset(g_rev[i].ev, 0, sizeof g_rev[i].ev); ev = g_rev[i].ev; }
+    for (int i = 0; i < 4 && !ev; i++) if (!atomic_load_explicit(&g_rev[i].obj, memory_order_relaxed)) { atomic_store_explicit(&g_rev[i].obj, (uintptr_t)1u, memory_order_release); memset(g_rev[i].ev, 0, sizeof g_rev[i].ev); ev = g_rev[i].ev; }
     pthread_mutex_unlock(&g_rev_mu); return ev;
 }
 static void rev_set(void *ev, void *obj) {   // obj NULL frees the slot
     pthread_mutex_lock(&g_rev_mu);
-    for (int i = 0; i < 4; i++) if (g_rev[i].ev == ev) g_rev[i].obj = obj;
+    for (int i = 0; i < 4; i++) if (g_rev[i].ev == ev) atomic_store_explicit(&g_rev[i].obj, (uintptr_t)obj, memory_order_release);
     pthread_mutex_unlock(&g_rev_mu);
 }
 static void *rev_find(void *obj) {
+    void *fast_ev = NULL; if (audren_rev_find(g_rev, obj, &fast_ev)) return fast_ev;
     pthread_mutex_lock(&g_rev_mu); void *ev = NULL;
-    for (int i = 0; i < 4 && !ev; i++) if (g_rev[i].obj == obj) ev = g_rev[i].ev;
+    for (int i = 0; i < 4 && !ev; i++) if (atomic_load_explicit(&g_rev[i].obj, memory_order_relaxed) == (uintptr_t)obj) ev = g_rev[i].ev;
     pthread_mutex_unlock(&g_rev_mu); return ev;
 }
 static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work, size_t sz) {
@@ -325,6 +329,7 @@ static uint32_t up_3_2(const int32_t *in, uint32_t n, int32_t *out) {
             for (int k = 0; k < RS_T; k++) h[p][k] = (float)(w[k] / sum);
         }
     }
+    if (audren_fast_active()) return audren_fast_up_3_2(h, buf, &pos, in, n, out);
     memcpy(buf + 2 * (RS_T - 1), in, (size_t)n * 8);   // the frame after the last RS_T - 1 samples of the one before (copied first: out may be in)
     uint32_t m = 0;
     for (; pos < 3 * n; pos += 2, m++) {
@@ -335,6 +340,50 @@ static uint32_t up_3_2(const int32_t *in, uint32_t n, int32_t *out) {
     pos -= 3 * n;
     memmove(buf, buf + 2 * n, (RS_T - 1) * 8);
     return m;
+}
+static int capture_sink_pcm(const uint8_t *c, const int32_t *mix, uint32_t samples, uint32_t rate, int *logged, int16_t *dst) {
+    const uint8_t *b = c + sink_body();
+    uint32_t nin = *(const uint32_t *)(b + (g_sink4 ? 0x120 : 0x130)); int16_t in[6];
+    for (uint32_t j = 0; j < 6; j++) in[j] = g_sink4 && !g_sink5 ? ((const int8_t *)(b + 0x124))[j] : ((const int16_t *)(b + (g_sink4 ? 0x124 : 0x134)))[j];
+    const int32_t *up = *(const int32_t *const *)(b + (g_sink4 ? 0x118 : 0x128));
+    if (!(*logged)++) LOG("audren: DeviceSink inputs %u (%d %d …) rate %u samples per frame %u mix buffer %p upsample buffer %p%s", nin, nin ? in[0] : -1, nin > 1 ? in[1] : -1, rate, samples, (void *)mix, (void *)up,
+                          rate == 32000 ? " (32 kHz: resampled to 48 kHz on the host)" : "");
+    if (!nin || samples > (rate == 48000 ? FRAME_MAX : FRAME_MAX * 2 / 3 - 1)) return 0;
+    if (rate != 48000 && rate != 32000) { static int once; if (!once++) LOG("[RED] audren: renderer sample rate %u (the SDK takes 32000 or 48000): no sound", rate); return 0; }
+    const int32_t *ch[6]; uint32_t k = nin > 6 ? 6 : nin;
+    for (uint32_t j = 0; j < k; j++) ch[j] = mix + (size_t)in[j] * samples;
+    enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
+    static int32_t st[FRAME_MAX * 2];
+    uint32_t nout = samples; uint64_t loud = 0; int32_t peak = 0;
+    if (rate == 48000 && dm_audio_fast_on()) {
+        dm_audren_downmix_48k(dst, ch, k, samples, &loud, &peak);
+    } else {
+        for (uint32_t s = 0; s < samples; s++) {
+            int32_t l, r;
+            if (k >= 6) { int64_t c0 = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
+                          l = (int32_t)(((int64_t)ch[0][s] * CF + c0 + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c0 + (int64_t)ch[5][s] * CB) >> 15); }
+            else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
+            st[2 * s] = l; st[2 * s + 1] = r;
+        }
+        nout = rate == 48000 ? samples : up_3_2(st, samples, st);
+        if (dm_audio_fast_on()) { dm_audren_clamp_peak(dst, st, 2 * nout, &loud, &peak); }
+        else {
+            for (uint32_t s = 0; s < 2 * nout; s++) {
+                int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+                dst[s] = (int16_t)v; loud |= (uint64_t)v; int32_t av = v < 0 ? -v : v; if (av > peak) peak = av;
+            }
+        }
+    }
+    atomic_fetch_add(&g_frames, 1); if (loud) atomic_fetch_add(&g_nonsilent, 1);
+    static uint64_t win_frames, win_nonsilent; static int32_t win_peak;
+    win_frames++; if (loud) win_nonsilent++; if (peak > win_peak) win_peak = peak;
+    uint64_t f = atomic_load(&g_frames);
+    if (f == 200 || f == 1000 || f % 3000 == 0) {
+        LOG("audren: rendered %llu frames, %llu of them not silent (the last %llu: %llu not silent, peak %d of 32767, at %.1f s)", (unsigned long long)f, (unsigned long long)atomic_load(&g_nonsilent),
+            (unsigned long long)win_frames, (unsigned long long)win_nonsilent, win_peak, dm_rel_s());
+        win_frames = win_nonsilent = 0; win_peak = 0;
+    }
+    return (int)nout;
 }
 static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
     if (len < 0x20) return 0;
@@ -357,6 +406,13 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
         }
     }
     if (!layout_done) return 0;
+    if (hist_logged && audren_fast_active()) {
+        int mal = 0; uint32_t bad_i = 0; size_t bad_off = 0;
+        const uint8_t *sink = audren_fast_find_sink(cl, len, ncmd, g_hdr6, g_hdr21, g_sink_id, &mal, &bad_i, &bad_off);
+        if (mal) { if (!logged++) LOG("[RED] audren: command %u in the command list is malformed (offset %#zx, list %#zx bytes)", bad_i, bad_off, len); return 0; }
+        if (!sink) return 0;
+        return capture_sink_pcm(sink, mix, samples, rate, &logged, dst);
+    }
     // A later list can be incomplete too. Validate every command before consuming the
     // one-time sink scan or returning PCM from a sink that precedes a malformed tail.
     const uint8_t *c = cl + 0x20;
@@ -388,56 +444,7 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
     c = cl + 0x20;
     for (uint32_t i = 0; i < ncmd; i++) {
         int size = cmd_size(c);
-        if (cmd_id(c) == g_sink_id && cmd_on(c)) {
-            const uint8_t *b = c + sink_body();
-            uint32_t nin = *(const uint32_t *)(b + (g_sink4 ? 0x120 : 0x130)); int16_t in[6];
-            for (uint32_t j = 0; j < 6; j++) in[j] = g_sink4 && !g_sink5 ? ((const int8_t *)(b + 0x124))[j] : ((const int16_t *)(b + (g_sink4 ? 0x124 : 0x134)))[j];
-            const int32_t *up = *(const int32_t *const *)(b + (g_sink4 ? 0x118 : 0x128));
-            if (!logged++) LOG("audren: DeviceSink inputs %u (%d %d …) rate %u samples per frame %u mix buffer %p upsample buffer %p%s", nin, nin ? in[0] : -1, nin > 1 ? in[1] : -1, rate, samples, (void *)mix, (void *)up,
-                               rate == 32000 ? " (32 kHz: resampled to 48 kHz on the host)" : "");
-            if (!nin || samples > (rate == 48000 ? FRAME_MAX : FRAME_MAX * 2 / 3 - 1)) return 0;
-            if (rate != 48000 && rate != 32000) { static int once; if (!once++) LOG("[RED] audren: renderer sample rate %u (the SDK takes 32000 or 48000): no sound", rate); return 0; }
-            // Input buffers: the mix buffers the DeviceSink inputs name, at the renderer's rate (with CPU rendering the SDK makes no upsampler, below)
-            const int32_t *ch[6]; uint32_t k = nin > 6 ? 6 : nin;
-            for (uint32_t j = 0; j < k; j++) ch[j] = mix + (size_t)in[j] * samples;
-            // Channel order front-left front-right center LFE back-left back-right; 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
-            enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
-            static int32_t st[FRAME_MAX * 2];   // the stereo downmix before clamping (capture runs under g_render_mu)
-            uint32_t nout = samples; uint64_t loud = 0; int32_t peak = 0;
-            if (rate == 48000 && dm_audio_fast_on()) {
-                dm_audren_downmix_48k(dst, ch, k, samples, &loud, &peak);
-            } else {
-                for (uint32_t s = 0; s < samples; s++) {
-                    int32_t l, r;
-                    if (k >= 6) { int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
-                                  l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15); }
-                    else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
-                    st[2 * s] = l; st[2 * s + 1] = r;
-                }
-                nout = rate == 48000 ? samples : up_3_2(st, samples, st);
-                if (dm_audio_fast_on()) {
-                    dm_audren_clamp_peak(dst, st, 2 * nout, &loud, &peak);
-                } else {
-                    for (uint32_t s = 0; s < 2 * nout; s++) {
-                        int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-                        dst[s] = (int16_t)v; loud |= (uint64_t)v;
-                        int32_t av = v < 0 ? -v : v; if (av > peak) peak = av;
-                    }
-                }
-            }
-            atomic_fetch_add(&g_frames, 1); if (loud) atomic_fetch_add(&g_nonsilent, 1);
-            // The window since the last line (this runs under g_render_mu): a short run still gets lines (the first second, the fifth, then every 15 s), and the window
-            // says whether the sound is there now, not only on average since the start of the run
-            static uint64_t win_frames, win_nonsilent; static int32_t win_peak;
-            win_frames++; if (loud) win_nonsilent++; if (peak > win_peak) win_peak = peak;
-            uint64_t f = atomic_load(&g_frames);
-            if (f == 200 || f == 1000 || f % 3000 == 0) {
-                LOG("audren: rendered %llu frames, %llu of them not silent (the last %llu: %llu not silent, peak %d of 32767, at %.1f s)", (unsigned long long)f, (unsigned long long)atomic_load(&g_nonsilent),
-                    (unsigned long long)win_frames, (unsigned long long)win_nonsilent, win_peak, dm_rel_s());
-                win_frames = win_nonsilent = 0; win_peak = 0;
-            }
-            return (int)nout;
-        }
+        if (cmd_id(c) == g_sink_id && cmd_on(c)) return capture_sink_pcm(c, mix, samples, rate, &logged, dst);
         c += size;
     }
     return 0;
@@ -576,9 +583,11 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
         if (wait_on && atomic_load(&g_cq_tail) == atomic_load(&g_cq_head)) {   // (no queued frame: the render thread renders its next one itself)
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 15000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
             pthread_mutex_lock(&g_cq_mu);
+            audren_cq_wait_enter(&g_cq_waiters);
             dm_host_work++;   // a wait for the render thread is not a thread running on its core (see render_lock)
             while (atomic_load(&g_open) && atomic_load(&g_renders) == r && !pthread_cond_timedwait(&g_cq_cv, &g_cq_mu, &dl)) {}
             dm_host_work--;
+            audren_cq_wait_leave(&g_cq_waiters);
             pthread_mutex_unlock(&g_cq_mu);
             r = atomic_load(&g_renders);
         }
@@ -590,9 +599,11 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
         if (t - atomic_load(&g_cq_head) >= CQ) {   // queue full: wait for the render thread to play one (every 5 ms), so catch-up frames keep real time; at most 50 ms (an output that stopped)
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 50000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
             pthread_mutex_lock(&g_cq_mu);
+            audren_cq_wait_enter(&g_cq_waiters);
             dm_host_work++;   // a wait for the render thread is not a thread running on its core (same-core handoff, see render_lock)
             while (atomic_load(&g_open) && t - atomic_load(&g_cq_head) >= CQ && !pthread_cond_timedwait(&g_cq_cv, &g_cq_mu, &dl)) {}
             dm_host_work--;
+            audren_cq_wait_leave(&g_cq_waiters);
             pthread_mutex_unlock(&g_cq_mu);
         }
         // The render lock around the catch-up render too (see above), so it cannot cross a render-thread render
