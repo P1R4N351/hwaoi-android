@@ -459,6 +459,7 @@ DM_THERMAL_CAP	internal	Game			text			both						Mac or iOS only
 DM_THR	developer	Diagnostics			text			both							
 DM_THRCPU	internal	Diagnostics			text			both						Mac or iOS only	
 DM_TIME	developer	Game			text			both							
+DM_TIME_FAST	developer	Game			text			both							
 DM_TIME_OFFSET	developer	Game			text			both							
 DM_TOUCH_HAPTICS	developer	Input			text			both							
 DM_TOUCH_LOG	developer	Diagnostics			text			both							

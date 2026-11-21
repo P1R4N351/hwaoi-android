@@ -4,42 +4,57 @@
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
+#include "time_fast.h"
+static time_fast_ctx_slot g_ctx_fast;
+static time_fast_cal_slot g_cal_fast;
+static time_fast_loc_slot g_loc_fast;
 
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
 
 // DM_FIXED_TIME=seconds (for deterministic comparison): the user clock always returns this value (and main.c pins the host time zone to UTC)
 static int64_t fixed_time(void) {
-    static int64_t v = -2;
-    if (v == -2) { const char *e = getenv("DM_FIXED_TIME"); v = e ? strtoll(e, 0, 0) : -1;
-                   if (v >= 0) LOG("DM_FIXED_TIME=%lld: the user clock returns a fixed value", (long long)v); }
-    return v;
+    static _Atomic int init; static _Atomic int64_t val = -1; static pthread_mutex_t fmu = PTHREAD_MUTEX_INITIALIZER;
+    if (atomic_load_explicit(&init, memory_order_acquire)) return atomic_load_explicit(&val, memory_order_relaxed);
+    pthread_mutex_lock(&fmu);
+    if (!atomic_load_explicit(&init, memory_order_relaxed)) {
+        const char *e = getenv("DM_FIXED_TIME"); int64_t v = e ? strtoll(e, 0, 0) : -1;
+        if (v >= 0) LOG("DM_FIXED_TIME=%lld: the user clock returns a fixed value", (long long)v);
+        atomic_store_explicit(&val, v, memory_order_relaxed); atomic_store_explicit(&init, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&fmu);
+    return atomic_load_explicit(&val, memory_order_relaxed);
 }
 // DM_TIME=YYYY-MM-DDTHH:MM[:SS] / DM_TIME_OFFSET=<±seconds>: a custom user clock, as Eden's "set the time" does. The clock runs from
 // there instead of the host's: DM_TIME anchors it to the host's monotonic clock (it advances as much as the run lasts), DM_TIME_OFFSET
 // follows the host clock at that offset. DM_FIXED_TIME= keeps precedence (a replay needs the same calendar time every run).
 static void user_clock(int64_t *sec, int64_t *nsec) {
-    static int mode = -2; static int64_t arg, base_ns;   // -1 host clock, 0 offset, 1 fixed start
-    if (mode == -2) {
-        const char *of = getenv("DM_TIME_OFFSET"), *t = getenv("DM_TIME");
-        mode = -1; arg = 0;
-        if (of && *of) { mode = 0; arg = (int64_t)strtoll(of, NULL, 0); LOG("DM_TIME_OFFSET=%lld: the user clock runs %+lld s off the host clock", (long long)arg, (long long)arg); }
-        else if (t && *t) {
-            struct tm tm; memset(&tm, 0, sizeof tm); tm.tm_sec = 0;
-            if (sscanf(t, "%d-%d-%dT%d:%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) >= 5) {
-                tm.tm_year -= 1900; tm.tm_mon -= 1;
-                // local wall-clock time, as Eden's "set the time" means it: the fields are read in the host's zone (DM_TZ, else the
-                // system's), not in UTC. timegm gives the fields as UTC; the zone's offset at that instant moves them back
-                mode = 1; arg = (int64_t)timegm(&tm);
-                { struct tm lt; time_t e = (time_t)arg; if (localtime_r(&e, &lt)) arg -= (int64_t)lt.tm_gmtoff; }
-                base_ns = (int64_t)plat_clock_ns(CLOCK_MONOTONIC);
-                LOG("DM_TIME=%s: the user clock starts there and advances (epoch %lld, local time)", t, (long long)arg);
-            } else LOG("[RED] DM_TIME=%s: want YYYY-MM-DDTHH:MM[:SS]", t);
+    static _Atomic int init; static _Atomic int a_mode = -1; static _Atomic int64_t a_arg, a_base;
+    static pthread_mutex_t umu = PTHREAD_MUTEX_INITIALIZER;
+    if (!atomic_load_explicit(&init, memory_order_acquire)) {
+        pthread_mutex_lock(&umu);
+        if (!atomic_load_explicit(&init, memory_order_relaxed)) {
+            const char *of = getenv("DM_TIME_OFFSET"), *t = getenv("DM_TIME");
+            int md = -1; int64_t ar = 0, bn = 0;
+            if (of && *of) { md = 0; ar = (int64_t)strtoll(of, NULL, 0); LOG("DM_TIME_OFFSET=%lld: the user clock runs %+lld s off the host clock", (long long)ar, (long long)ar); }
+            else if (t && *t) {
+                struct tm tm; memset(&tm, 0, sizeof tm); tm.tm_sec = 0;
+                if (sscanf(t, "%d-%d-%dT%d:%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) >= 5) {
+                    tm.tm_year -= 1900; tm.tm_mon -= 1; md = 1; ar = (int64_t)timegm(&tm);
+                    { struct tm lt; time_t e = (time_t)ar; if (localtime_r(&e, &lt)) ar -= (int64_t)lt.tm_gmtoff; }
+                    bn = (int64_t)plat_clock_ns(CLOCK_MONOTONIC);
+                    LOG("DM_TIME=%s: the user clock starts there and advances (epoch %lld, local time)", t, (long long)ar);
+                } else LOG("[RED] DM_TIME=%s: want YYYY-MM-DDTHH:MM[:SS]", t);
+            }
+            atomic_store_explicit(&a_mode, md, memory_order_relaxed); atomic_store_explicit(&a_arg, ar, memory_order_relaxed);
+            atomic_store_explicit(&a_base, bn, memory_order_relaxed); atomic_store_explicit(&init, 1, memory_order_release);
         }
+        pthread_mutex_unlock(&umu);
     }
-    if (mode == 1) { int64_t ns = (int64_t)plat_clock_ns(CLOCK_MONOTONIC) - base_ns; *sec = arg + ns / 1000000000; *nsec = ns % 1000000000; return; }
+    int md = atomic_load_explicit(&a_mode, memory_order_relaxed); int64_t ar = atomic_load_explicit(&a_arg, memory_order_relaxed);
+    if (md == 1) { int64_t ns = (int64_t)plat_clock_ns(CLOCK_MONOTONIC) - atomic_load_explicit(&a_base, memory_order_relaxed); *sec = ar + ns / 1000000000; *nsec = ns % 1000000000; return; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    *sec = (int64_t)ts.tv_sec + (mode == 0 ? arg : 0); *nsec = ts.tv_nsec;
+    *sec = (int64_t)ts.tv_sec + (md == 0 ? ar : 0); *nsec = ts.tv_nsec;
 }
 static int64_t user_now(void) { int64_t s, ns; user_clock(&s, &ns); return s; }
 HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
@@ -79,20 +94,24 @@ HLE_FORCE("_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec", "C li
 // The SDK reads it from the time service's shared memory, which the host never opens: it returns 0x74 and writes nothing. Unity's DateTime.UtcNow (Engage main+0x4ad40c; Ace Attorney Investigations
 // 1&2 per PR #14) then never starts its clock and reads 0001-01-01. Unity takes its time from GetCurrentTime plus system ticks and only compares the context to notice the clock being set, so like a
 // Switch's it stays the same until the host clock moves against the guest ticks by more than a second (clock set by hand, a sleep mach_absolute_time did not count); with DM_FIXED_TIME it is made once
-HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE", "user clock context from the time service; the host's user clock over its steady clock, renewed when the host clock is set",
-          Result, h_time_GetContext, uint8_t *out) {
+static Result get_context_at(uint8_t *out, const uint8_t tp[0x18], int64_t now) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint8_t ctx[0x20]; static int64_t drift; static int made;
-    uint8_t tp[0x18]; int64_t now; h_time_SteadyNow(tp); h_time_GetCurrentTime(&now);
-    int64_t d = now - (int64_t)(guest_ns() / 1000000000ull);
+    int64_t d = now - (int64_t)(guest_ns() / 1000000000ull), ft = fixed_time();
+    if (time_fast_active() && time_fast_ctx_read(&g_ctx_fast, ft, d, out)) return RES_OK;
     pthread_mutex_lock(&mu);
-    if (!made || (fixed_time() < 0 && llabs(d - drift) > 1)) {
+    if (!made || (ft < 0 && llabs(d - drift) > 1)) {
         int64_t off = now - *(const int64_t *)tp; memcpy(ctx, &off, 8); memcpy(ctx + 8, tp, 0x18);
         if (made) LOG("time: host clock moved %+lld s against the guest ticks, new user clock context", (long long)(d - drift));
-        drift = d; made = 1;
+        drift = d; made = 1; time_fast_ctx_write(&g_ctx_fast, drift, ctx);
     }
     memcpy(out, ctx, 0x20);
     pthread_mutex_unlock(&mu);
     return RES_OK;
+}
+HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE", "user clock context from the time service; the host's user clock over its steady clock, renewed when the host clock is set",
+          Result, h_time_GetContext, uint8_t *out) {
+    uint8_t tp[0x18]; int64_t now; h_time_SteadyNow(tp); h_time_GetCurrentTime(&now);
+    return get_context_at(out, tp, now);
 }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host time()", int64_t, h_time_now, void) {
     int64_t ft = fixed_time(); return ft >= 0 ? ft : user_now(); }
@@ -120,14 +139,25 @@ HLE_FORCE("_ZN2nn4time28AdjustableNetworkSystemClock21GetSystemClockContextEPNS0
 // The C library's real-time getters over the network clocks (SDK 17): the standard one reads the time service's shared memory (0x74 without it), the adjustable one its MonotonicSystemClock
 HLE_FORCE("_ZN2nn4time44GetStandardNetworkSystemClockCurrentTimespecEP8timespec", "real time from the network clock → host real time, as the user clock", int, h_time_NetTimespec, int64_t *ts) { return h_time_timespec(ts); }
 HLE_FORCE("_ZN2nn4time46GetAdjustableNetworkSystemClockCurrentTimespecEP8timespec", "real time from the adjustable network clock → host real time, as the user clock", int, h_time_AdjNetTimespec, int64_t *ts) { return h_time_timespec(ts); }
+static Result to_calendar_tz(CalendarTime *ct, CalendarAdditionalInfo *ai, const int64_t *pt, int fast, uint64_t tz) {
+    static _Atomic int once;
+    if (fast && atomic_load_explicit(&once, memory_order_acquire) && time_fast_cal_read(&g_cal_fast, *pt, tz, ct, ai)) return RES_OK;
+    time_t t = *pt; struct tm tm; localtime_r(&t, &tm);
+    CalendarTime c_val = {(int16_t)(tm.tm_year + 1900), (int8_t)(tm.tm_mon + 1), (int8_t)tm.tm_mday, (int8_t)tm.tm_hour, (int8_t)tm.tm_min, (int8_t)tm.tm_sec, 0};
+    CalendarAdditionalInfo a_val; memset(&a_val, 0, sizeof a_val);
+    a_val.wday = tm.tm_wday; a_val.yday = tm.tm_yday; strlcpy(a_val.tzname, tm.tm_zone ? tm.tm_zone : "UTC", sizeof a_val.tzname);
+    a_val.dst = tm.tm_isdst > 0; a_val.offset = (int32_t)tm.tm_gmtoff;
+    if (fast) time_fast_cal_write(&g_cal_fast, *pt, tz, &c_val, &a_val);
+    if (atomic_exchange_explicit(&once, 1, memory_order_acq_rel) == 0)
+        LOG("ToCalendarTime: first conversion %lld → %04d-%02d-%02d %02d:%02d (time zone %s, offset %ld s)", (long long)t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_zone ? tm.tm_zone : "?", (long)tm.tm_gmtoff);
+    if (ct) *ct = c_val;
+    if (ai) *ai = a_val;
+    return RES_OK;
+}
 HLE_FORCE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
           "time zone rules of the time service; uses the host localtime_r instead", Result, h_time_ToCalendarTime, CalendarTime *ct, CalendarAdditionalInfo *ai, const int64_t *pt) {
-    time_t t = *pt; struct tm tm; localtime_r(&t, &tm);
-    static int once; if (!once++) LOG("ToCalendarTime: first conversion %lld → %04d-%02d-%02d %02d:%02d (time zone %s, offset %ld s)", (long long)t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_zone ? tm.tm_zone : "?", (long)tm.tm_gmtoff);
-    if (ct) *ct = (CalendarTime){(int16_t)(tm.tm_year + 1900), (int8_t)(tm.tm_mon + 1), (int8_t)tm.tm_mday, (int8_t)tm.tm_hour, (int8_t)tm.tm_min, (int8_t)tm.tm_sec, 0};
-    if (ai) { memset(ai, 0, sizeof *ai); ai->wday = tm.tm_wday; ai->yday = tm.tm_yday; strlcpy(ai->tzname, tm.tm_zone ? tm.tm_zone : "UTC", sizeof ai->tzname);
-              ai->dst = tm.tm_isdst > 0; ai->offset = (int32_t)tm.tm_gmtoff; }
-    return RES_OK;
+    int fast = time_fast_active(); uint64_t tz = fast ? time_fast_tz_tag(getenv("TZ")) : 0ull;
+    return to_calendar_tz(ct, ai, pt, fast, tz);
 }
 // Explicit time zone rules (Monster Hunter Rise, SDK 11): LoadTimeZoneRule reads the rule from the time service; the host keeps the game's rule buffer untouched and converts with localtime_r as above
 HLE_FORCE("_ZN2nn4time16LoadTimeZoneRuleEPNS0_12TimeZoneRuleERKNS0_12LocationNameE", "time zone rule from the time service; the host converts with its own zone, the rule stays unused", Result, h_time_LoadRule,
@@ -151,12 +181,24 @@ HLE_FORCE("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", "sna
     memset(s, 0, 0xd0);
     uint8_t tp[0x18]; h_time_SteadyNow(tp);
     int64_t now; h_time_GetCurrentTime(&now);
-    h_time_GetContext(s);   // +0x00: the user clock context, the same in every snapshot until the host clock is set (worked out per snapshot it moved by a second at random, a "clock change" to the user difference below)
-    memcpy(s + 0x40, &now, 8);
-    h_time_ToCalendarTime((CalendarTime *)(s + 0x50), (CalendarAdditionalInfo *)(s + 0x60), &now);
-    memcpy(s + 0x20, s, 0x20); memcpy(s + 0x48, &now, 8); memcpy(s + 0x58, s + 0x50, 8); memcpy(s + 0x78, s + 0x60, 0x18);   // the network clock's context, time, calendar and its info
-    memcpy(s + 0x90, tp, 0x18);
-    tzset(); strlcpy((char *)s + 0xa8, tzname[0] && *tzname[0] ? tzname[0] : "UTC", 0x24);
+    int fast = time_fast_active();
+    if (fast) {
+        uint64_t tz = time_fast_tz_tag(getenv("TZ"));
+        get_context_at(s, tp, now); memcpy(s + 0x40, &now, 8);
+        to_calendar_tz((CalendarTime *)(s + 0x50), (CalendarAdditionalInfo *)(s + 0x60), &now, 1, tz);
+        memcpy(s + 0x20, s, 0x20); memcpy(s + 0x48, &now, 8); memcpy(s + 0x58, s + 0x50, 8); memcpy(s + 0x78, s + 0x60, 0x18);
+        memcpy(s + 0x90, tp, 0x18);
+        if (!time_fast_loc_read(&g_loc_fast, tz, (char *)(s + 0xa8))) {
+            tzset(); char loc[0x24] = {0}; strlcpy(loc, tzname[0] && *tzname[0] ? tzname[0] : "UTC", 0x24);
+            time_fast_loc_write(&g_loc_fast, tz, loc); memcpy(s + 0xa8, loc, 0x24);
+        }
+    } else {
+        h_time_GetContext(s); memcpy(s + 0x40, &now, 8);
+        h_time_ToCalendarTime((CalendarTime *)(s + 0x50), (CalendarAdditionalInfo *)(s + 0x60), &now);
+        memcpy(s + 0x20, s, 0x20); memcpy(s + 0x48, &now, 8); memcpy(s + 0x58, s + 0x50, 8); memcpy(s + 0x78, s + 0x60, 0x18);
+        memcpy(s + 0x90, tp, 0x18);
+        tzset(); strlcpy((char *)s + 0xa8, tzname[0] && *tzname[0] ? tzname[0] : "UTC", 0x24);
+    }
     s[0xcd] = 1;   // The SDK passes type 1 for standard snapshots, 2 for adjustable snapshots; 0 is uninitialized.
     return RES_OK;
 }

@@ -10,12 +10,13 @@
 // then {"SFCI", version, command, token} and the arguments. The response is the same with {u32 objects, 3 × u32} and {"SFCO", version, result, token}
 #include "hle.h"
 #include <pthread.h>
+#include "time_fast.h"
 
 #define SF_H0 0xd0000u   // session handles: outside the kernel handle table (0x1000 + slot, 4096 slots, hle_thread.c)
 #define SF_MAX 64
 // A service's own answer to a command: its result, and a kernel handle to copy to the client in *copy (0: none). NULL: success, zeroed output (olsc:u)
 typedef Result (*sf_answer)(unsigned cmd, uint32_t *copy);
-static struct { char name[16]; int used, domain; unsigned seen; sf_answer answer; } g_sf[SF_MAX];
+static struct { char name[16]; _Atomic int used, domain; _Atomic unsigned seen; time_fast_sf_seen seen_fast; sf_answer answer; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
 // notif:a, the reminder alarms (nn::notification, linked by most SDKs; Fit Boxing 3 lists them when its Settings open, PR 1974): the SDK's client sends only 1000 Initialize (with the process
 // ID), 500 Register, 510 Update, 520 List, 530 LoadApplicationParameter and 540 Delete (SDK 21's sdk+0x58ac80..0x58ad10), and aborts on any failure; its notification event comes from am.
@@ -24,13 +25,16 @@ static const char *const sf_served[] = {"olsc:u", "caps:su", "caps:u", "caps:a",
 
 static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;
-    return i < SF_MAX && g_sf[i].used ? (int)i : -1;
+    return i < SF_MAX && atomic_load_explicit(&g_sf[i].used, memory_order_acquire) ? (int)i : -1;
 }
 static uint32_t sf_new(const char *name, int domain, sf_answer answer) {
     pthread_mutex_lock(&g_sf_mu);
-    unsigned i = 0; while (i < SF_MAX && g_sf[i].used) i++;
+    unsigned i = 0; while (i < SF_MAX && atomic_load_explicit(&g_sf[i].used, memory_order_relaxed)) i++;
     if (i == SF_MAX) die("sf: more than %d host service sessions", SF_MAX);
-    strlcpy(g_sf[i].name, name, sizeof g_sf[i].name); g_sf[i].used = 1; g_sf[i].domain = domain; g_sf[i].seen = 0; g_sf[i].answer = answer;
+    strlcpy(g_sf[i].name, name, sizeof g_sf[i].name); g_sf[i].answer = answer;
+    atomic_store_explicit(&g_sf[i].domain, domain, memory_order_relaxed); atomic_store_explicit(&g_sf[i].seen, 0u, memory_order_relaxed);
+    time_fast_sf_seen_init(&g_sf[i].seen_fast);
+    atomic_store_explicit(&g_sf[i].used, 1, memory_order_release);
     pthread_mutex_unlock(&g_sf_mu);
     return SF_H0 + i;
 }
@@ -77,7 +81,7 @@ HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect t
 HLE_FORCE("_ZN2nn2sf4hipc24CloseClientSessionHandleENS_3svc6HandleE", "close a session (kernel handle) → the host session", void, h_sf_Close, uint32_t h) {
     int i = sf_slot(h);
     if (i < 0) { LOG("[RED] sf: CloseClientSessionHandle on %#x, not a host session", h); return; }
-    pthread_mutex_lock(&g_sf_mu); g_sf[i].used = 0; pthread_mutex_unlock(&g_sf_mu);
+    pthread_mutex_lock(&g_sf_mu); atomic_store_explicit(&g_sf[i].used, 0, memory_order_release); pthread_mutex_unlock(&g_sf_mu);
 }
 // Control requests: the pointer buffer is the server's receive buffer for X descriptors (none: the host reads them in place), the domain conversion makes the session's object 1, a duplicate
 // is a new session to the same object
@@ -89,12 +93,12 @@ HLE_FORCE("_ZN2nn2sf4hipc6client22ConvertSessionToDomainEPNS0_4cmif18CmifDomainO
           uint32_t *out, uint32_t h) {
     int i = sf_slot(h);
     if (i < 0) { LOG("[RED] sf: ConvertSessionToDomain on %#x, not a host session", h); return RES_FAIL; }
-    g_sf[i].domain = 1; *out = 1; return RES_OK;
+    atomic_store_explicit(&g_sf[i].domain, 1, memory_order_relaxed); *out = 1; return RES_OK;
 }
 HLE_FORCE("_ZN2nn2sf4hipc6client16DuplicateSessionEPNS_3svc6HandleES4_", "control request: clone a session → a new host session to the same service", Result, h_sf_Dup, uint32_t *out, uint32_t h) {
     int i = sf_slot(h);
     if (i < 0) { LOG("[RED] sf: DuplicateSession on %#x, not a host session", h); return RES_FAIL; }
-    *out = sf_new(g_sf[i].name, g_sf[i].domain, g_sf[i].answer); return RES_OK;
+    *out = sf_new(g_sf[i].name, atomic_load_explicit(&g_sf[i].domain, memory_order_relaxed), g_sf[i].answer); return RES_OK;
 }
 HLE_FORCE("_ZN2nn2sf4hipc6client18DuplicateSessionExEPNS_3svc6HandleES4_j", "control request: clone a session (with a tag) → a new host session to the same service", Result, h_sf_DupEx,
           uint32_t *out, uint32_t h, unsigned tag) { (void)tag; return h_sf_Dup(out, h); }
@@ -109,21 +113,23 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     if (m[1] >> 31) { uint32_t sh = *p++; p += (sh & 1 ? 2 : 0) + (sh >> 1 & 15) + (sh >> 5 & 15); }   // special header: process ID, copy and move handles
     p += nx * 2 + nabw * 3;
     size_t data = (size_t)((uint8_t *)p - base), cm = (data + 15) & ~(size_t)15;
-    int dom = g_sf[i].domain && (type == 4 || type == 6);
+    int dom = atomic_load_explicit(&g_sf[i].domain, memory_order_relaxed) && (type == 4 || type == 6);
     unsigned dtype = dom ? base[cm] : 1, obj = dom ? *(uint32_t *)(base + cm + 4) : 0;
     size_t hin = cm + (dom ? 16 : 0);
     if (hin + 16 > size || data + ndw * 4 > size) { LOG("[RED] sf: %s: request of %u data words does not fit %llu bytes", g_sf[i].name, ndw, (unsigned long long)size); return 0xe401u; }
     uint32_t magic = *(uint32_t *)(base + hin), ver = *(uint32_t *)(base + hin + 4), cmd = *(uint32_t *)(base + hin + 8);
-    static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));
-    if (trace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
+    static _Atomic int trace = -1; int tr = atomic_load_explicit(&trace, memory_order_relaxed);
+    if (tr < 0) { tr = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE")); atomic_store_explicit(&trace, tr, memory_order_relaxed); }
+    if (tr) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
     if (type == 2) return 0xf601u;   // HIPC Close: the session ends, and the kernel answers the closed-session result (SDK 21's client sends one for a session it is done with: Star Fox's camera session)
     if (type != 4 && type != 6) { LOG("[RED] sf: %s: HIPC message type %u not served", g_sf[i].name, type); return 0xe401u; }
     if (dtype == 2) { memset(base, 0, 16); return RES_OK; }   // a domain object closed: nothing to answer
     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
     unsigned key = (obj & 0xff) << 16 | (cmd & 0xffff);   // log each object / command once
-    pthread_mutex_lock(&g_sf_mu); int first = g_sf[i].seen != key; g_sf[i].seen = key; pthread_mutex_unlock(&g_sf_mu);
+    int first; if (time_fast_active()) first = time_fast_sf_seen_mark(&g_sf[i].seen_fast, key);
+    else { pthread_mutex_lock(&g_sf_mu); first = atomic_load_explicit(&g_sf[i].seen, memory_order_relaxed) != key; atomic_store_explicit(&g_sf[i].seen, key, memory_order_relaxed); pthread_mutex_unlock(&g_sf_mu); }
     uint32_t copy = 0; Result res = g_sf[i].answer ? g_sf[i].answer(cmd & 0xffff, &copy) : RES_OK;
-    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): %s%s", g_sf[i].name, obj, cmd, ndw, res ? "fails" : "success, zeroed output", copy ? ", a copied handle" : "");
+    if (first || tr) LOG("sf: %s object %u command %u (%u data words in): %s%s", g_sf[i].name, obj, cmd, ndw, res ? "fails" : "success, zeroed output", copy ? ", a copied handle" : "");
     // The response: no descriptors. Without a handle there is no special header, so the data words start at +8; a copied handle takes a special header (its copy count) and the handle,
     // so they start at +0x10. The CMIF part starts at +0x10 either way (16-byte aligned); everything after the headers up to the buffer's end reads as zero
     size_t end = size < 0x1000 ? size : 0x1000, dw = copy ? 0x10 : 8;
@@ -131,6 +137,6 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     m[1] = (uint32_t)((end - dw) / 4 < 0x3ff ? (end - dw) / 4 : 0x3ff);
     if (copy) { m[1] |= 1u << 31; m[2] = 1u << 1; m[3] = copy; }   // special header: no process ID, 1 copy handle, 0 move handles
     size_t out = 0x10 + (dom ? 16 : 0);
-    uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = res; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
+    uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653 ^ (time_fast_w25_fault() == 5 ? 1u : 0u); o[1] = ver; o[2] = res; o[3] = 0;   // "SFCO"
     return RES_OK;
 }
