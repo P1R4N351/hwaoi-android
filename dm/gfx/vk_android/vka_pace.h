@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "vka_perf_fast.h"
 
 enum { VKP_MAXITV = 6, VKP_N = 1024 };
 typedef struct {
@@ -33,9 +34,14 @@ static inline void vkpace_gpu(vkpace *p, double gpu_ms, double span_ms) {   // a
 // The pct-th percentile (0-100) of v[0..n) in ms; sorts v. -1 when n is 0
 static inline double vkpace_pct(uint32_t *v, int n, int pct) {
     if (n <= 0) return -1;
+    if (vka_perf_fast_on()) return vka_pace_pct_fast(v, n, pct);
     for (int i = 1; i < n; i++) { uint32_t x = v[i]; int j = i; while (j > 0 && v[j - 1] > x) { v[j] = v[j - 1]; j--; } v[j] = x; }
     int k = (int)((int64_t)n * pct / 100); if (k >= n) k = n - 1;
     return v[k] / 1000.0;
+}
+static inline void vkpace_p50_p90(uint32_t *v, int n, double *p50, double *p90) {
+    if (vka_perf_fast_on()) { vka_pace_p50_p90(v, n, p50, p90); return; }
+    *p50 = vkpace_pct(v, n, 50); *p90 = vkpace_pct(v, n, 90);
 }
 // "1 40 %, 2 60 %" (frames at each interval, the share of the window); "none" with no frames
 static inline void vkpace_intervals(const vkpace *p, char *b, size_t n) {

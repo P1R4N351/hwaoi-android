@@ -9,6 +9,7 @@
 // stretch and 94-98 ms after 2.6 s of idle GPU: its clock follows load). DM_VK_ADPF_GPU=0 (live) reports CPU time only
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_perf_fast.h"
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <sys/resource.h>
@@ -38,7 +39,15 @@ static struct {
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static APerformanceHintSession *g_s; static int g_state;   // 0 not tried, 1 usable, -1 not available / off
 enum { MAXT = 16 };
-static int32_t g_tid[MAXT]; static int g_nt, g_dirty;
+static int32_t g_tid[MAXT]; static int g_nt; static _Atomic int g_dirty;
+static vka_perf_cfg g_pcfg;
+static void perf_cfg_load(vka_perf_cfg *c) {
+    int vka_floor_adpf(void);
+    c->adpf_gpu = VKA_ENV("DM_VK_ADPF_GPU", 1);
+    c->adpf_span = VKA_ENV("DM_VK_ADPF_SPAN", -1);
+    c->pace_log = VKA_ENV("DM_VK_PACE_LOG", 5000);
+    c->floor_adpf = vka_floor_adpf();
+}
 static int64_t g_target = 16666667;
 
 static int avail(void) {
@@ -65,8 +74,8 @@ static int avail(void) {
     return 1;
 }
 static void session_update(void) {   // g_mu held
-    if (!g_dirty || !g_nt) return;
-    g_dirty = 0;
+    if (!atomic_load_explicit(&g_dirty, memory_order_acquire) || !g_nt) return;
+    atomic_store_explicit(&g_dirty, 0, memory_order_release);
     if (g_s && H.threads && !H.threads(g_s, g_tid, (size_t)g_nt)) return;
     if (g_s && H.close) H.close(g_s);
     g_s = NULL; int pipe = 0;
@@ -92,7 +101,7 @@ void vka_perf_thread(int nice) {
     int32_t t = (int32_t)gettid();
     pthread_mutex_lock(&g_mu);
     int k = 0; while (k < g_nt && g_tid[k] != t) k++;
-    if (k == g_nt && g_nt < MAXT) { g_tid[g_nt++] = t; g_dirty = 1; }
+    if (k == g_nt && g_nt < MAXT) { g_tid[g_nt++] = t; atomic_store_explicit(&g_dirty, 1, memory_order_release); }
     session_update();
     pthread_mutex_unlock(&g_mu);
 }
@@ -110,7 +119,14 @@ void vka_perf_thread(int nice) {
 // sets the CPU clocks and cores of the replay's threads, and the old reports read a frame recorded in 30 ms at 20 fps as on target against the 50 ms period; whether that
 // holds the frame rate low after the phone cools is open (docs/reference/frame-rate.md "A dynamic interval that does not step back up after the phone cools on the Vulkan
 // replay"): DM_VK_ADPF_SPAN=100 is that A/B arm, the default stays until a phone run shows it helps
-static int span_pct(void) { int vka_floor_adpf(void); int p = VKA_ENV("DM_VK_ADPF_SPAN", -1); if (p < 0) p = vka_floor_adpf() ? 100 : 0; return p <= 0 ? 0 : p > 100 ? 100 : p; }
+static int span_pct(void) {
+    int vka_floor_adpf(void); int p, fa;
+    if (vka_perf_fast_on()) {
+        const vka_perf_cfg *c = vka_perf_cfg_sync(&g_pcfg, atomic_load_explicit(&vka_env_gen, memory_order_relaxed), perf_cfg_load);
+        p = c->adpf_span; fa = c->floor_adpf;
+    } else { p = VKA_ENV("DM_VK_ADPF_SPAN", -1); fa = vka_floor_adpf(); }
+    if (p < 0) p = fa ? 100 : 0; return p <= 0 ? 0 : p > 100 ? 100 : p;
+}
 static int64_t span_target(double period_s, int pct) { (void)period_s; int64_t vka_floor_period_ns(void); return vka_floor_period_ns() * pct / 100; }
 uint64_t vka_floor_span_of(uint64_t f); uint64_t vka_frame_start_ns(uint64_t f); uint64_t now_ns(void);
 static void pace_tick(double period_s);
@@ -127,7 +143,8 @@ void vka_perf_frame(double period_s) {
     static __thread int64_t wlast; clock_gettime(CLOCK_MONOTONIC, &ts); int64_t w = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec, w0 = wlast; wlast = w;
     int64_t gpu = 0;   // the newest frame whose GPU time is in (it comes in a few frames late)
     int64_t s_start = 0, s_total = 0;   // DM_VK_ADPF_SPAN: that frame's start (CLOCK_MONOTONIC) and its span
-    int with_gpu = H.report2 && H.wd_create && H.wd_gpu && VKA_ENV("DM_VK_ADPF_GPU", 1), pct = with_gpu ? span_pct() : 0;   // (the span goes in the reports with GPU time only)
+    int gpu_on = vka_perf_fast_on() ? vka_perf_cfg_sync(&g_pcfg, atomic_load_explicit(&vka_env_gen, memory_order_relaxed), perf_cfg_load)->adpf_gpu : VKA_ENV("DM_VK_ADPF_GPU", 1);
+    int with_gpu = H.report2 && H.wd_create && H.wd_gpu && gpu_on, pct = with_gpu ? span_pct() : 0;   // (the span goes in the reports with GPU time only)
     if (with_gpu) {
         static __thread uint64_t reported; uint64_t f = vka_frame();
         for (uint64_t k = 2; k < 14 && k < f; k++) {
@@ -179,8 +196,16 @@ static void pace_cpu(char *b, size_t n) {   // "now/cap" MHz of each cpufreq pol
     size_t o = 0; b[0] = 0;
     for (int k = 0; k < 16 && o < n; k++) {
         char p[96]; unsigned long cur = 0, max = 0; FILE *f;
-        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_cur_freq", k); if (!(f = fopen(p, "r"))) continue; if (fscanf(f, "%lu", &cur) != 1) cur = 0; fclose(f);
-        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_max_freq", k); if ((f = fopen(p, "r"))) { if (fscanf(f, "%lu", &max) != 1) max = 0; fclose(f); }
+        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_cur_freq", k);
+        if (vka_perf_fast_on()) {
+            char b[64]; ssize_t rn = vka_read_small_file(p, b, sizeof b); uint64_t u = 0;
+            if (rn <= 0) continue; cur = vka_parse_u64_one(b, (size_t)rn, &u) ? (unsigned long)u : 0;
+            snprintf(p, sizeof p, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_max_freq", k);
+            rn = vka_read_small_file(p, b, sizeof b); if (rn > 0 && vka_parse_u64_one(b, (size_t)rn, &u)) max = (unsigned long)u;
+        } else {
+            if (!(f = fopen(p, "r"))) continue; if (fscanf(f, "%lu", &cur) != 1) cur = 0; fclose(f);
+            snprintf(p, sizeof p, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_max_freq", k); if ((f = fopen(p, "r"))) { if (fscanf(f, "%lu", &max) != 1) max = 0; fclose(f); }
+        }
         int w = snprintf(b + o, n - o, "%s%lu/%lu", o ? " " : "", cur / 1000, max / 1000); if (w < 0) break; o += (size_t)w;
     }
     if (!b[0]) snprintf(b, n, "not readable");
@@ -192,10 +217,15 @@ static void pace_gpu(char *b, size_t n) {
     static const char *const pp[2][2] = {{"/sys/class/kgsl/kgsl-3d0/gpuclk", "/sys/class/kgsl/kgsl-3d0/max_gpuclk"}, {"/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq"}};
     for (int k = 0; k < 2; k++) {
         unsigned long cur = 0, max = 0; FILE *f;
-        if (!(f = fopen(pp[k][0], "re"))) continue;
-        int ok = fscanf(f, "%lu", &cur) == 1; fclose(f);
-        if (!ok || !cur) continue;
-        if ((f = fopen(pp[k][1], "re"))) { if (fscanf(f, "%lu", &max) != 1) max = 0; fclose(f); }
+        if (vka_perf_fast_on()) {
+            char b[64]; ssize_t rn = vka_read_small_file(pp[k][0], b, sizeof b); uint64_t u = 0;
+            if (rn <= 0 || !vka_parse_u64_one(b, (size_t)rn, &u) || !u) continue; cur = (unsigned long)u;
+            rn = vka_read_small_file(pp[k][1], b, sizeof b); if (rn > 0 && vka_parse_u64_one(b, (size_t)rn, &u)) max = (unsigned long)u;
+        } else {
+            if (!(f = fopen(pp[k][0], "re"))) continue;
+            int ok = fscanf(f, "%lu", &cur) == 1; fclose(f); if (!ok || !cur) continue;
+            if ((f = fopen(pp[k][1], "re"))) { if (fscanf(f, "%lu", &max) != 1) max = 0; fclose(f); }
+        }
         snprintf(b, n, "%lu/%lu", cur / 1000000, max / 1000000); return;
     }
     snprintf(b, n, "not readable");
@@ -211,10 +241,17 @@ int vka_rec_tid(void); int vka_enc_tid(void);
 static int pace_thr(int tid, vkpace_thr *o) {
     if (tid <= 0) return 0;
     char p[64], b[2048]; FILE *f; int ok = 0;
-    snprintf(p, sizeof p, "/proc/self/task/%d/schedstat", tid);
-    if ((f = fopen(p, "re"))) { size_t k = fread(b, 1, sizeof b - 1, f); b[k] = 0; fclose(f); ok = vkpace_schedstat(b, o); }
-    snprintf(p, sizeof p, "/proc/self/task/%d/status", tid);
-    if (ok && (f = fopen(p, "re"))) { size_t k = fread(b, 1, sizeof b - 1, f); b[k] = 0; fclose(f); if (!vkpace_status(b, o)) o->vol = o->invol = 0; }
+    if (vka_perf_fast_on()) {
+        snprintf(p, sizeof p, "/proc/self/task/%d/schedstat", tid);
+        if (vka_read_small_file(p, b, sizeof b) > 0) ok = vkpace_schedstat(b, o);
+        snprintf(p, sizeof p, "/proc/self/task/%d/status", tid);
+        if (ok && vka_read_small_file(p, b, sizeof b) > 0 && !vkpace_status(b, o)) o->vol = o->invol = 0;
+    } else {
+        snprintf(p, sizeof p, "/proc/self/task/%d/schedstat", tid);
+        if ((f = fopen(p, "re"))) { size_t k = fread(b, 1, sizeof b - 1, f); b[k] = 0; fclose(f); ok = vkpace_schedstat(b, o); }
+        snprintf(p, sizeof p, "/proc/self/task/%d/status", tid);
+        if (ok && (f = fopen(p, "re"))) { size_t k = fread(b, 1, sizeof b - 1, f); b[k] = 0; fclose(f); if (!vkpace_status(b, o)) o->vol = o->invol = 0; }
+    }
     return ok;
 }
 static void pace_cost(uint64_t f, double nf, uint64_t draws, double rec_ms) {
@@ -241,7 +278,8 @@ static void pace_cost(uint64_t f, double nf, uint64_t draws, double rec_ms) {
 }
 static void pace_tick(double period_s) {
     static vkpace P; static uint64_t sampled;
-    int ms = VKA_ENV("DM_VK_PACE_LOG", 5000); if (ms <= 0) return;
+    int ms = vka_perf_fast_on() ? vka_perf_cfg_sync(&g_pcfg, atomic_load_explicit(&vka_env_gen, memory_order_relaxed), perf_cfg_load)->pace_log : VKA_ENV("DM_VK_PACE_LOG", 5000);
+    if (ms <= 0) return;
     uint64_t now = now_ns(), f = vka_frame(), draws = 0, rec = 0, cpu = vka_worker_sub_cpu(); mtl_stats(NULL, &draws); vka_worker_waits(NULL, &rec);
     if (!P.t0) { vkpace_reset(&P, now, f, draws, rec, cpu); sampled = f > 10 ? f - 10 : 0; return; }   // (sampled <= f - 10 from here on: the catch-up below cannot wrap)
     vkpace_frame(&P, period_s);
@@ -257,9 +295,11 @@ static void pace_tick(double period_s) {
     pthread_mutex_lock(&g_mu); int have = g_state > 0 && g_s; int64_t tg = g_target; pthread_mutex_unlock(&g_mu);   // (other threads join the session under g_mu)
     char adpf[64]; if (!have) snprintf(adpf, sizeof adpf, "no session"); else if (pct) snprintf(adpf, sizeof adpf, "span against %.1f ms", tg / 1e6); else snprintf(adpf, sizeof adpf, "present period against %.1f ms", tg / 1e6);
     char flb[48]; if (fl < 0) snprintf(flb, sizeof flb, "%s", fk); else snprintf(flb, sizeof flb, "%s %d %% (%d)", fk, fl, flr);
+    double gp50 = 0, gp90 = 0, sp50 = 0, sp90 = 0;
+    vkpace_p50_p90(P.gpu_us, P.ng, &gp50, &gp90); vkpace_p50_p90(P.span_us, P.ns, &sp50, &sp90);
     VLOG("pace up to frame %llu (%.1f s): interval %s; %.1f fps; GPU busy p50/p90 %.1f/%.1f ms, recording start to GPU end p50/p90 %.1f/%.1f ms; replay recording %.1f ms a frame (its CPU %.1f), %.0f draws; "
          "GPU clock floor %s; ADPF %s; window %d fps, panel %.2f Hz; thermal %d, headroom %.2f; CPU MHz %s; GPU MHz %s",
-         (unsigned long long)f, s, itv, nf / s, vkpace_pct(P.gpu_us, P.ng, 50), vkpace_pct(P.gpu_us, P.ng, 90), vkpace_pct(P.span_us, P.ns, 50), vkpace_pct(P.span_us, P.ns, 90),
+         (unsigned long long)f, s, itv, nf / s, gp50, gp90, sp50, sp90,
          nf ? (rec - P.rec0) / 1e6 / nf : 0.0, nf ? (cpu - P.cpu0) / 1e6 / nf : 0.0, nf ? (draws - P.draws0) / nf : 0.0, flb, adpf, wfps, hz, th, (double)head, cpus, gpus);
     pace_cost(f, nf, draws - P.draws0, nf ? (rec - P.rec0) / 1e6 / nf : 0.0);
     vkpace_reset(&P, now, f, draws, rec, cpu);
@@ -303,15 +343,27 @@ static int ts_read(tsnap *s) {
     while ((de = readdir(d)) && s->n < TS_MAX) {
         int tid = atoi(de->d_name); if (tid <= 0) continue;
         uint64_t ns = 0; int ok = 0;
-        snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", tid);
-        FILE *f = fopen(path, "re");
-        if (f) { unsigned long long r; ok = fscanf(f, "%llu", &r) == 1; fclose(f); ns = ok ? r : 0; }
-        if (!ok) {
-            snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
-            if ((f = fopen(path, "re"))) {
-                size_t k = fread(b, 1, sizeof b - 1, f); fclose(f); b[k] = 0;
-                char *q = strrchr(b, ')'); unsigned long long ut, st;
-                if (q && sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) == 2) { ns = (ut + st) * (1000000000ull / (uint64_t)hz); ok = 1; }
+        if (vka_perf_fast_on()) {
+            snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", tid);
+            ssize_t rn = vka_read_small_file(path, b, sizeof b);
+            if (rn > 0 && vka_parse_u64_one(b, (size_t)rn, &ns)) ok = 1;
+            if (!ok) {
+                snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+                rn = vka_read_small_file(path, b, sizeof b);
+                uint64_t ut = 0, st = 0;
+                if (rn > 0 && vka_parse_stat_ut_st(b, (size_t)rn, &ut, &st)) { ns = (ut + st) * (1000000000ull / (uint64_t)hz); ok = 1; }
+            }
+        } else {
+            snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", tid);
+            FILE *f = fopen(path, "re");
+            if (f) { unsigned long long r; ok = fscanf(f, "%llu", &r) == 1; fclose(f); ns = ok ? r : 0; }
+            if (!ok) {
+                snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+                if ((f = fopen(path, "re"))) {
+                    size_t k = fread(b, 1, sizeof b - 1, f); fclose(f); b[k] = 0;
+                    char *q = strrchr(b, ')'); unsigned long long ut, st;
+                    if (q && sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) == 2) { ns = (ut + st) * (1000000000ull / (uint64_t)hz); ok = 1; }
+                }
             }
         }
         if (ok) { s->e[s->n].tid = tid; s->e[s->n].ns = ns; s->n++; }
@@ -322,8 +374,12 @@ static int ts_read(tsnap *s) {
 static int ts_period_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_LONGFRAME_THREADS"); v = e ? atoi(e) : 250; if (v < 0) v = 0; } return v; }
 static void ts_busiest(const tsnap *base, const tsnap *now, char *out, size_t n) {   // "busiest threads over <ms>: '<name>' <ms>, …" between two readings
     struct { int tid; uint64_t d; } top[3] = {{0}};
+    vka_tid_map bm; int use_fast = vka_perf_fast_on();
+    if (use_fast) { vka_tid_map_init(&bm); for (int j = 0; j < base->n && j < TS_MAX; j++) vka_tid_map_put(&bm, base->e[j].tid, base->e[j].ns); }
     for (int i = 0; i < now->n; i++) {
-        uint64_t prev = 0; for (int j = 0; j < base->n; j++) if (base->e[j].tid == now->e[i].tid) { prev = base->e[j].ns; break; }   // a thread born since: all of its time
+        uint64_t prev = 0;
+        if (use_fast) prev = vka_tid_map_get(&bm, now->e[i].tid);
+        else for (int j = 0; j < base->n; j++) if (base->e[j].tid == now->e[i].tid) { prev = base->e[j].ns; break; }
         uint64_t d = now->e[i].ns > prev ? now->e[i].ns - prev : 0;
         for (int k = 0; k < 3; k++) if (d > top[k].d) { for (int m = 2; m > k; m--) top[m] = top[m - 1]; top[k].tid = now->e[i].tid; top[k].d = d; break; }
     }

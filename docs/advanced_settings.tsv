@@ -662,6 +662,7 @@ DM_VK_PCACHE_FAST	developer	Graphics			text			both
 DM_VK_PCACHE_KEEP	developer	Memory			text			both							
 DM_VK_PCACHE_SAVE_S	developer	Memory			text			both							
 DM_VK_PCACHE_SAVE_SLOW_S	developer	Memory			text			both							
+DM_VK_PERF_FAST	developer	Graphics			text			both							
 DM_VK_PFB_SPV_DIR	internal	Diagnostics			text			both						test harness	
 DM_VK_PICTURE_ASPECT	developer	Graphics			text			both							
 DM_VK_PICTURE_SIZE	developer	Graphics			text			both							

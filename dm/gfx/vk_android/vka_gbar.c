@@ -10,10 +10,13 @@
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vka_gbar.h"
+#include "vka_perf_fast.h"
 #include <stdio.h>
 
 static _Atomic(VkCommandBuffer) g_tcb;   // the replay's command buffer being recorded (vka_gbar_cb); the state below is the replay thread's
 static vkgb G; static vkgb_stats GS, GS0;
+static vka_env_gen_i32 g_bar_narrow_cfg;
+static int gbar_rd_env(const char *k, int def) { (void)k; return VKA_ENV("DM_VK_BAR_NARROW", def); }
 
 #define GB_FNS(X) X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdUpdateBuffer) X(vkCmdFillBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
     X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdBeginRendering) X(vkCmdBeginRenderPass) \
@@ -74,7 +77,8 @@ void vka_gbar_settle(VkCommandBuffer cb) { pre(cb, VKGB_C_WORK); }
 // A game barrier outside a draw pass (vka_exec.c OP_BARRIER): 1 = taken, 0 = the caller records the full barrier
 int vka_gbar_game(VkCommandBuffer cb, uint32_t bits) {
     if (!cb || cb != atomic_load_explicit(&g_tcb, memory_order_relaxed) || vka_rp_is_open()) { GS.full++; return 0; }
-    if (!vkgb_game(&G, bits, VKA_ENV("DM_VK_BAR_NARROW", 1) != 0, &GS)) return 0;
+    int narrow = vka_perf_fast_on() ? vka_env_cached_i32(&g_bar_narrow_cfg, atomic_load_explicit(&vka_env_gen, memory_order_relaxed), "DM_VK_BAR_NARROW", 1, gbar_rd_env) : VKA_ENV("DM_VK_BAR_NARROW", 1);
+    if (!vkgb_game(&G, bits, narrow != 0, &GS)) return 0;
     // The dispatches before it need no barrier of the host's after them ("Dispatch order"): this one is recorded before any other work
     { extern uint64_t vka_disp_cleared; VkCommandBuffer p = cb; if (atomic_compare_exchange_strong(&vka_disp_pend, &p, VK_NULL_HANDLE)) vka_disp_cleared++; }
     return 1;
