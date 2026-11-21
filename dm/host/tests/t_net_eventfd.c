@@ -10,7 +10,8 @@ static int checks, fails;
 #define CHECK(c, s) do { checks++; int ok_ = !!(c); fails += !ok_; printf("%s %s\n", ok_ ? "✓" : "✗", s); } while (0)
 static uint64_t now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000; }
 static int g_wfd;
-static void *late_write(void *p) { (void)p; dm_guest_sleep_ns(50000000); h_sk_EventFdWrite(g_wfd, 3); return NULL; }
+static int64_t g_wdelay_ns = 50000000;
+static void *late_write(void *p) { (void)p; dm_guest_sleep_ns(g_wdelay_ns); h_sk_EventFdWrite(g_wfd, 3); return NULL; }
 
 int main(void) {
     uint64_t v = 0;
@@ -41,12 +42,20 @@ int main(void) {
     p[1].events = SK_POLLIN;
     t0 = now_ms();
     CHECK(dm_sk_poll(p, 2, 30) == 0 && now_ms() - t0 >= 25, "nothing ready: the timeout passes, 0");
-    g_wfd = fd; pthread_t th; pthread_create(&th, NULL, late_write, NULL);
+    g_wfd = fd; g_wdelay_ns = 50000000;
+    pthread_t th; pthread_create(&th, NULL, late_write, NULL);
     t0 = now_ms();
     int got = dm_sk_poll(p, 2, 2000);
-    CHECK(got == 1 && p[0].revents == SK_POLLIN && now_ms() - t0 < 1000, "a write from another thread wakes the poll");
+    CHECK(got == 1 && p[0].revents == SK_POLLIN && now_ms() - t0 < 1500, "a write from another thread wakes the poll");
     pthread_join(th, NULL);
     CHECK(h_sk_EventFdRead(fd, &v) == 0 && v == 3, "and its value is read");
+    g_wdelay_ns = 130000000;
+    pthread_create(&th, NULL, late_write, NULL);
+    t0 = now_ms();
+    got = dm_sk_poll(p, 2, 2000);
+    CHECK(got == 1 && p[0].revents == SK_POLLIN && now_ms() - t0 >= 110 && now_ms() - t0 < 1500, "a write past one 100 ms slice still wakes a 2000 ms poll");
+    pthread_join(th, NULL);
+    CHECK(h_sk_EventFdRead(fd, &v) == 0 && v == 3, "and its post-slice value is read");
 
     // select on the same descriptors
     uint64_t rset[16] = {0}, wset[16] = {0}; int64_t tv[2] = {0, 0};

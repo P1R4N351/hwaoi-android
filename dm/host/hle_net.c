@@ -92,6 +92,10 @@ static int efd_err(int sk, int libc) {   // -1 with the socket error code and th
     if (loc) *loc() = libc;
     return -1;
 }
+static int64_t efd_mono_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
 static int efd_wait(int64_t ms) {   // waits for a change of any counter, at most ms (< 0: 100 ms, as an endless wait, sk_idle); 0 when the time is up. Caller holds g_efd_mu
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     int64_t ns = ts.tv_nsec + (ms < 0 || ms > 100 ? 100 : ms) * 1000000;
@@ -192,12 +196,20 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {   // also hle_offline.c's plain 
         static int once; if (!once++) LOG("socket: Poll of %llu descriptors with one the host never made (fd %d, events %#x; %d ms): nothing ready at the timeout", (unsigned long long)n, p[i].fd, p[i].events, ms);
     }
     if (!any) { pthread_mutex_unlock(&g_efd_mu); for (uint64_t i = 0; i < n; i++) p[i].revents = 0; return sk_idle(ms); }
-    int ready;
-    for (int64_t left = ms;;) {
+    int ready = 0;
+    int64_t wait_ms = ms < 0 ? 100 : (ms > 3600000 ? 3600000 : (int64_t)ms);
+    int64_t deadline = wait_ms > 0 ? efd_mono_ms() + wait_ms : 0;
+    for (int step = 0; step < 65536; step++) {
         ready = 0;
-        for (uint64_t i = 0; i < n; i++) { int k = p[i].fd >= 0 ? efd_slot(p[i].fd) : -1; p[i].revents = (int16_t)(k >= 0 ? efd_ready(k, p[i].events) : 0); ready += p[i].revents != 0; }
-        if (ready || !left || !efd_wait(left)) break;   // ready, a zero timeout, or a slice passed with no change
-        if (left > 0) left = left > 100 ? left - 100 : 0;
+        for (uint64_t i = 0; i < n; i++) {
+            int k = p[i].fd >= 0 ? efd_slot(p[i].fd) : -1;
+            p[i].revents = (int16_t)(k >= 0 ? efd_ready(k, p[i].events) : 0);
+            ready += p[i].revents != 0;
+        }
+        if (ready || wait_ms <= 0) break;
+        int64_t rem = deadline - efd_mono_ms();
+        if (rem <= 0) break;
+        (void)efd_wait(rem);
     }
     pthread_mutex_unlock(&g_efd_mu);
     return ready;
