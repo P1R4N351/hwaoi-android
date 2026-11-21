@@ -26,7 +26,7 @@ static uint8_t *g_as;              // ASLR region base = the whole block
 static size_t g_reserve;           // its size: RESERVE, or more with a DM_ALIAS_SIZE alias region
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
-int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }
+int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = atomic_load_explicit(&g_heap_cur, memory_order_acquire); return g_heap && a >= b && n <= cur && a - b <= cur - n; }
 // The opened heap span for callers that address guest memory by region (hle_cheats.c region 1, like dmnt's heap extents): the
 // reservation's base (guest address) and the length the game has actually opened with SetHeapSize right now, which grows and
 // shrinks with it; both 0 until the game's first SetHeapSize. There is no lock: the caller uses the pair only to bounds-check and
@@ -125,6 +125,7 @@ static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++)
 // without it the game asks for pool − 64 MB = 3.15 GB of heap
 // Like image_bytes, exclude NROs: their buffers already belong to the game's heap. Counting every offline-mapped NRO's bss made FFX/X-2's used memory exceed its pool before any LoadModule.
 static _Atomic uint32_t g_map_seq = 2;
+uint32_t dm_guest_map_seq_load(void) { return atomic_load_explicit(&g_map_seq, memory_order_acquire); }
 static _Thread_local svc_fast_qmem_tls g_qmem_tls;
 static size_t big_bss_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro && g_mod[i].patch_off < 0) n += g_mod[i].size - g_mod[i].back_len - g_mod[i].file_image_len; return n; }
 

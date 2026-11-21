@@ -16,7 +16,7 @@ GAME_H = ../gen/$(GAME)/game_profile.h
 # reference to an undefined symbol only when it is named as allowed to stay undefined
 WEAK_HOST = -Wl,-U,_vka_swap_rb
 
-run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_time_fast_w25 $(B)/t_gate_fast_w26 $(B)/t_fs_lookup_fast_w27 $(B)/t_oe_fast_w28 $(B)/t_audren_fast_w29 $(B)/t_worker_fast_w30 $(B)/t_movie_fast_w31 $(B)/t_imgmem_fast_w32 $(B)/t_shlib_fast_w33 $(B)/t_pcache_fast_w34 $(B)/t_exec_fast_w35 $(B)/t_present_fast_w36 $(B)/t_perf_fast_w37 $(B)/t_fg_fast_w38 $(B)/t_spvpatch_fast_w39 $(B)/t_ovl_fast_w40 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
+run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_time_fast_w25 $(B)/t_gate_fast_w26 $(B)/t_fs_lookup_fast_w27 $(B)/t_oe_fast_w28 $(B)/t_audren_fast_w29 $(B)/t_worker_fast_w30 $(B)/t_movie_fast_w31 $(B)/t_imgmem_fast_w32 $(B)/t_shlib_fast_w33 $(B)/t_pcache_fast_w34 $(B)/t_exec_fast_w35 $(B)/t_present_fast_w36 $(B)/t_perf_fast_w37 $(B)/t_fg_fast_w38 $(B)/t_spvpatch_fast_w39 $(B)/t_ovl_fast_w40 $(B)/t_fps_fast_w41 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
 	$(B)/t_language
 	$(B)/t_heap_size
 	$(B)/t_touch
@@ -51,6 +51,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_fg_fast_w38
 	$(B)/t_spvpatch_fast_w39
 	$(B)/t_ovl_fast_w40
+	$(B)/t_fps_fast_w41
 	$(B)/t_output_stream
 	$(B)/t_opus_hw
 	$(B)/t_audio_spsc
@@ -307,6 +308,8 @@ $(B)/t_spvpatch_fast_w39: t_spvpatch_fast_w39.c ../../gfx/vk_android/vka_spvpatc
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W39_TEST_HOOKS -I.. -o $@ t_spvpatch_fast_w39.c ../../gfx/vk_android/vka_spvpatch.c ../../gfx/vk_android/vka_memu_spv.c -lpthread
 $(B)/t_ovl_fast_w40: t_ovl_fast_w40.c ../../gfx/vk_android/vka_ovl_fast.h | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W40_TEST_HOOKS -I.. -o $@ t_ovl_fast_w40.c -lpthread
+$(B)/t_fps_fast_w41: t_fps_fast_w41.c ../fps_fast.h ../drs_steps.h | $(B)
+	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W41_TEST_HOOKS -I.. -o $@ t_fps_fast_w41.c -lm -lpthread
 $(B)/t_fg_fast_w38: t_fg_fast_w38.c ../../gfx/vk_android/vka_fg_fast.h | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W38_TEST_HOOKS -I.. -o $@ t_fg_fast_w38.c -lm -lpthread
 run: $(B)/t_audio_stats
@@ -319,7 +322,7 @@ run: audio-device
 $(B)/t_audio_spsc_tsan: t_audio_spsc.c ../hle_audio.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -O1 -fsanitize=thread -Wno-unused-function -I.. $(GINC) -o $@ t_audio_spsc.c ../hle_bigstack.c -framework AudioToolbox
 run: $(B)/t_fpslock
-$(B)/t_fpslock: t_fpslock.c ../hle_fpslock.c ../hle.h ../dm.h $(GAME_H) | $(B)
+$(B)/t_fpslock: t_fpslock.c ../hle_fpslock.c ../fps_fast.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wno-unused-function $(GINC) -o $@ t_fpslock.c
 run: $(B)/t_uecvar
 $(B)/t_uecvar: t_uecvar.c ../hle_uecvar.c ../hle.h ../dm.h $(GAME_H) | $(B)
@@ -433,7 +436,7 @@ render-cfg: $(B)/t_render_cfg
 	$(B)/t_render_cfg wrong $(QUIET)
 	$(B)/t_render_cfg pool $(QUIET)
 	$(B)/t_render_cfg big $(QUIET)
-$(B)/t_resolution: t_resolution.c ../hle_fpslock.c ../hle.h ../dm.h $(GAME_H) | $(B)
+$(B)/t_resolution: t_resolution.c ../hle_fpslock.c ../fps_fast.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	clang -O1 -Wall -Werror -Wno-unused-function -fsanitize=undefined -I.. $(GINC) -o $@ t_resolution.c
 .PHONY: resolution
 run: resolution
@@ -740,7 +743,7 @@ run: $(B)/t_dkb_wide
 $(B)/t_dkb_wide: t_dkb_wide.c ../android/dkb_wide.c ../android/wide_shape.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wno-unused-function -I.. $(GINC) -o $@ t_dkb_wide.c -lm -pthread
 run: $(B)/t_drs_steps
-$(B)/t_drs_steps: t_drs_steps.c ../drs_steps.h | $(B)
+$(B)/t_drs_steps: t_drs_steps.c ../drs_steps.h ../fps_fast.h | $(B)
 	$(CLANG) -O1 -g -o $@ t_drs_steps.c -lm
 run: $(B)/t_pkp_aspect
 $(B)/t_pkp_aspect: t_pkp_aspect.c ../android/pkp_aspect.c ../hle.h ../dm.h $(GAME_H) | $(B)

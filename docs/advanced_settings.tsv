@@ -80,6 +80,7 @@ DM_FONT_DIR	developer	Diagnostics			text			both
 DM_FORCE_STRICT	developer	Diagnostics			text			both							
 DM_FPS	developer	Performance			text			both							
 DM_FPS_DECOUPLE	developer	Performance			text			both							
+DM_FPS_FAST	developer	Performance			text			both							
 DM_FPS_HOLD	developer	Performance			text			both							
 DM_FPS_HOLD60	developer	Performance			text			both							
 DM_FPS_LIMIT	advanced	Performance	Frame rate cap		toggle			game		Game settings > Frame rate cap					

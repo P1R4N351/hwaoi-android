@@ -11,6 +11,7 @@
 // fixups UNITY_*). Monolith's native interval controls both the wait and the simulation's elapsed-time step; monolith_fps.py recognizes reviewed engine implementations and derives its
 // global (MONOLITH_INTERVAL: Xenoblade Chronicles 2 and 3, X DE). These came from upstream nxnative (f5f6d4b5, bd979ced, 62f6a52c, 50aefc12, aa9e0ff7)
 #include "hle.h"
+#include "fps_fast.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <time.h>
@@ -134,7 +135,16 @@ static const steps_row_t k_steps[] = DM_FPS_STEPS_ROWS;
 #define NSTEPS DM_FPS_NSTEPS_ROWS
 #define STEPS_MAX 3    // 20 fps: the most steps a frame offered (each 1/60 s)
 #define STEPS_HOLD 3   // a mode outside the game's 0..2: its pick then leaves the count the host wrote
-static int rd(uint64_t a, void *out, size_t n) { return a >= 0x1000 && !plat_mem_read(a, out, n); }
+__attribute__((weak)) int dm_guest_heap_readable(uint64_t a, size_t n) { (void)a; (void)n; return 0; }
+__attribute__((weak)) uint32_t dm_guest_map_seq_load(void) { return 0; }
+static _Thread_local dm_fps_pcache_tls g_fps_pcache;
+static uint8_t *g_mod_base;
+static size_t g_mod_span;
+static int rd_slow(uint64_t a, void *out, size_t n) { return a >= 0x1000 && !plat_mem_read(a, out, n); }
+static int rd(uint64_t a, void *out, size_t n) {
+    return dm_fps_rd_fast(a, out, n, (uint64_t)(uintptr_t)g_mod_base, g_mod_span, &g_fps_pcache,
+        dm_guest_heap_readable, dm_guest_map_seq_load, rd_slow);
+}
 
 // NieR 1.0.3 exposes its preset minimum but ships fixed mode-specific fallbacks.
 // Keep the native current-scale and UV controller intact; only select its
@@ -321,6 +331,8 @@ static void lock_find(void) {
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
         // the rewriter left a timing correction this main's engine rule needs uninstalled (patch_nso.py NATIVE_FPS_BLOCKED): writing a frame rate would run the game at the wrong speed
         if (g_mod[i].native_fps_blocked) { LOG("[RED] main: native frame target disabled: a required timing correction did not match"); continue; }
+        g_mod_base = g_mod[i].base;
+        g_mod_span = g_mod[i].back_off ? (size_t)g_mod[i].back_off : g_mod[i].size;
         for (int k = 0; k < (int)(sizeof k_nier_dr / sizeof *k_nier_dr); k++) if (!strcmp(g_mod[i].build_id, k_nier_dr[k].build)) { base = g_mod[i].base; nier = 1; display = k_nier_dr[k].display; }
         for (int k = 0; k < NLOCKS; k++) if (!strcmp(g_mod[i].build_id, k_locks[k].build)) { rows[nrow++] = &k_locks[k]; base = g_mod[i].base; }
         if (target_row(&g_mod[i], &target_lock)) { rows[nrow++] = &target_lock; base = g_mod[i].base; }
@@ -363,7 +375,7 @@ static _Atomic int g_target = -1, g_target_gen; static const char *g_target_src;
 __attribute__((weak)) uint8_t *dm_fps_state;   // loader.c: the frame step state page (NULL without a frame step); the unit tests have no loader
 void dm_fps_step_fold(void);   // below: the frame limit folded into the frame step's cap
 int dm_fps_target(void) {
-    int t = atomic_load(&g_target);
+    int t = dm_fps_fast_on() ? atomic_load_explicit(&g_target, memory_order_acquire) : atomic_load(&g_target);
     if (t >= 0) return t;
     const char *e = getenv("DM_FPS_TARGET"); t = e ? atoi(e) : DM_GAME_FPS_TARGET;
     if (!target_ok(t)) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 15, 20, 30, 40, 45 or 60; leaving the game's frame limit", e); t = 0; }
@@ -371,7 +383,9 @@ int dm_fps_target(void) {
     if (atomic_compare_exchange_strong(&g_target, &was, t)) g_target_src = e ? "DM_FPS_TARGET" : "game profile fps_target";
     return atomic_load(&g_target);
 }
-int dm_fps_target_gen(void) { return atomic_load(&g_target_gen); }
+int dm_fps_target_gen(void) {
+    return dm_fps_fast_on() ? atomic_load_explicit(&g_target_gen, memory_order_acquire) : atomic_load(&g_target_gen);
+}
 void dm_fps_target_set(int t, const char *src) {
     if (!target_ok(t)) { LOG("[RED] frame rate cap %d (%s): must be 0, 15, 20, 30, 40, 45 or 60; unchanged", t, src); return; }
     dm_fps_target(); g_target_src = src; atomic_store(&g_target, t); atomic_fetch_add(&g_target_gen, 1);
@@ -391,11 +405,12 @@ static uint64_t row_obj(const lock_t *L) {
     return obj;
 }
 // A floor row's controller maximum (the int32 after the floor, set by the game), or 0 while the game has not made the controller or set it
-static int floor_max(const lock_t *L) {
-    uint64_t obj = row_obj(L); int32_t mx;
+static int floor_max_at(uint64_t obj, const lock_t *L) {
+    int32_t mx;
     if (!obj || !rd(obj + L->field + 4, &mx, sizeof mx) || mx < 1 || mx > 60) return 0;
     return mx;
 }
+static int floor_max(const lock_t *L) { return floor_max_at(row_obj(L), L); }
 // Whether a row can hold cap t: its kind's rates (rate_ok), and for a floor no more vsyncs than the controller's own maximum (while that is unknown, the write waits for it)
 static int row_holds(const lock_t *L, int t) {
     if (!rate_ok(L->kind, t)) return 0;
@@ -462,7 +477,7 @@ __attribute__((visibility("default"))) void nxhost_fps_decouple_set(int on) {
     LOG("main: frame rate decoupling %s (%s)", on ? "on" : "off", g_decouple_src);
 }
 static int sead_rate_on(void) {
-    int v = atomic_load(&g_decouple);
+    int v = dm_fps_fast_on() ? atomic_load_explicit(&g_decouple, memory_order_acquire) : atomic_load(&g_decouple);
     if (v >= 0) return v;
     const char *e = getenv("DM_FPS_DECOUPLE"); int was = -1;
     v = !e || atoi(e) != 0;
@@ -607,7 +622,7 @@ static int fps_limit_start(void) {
     if (atomic_compare_exchange_strong(&g_fps_limit, &was, l)) { g_fps_limit_src = e ? "DM_FPS_LIMIT" : "game profile fps_limit"; if (l) LOG("main: frame limit %d fps (%s)", l, g_fps_limit_src); }
     return atomic_load(&g_fps_limit);
 }
-static int limit_raw(void) { int l = atomic_load(&g_fps_limit); if (l < 0) l = fps_limit_start(); return l > 0 ? l : 0; }
+static int limit_raw(void) { int l = dm_fps_fast_on() ? atomic_load_explicit(&g_fps_limit, memory_order_acquire) : atomic_load(&g_fps_limit); if (l < 0) l = fps_limit_start(); return l > 0 ? l : 0; }
 // A game with a frame step (the rewriter's stubs, a state page: loader.c) steps its game time by the vsyncs the host hands it each frame (hle_nvn.c fstep_tick). The limiter
 // alone held such a game's frames to the limit while the game went on stepping by its own interval: Ocarina of Time (0400486024DEC000) kept interval 1 (1/60 s a frame) at
 // the profile's 30 fps limit and ran at half speed, and at 25 fps uncapped at 0.4. So for such a game the limit is the frame step's cap, in whole vsyncs: 60, 30 or 20 fps
@@ -663,7 +678,7 @@ static void fps_limit_wait(void) {
 static _Atomic int g_hold60 = -1;
 __attribute__((visibility("default"))) void nxhost_fps_hold60_set(int on) { atomic_store(&g_hold60, on != 0); LOG("main: hold 60 fps %s (the launcher's in-game panel)", on ? "on" : "off"); }
 static int hold60_on(void) {
-    int v = atomic_load(&g_hold60);
+    int v = dm_fps_fast_on() ? atomic_load_explicit(&g_hold60, memory_order_acquire) : atomic_load(&g_hold60);
     if (v >= 0) return v;
     const char *e = getenv("DM_FPS_HOLD60"); int was = -1; v = e && atoi(e) > 0;
     if (atomic_compare_exchange_strong(&g_hold60, &was, v) && v) LOG("main: hold 60 fps on (DM_FPS_HOLD60=1): one framework step a frame where the game's own mode would drop to 30 fps");
@@ -694,156 +709,178 @@ static void steps_tick(const lock_t *L, int r, int target, const char *src) {
     }
 }
 
+static struct {
+    int state, target, gen, start_cap;
+    const char *src;
+    int nlog[NROWS];
+    uint8_t over[NROWS];
+    uint32_t orig[NROWS][2];
+    uint8_t have_orig[NROWS][2];
+} g_tick = { .state = -2, .gen = -1 };
+
+static void fps_lock_restore_rows(void) {
+    for (int r = 0; r < nrow; r++) {
+        uint64_t obj = row_obj(rows[r]); if (!obj) continue;
+        if (rows[r]->kind == EXTRA_VSYNCS_U8) {
+            if (g_tick.have_orig[r][0]) {
+                uint16_t *p = (uint16_t *)(uintptr_t)(obj + rows[r]->field);
+                dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, (uint16_t)g_tick.orig[r][0], __ATOMIC_RELAXED);
+                LOG("main: %s back to the game's least %u most %u (%s)", rows[r]->what, g_tick.orig[r][0] & 0xff, (g_tick.orig[r][0] >> 8) & 0xff, g_tick.src);
+            }
+            continue;
+        }
+        for (int c = 0; c < rows[r]->copies && c < 2; c++) if (g_tick.have_orig[r][c] && rows[r]->kind != FPS_F64) {
+            uint32_t *p = (uint32_t *)(uintptr_t)(obj + rows[r]->field + 4 * (uint64_t)c);
+            dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, g_tick.orig[r][c], __ATOMIC_RELAXED);
+            int k = rows[r]->kind; float fv; memcpy(&fv, &g_tick.orig[r][c], sizeof fv);
+            if (k == FPS_F32 || k == MS_F32 || k == SECS_F32) LOG("main: %s back to the game's %g (%s)", rows[r]->what, fv, g_tick.src);
+            else LOG("main: %s back to the game's %u (%s)", rows[r]->what, g_tick.orig[r][c], g_tick.src);
+        }
+    }
+}
+
+static void fps_lock_handle_gen(int g) {
+    int first = g_tick.gen < 0, t = dm_fps_target();
+    g_tick.gen = g; g_tick.src = g_target_src;
+    if (!t) {
+        if (first) {
+            for (int r = 0; r < nrow; r++) LOG("main: %s left as the game sets it (%s)", rows[r]->what, g_tick.src);
+            if (nier) LOG("main: NieR frame interval left as the game sets it (%s)", g_tick.src);
+            if (fb.n) LOG("main: Frostbite simulation rate left as the game sets it (%s)", g_tick.src);
+            if (uq.base) LOG("main: Unity vSyncCount left as the game sets it (%s)", g_tick.src);
+        } else {
+            if (uq.base) unity_vsync_restore(g_tick.src);
+            fps_lock_restore_rows();
+        }
+    } else {
+        for (int r = 0; r < nrow; r++)
+            if (!rate_ok(rows[r]->kind, t) && rows[r]->kind != STEPS_I32)
+                LOG("main: %s cannot hold %d fps (whole vsyncs only): left as the game sets it (%s)", rows[r]->what, t, g_tick.src);
+    }
+    g_tick.target = t; g_tick.start_cap = first && t;
+    if (!first) for (int r = 0; r < NROWS; r++) g_tick.nlog[r] = g_tick.over[r] = 0;
+}
+
+static void fps_lock_nier_tick(void) {
+    uint64_t p = 0; static int nlog_nier;
+    uint32_t want = (uint32_t)(60 / g_tick.target), want_mode = want - 1, cur_mode = 0;
+    if (rd((uint64_t)(uintptr_t)(base + display + 0x504), &cur_mode, sizeof cur_mode) && cur_mode != want_mode && (cur_mode == 0 || cur_mode == 1)) {
+        uint32_t *dst = (uint32_t *)(uintptr_t)(base + display + 0x504);
+        dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want_mode, __ATOMIC_RELAXED);
+    }
+    if (rd((uint64_t)(uintptr_t)(base + display), &p, sizeof p) && p) {
+        uint64_t a = p + 0x9c160; uint32_t cur = 0;
+        if (rd(a, &cur, sizeof cur) && cur != want && (cur == 1 || cur == 2)) {
+            uint32_t *dst = (uint32_t *)(uintptr_t)a;
+            dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want, __ATOMIC_RELAXED);
+            if (nlog_nier++ < 8) LOG("main: NieR frame interval %u → %u (%d fps; %s)", cur, want, g_tick.target, g_tick.src);
+        }
+    }
+}
+
+static int fps_lock_prepare_u32(const lock_t *L, int r, uint64_t obj, uint32_t cur, uint32_t *want, char *was, size_t wlen) {
+    if (L->kind == FPS_F32 || L->kind == MS_F32) {
+        int ms = L->kind == MS_F32; float f, w = ms ? ms_want(g_tick.target) : (float)g_tick.target; memcpy(&f, &cur, sizeof f); memcpy(want, &w, sizeof *want);
+        if (cur == *want || !(ms ? f >= 8 && f <= 100 : f >= 10 && f <= 120)) return 0;
+        snprintf(was, wlen, ms ? "%.3f ms" : "%g", f);
+    } else if (L->kind == SECS_F32) {
+        float f, w = 1.0f / (float)g_tick.target; memcpy(&f, &cur, sizeof f); memcpy(want, &w, sizeof *want);
+        if (cur == *want || !(f >= 1.0f / 120 && f <= 0.1f)) return 0;
+        snprintf(was, wlen, "%.5f s", f);
+    } else if (L->kind == TICKS_U32) {
+        *want = L->scale / (uint32_t)g_tick.target;
+        if (cur == *want || cur < L->scale / 120 || cur > L->scale / 10) return 0;
+        snprintf(was, wlen, "%u", cur);
+    } else if (L->kind == MODE_U32) {
+        *want = 1;
+        if (cur) return 0;
+        snprintf(was, wlen, "%u", cur);
+    } else {
+        int fps = L->kind == FPS_I32;
+        *want = fps ? (uint32_t)g_tick.target : 60 / (uint32_t)g_tick.target;
+        uint32_t value = !cur && L->kind == VSYNCS_DEFAULT2_I32 ? 2 : cur;
+        if (value == *want || value < (fps ? 10u : 1u) || value > (fps ? 120u : 4u)) return 0;
+        if (L->kind == MIN_VSYNCS_I32) {
+            int mx = dm_fps_fast_on() ? floor_max_at(obj, L) : floor_max(L);
+            if (!mx) return 0;
+            if (*want > (uint32_t)mx) { if (!g_tick.over[r]) { g_tick.over[r] = 1; LOG("main: %s left at %u: %d fps needs %u vsyncs, above the controller's maximum %d (%s)", L->what, cur, g_tick.target, *want, mx, g_tick.src); } return 0; }
+        }
+        snprintf(was, wlen, "%u", cur);
+    }
+    return 1;
+}
+
+static void fps_lock_apply_row(const lock_t *L, int r, uint64_t obj) {
+    if (L->kind == FPS_F64) {
+        for (int c = 0; c < L->copies; c++) {
+            uint64_t a = obj + L->field + 8 * (uint64_t)c; double cur, want = g_tick.target;
+            if (!rd(a, &cur, sizeof cur)) break;
+            if (cur == want || !(cur >= 10 && cur <= 120)) continue;
+            double *p = (double *)(uintptr_t)a; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint64_t *)p, *(uint64_t *)&want, __ATOMIC_RELAXED);
+            if (g_tick.nlog[r] < 8) { g_tick.nlog[r]++; LOG("main: %s%s %g → %d fps (%s)", L->what, L->copies > 1 ? (c ? " (reported rate)" : " (target)") : "", cur, g_tick.target, g_tick.src); }
+        }
+        return;
+    }
+    if (L->kind == EXTRA_VSYNCS_U8) {
+        uint64_t a = obj + L->field; uint16_t cur, want = g_tick.target == 60 ? 0x0000 : g_tick.target == 30 ? 0x0101 : 0xffff;
+        if (want == 0xffff || !rd(a, &cur, sizeof cur) || cur == want) return;
+        if (!g_tick.have_orig[r][0]) { g_tick.orig[r][0] = cur; g_tick.have_orig[r][0] = 1; }
+        uint16_t *p = (uint16_t *)(uintptr_t)a; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+        if (g_tick.nlog[r] < 8) { g_tick.nlog[r]++; LOG("main: %s least %u most %u → least %u most %u (%d fps; %s)", L->what, cur & 0xff, cur >> 8, want & 0xff, want >> 8, g_tick.target, g_tick.src); }
+        return;
+    }
+    for (int c = 0; c < L->copies; c++) {
+        uint64_t a = obj + L->field + 4 * (uint64_t)c; uint32_t cur, want = 0; char was[16];
+        if (!rd(a, &cur, sizeof cur)) break;
+        if (!fps_lock_prepare_u32(L, r, obj, cur, &want, was, sizeof was)) continue;
+        if (c < 2 && !g_tick.have_orig[r][c]) { g_tick.orig[r][c] = cur; g_tick.have_orig[r][c] = 1; }
+        uint32_t *p = (uint32_t *)(uintptr_t)a; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+        if (g_tick.nlog[r] < 8) { g_tick.nlog[r]++; char now[24];
+            if (L->kind == MS_F32) snprintf(now, sizeof now, "%.3f ms (%d fps)", ms_want(g_tick.target), g_tick.target);
+            else if (L->kind == SECS_F32) snprintf(now, sizeof now, "%.5f s (%d fps)", 1.0 / g_tick.target, g_tick.target);
+            else if (L->kind == TICKS_U32) snprintf(now, sizeof now, "%u (%d fps)", want, g_tick.target);
+            else if (L->kind == MODE_U32) snprintf(now, sizeof now, "1 (%d fps)", g_tick.target);
+            else snprintf(now, sizeof now, "%u%s", L->kind == FPS_F32 ? (unsigned)g_tick.target : want, L->kind == FPS_F32 || L->kind == FPS_I32 ? " fps" : " vsyncs");
+            LOG("main: %s%s %s → %s (%s)", L->what, L->copies > 1 ? (c ? " (render thread)" : " (game thread)") : "", was, now, g_tick.src); }
+    }
+}
+
 void dm_fps_lock_tick(void) {
     fps_limit_wait();
-    atomic_fetch_add_explicit(&g_presents, 1, memory_order_relaxed);   // sead_rate's frame count
-    dynamic_resolution_tick();   // separate from the FPS cap
-    static int state = -2, nlog[NROWS], target, gen = -1, start_cap; static const char *src; static uint8_t over[NROWS];
-    static uint32_t orig[NROWS][2]; static uint8_t have_orig[NROWS][2];   // what a row held before the host first wrote it: put back when the cap goes to 0 while the game runs
-    if (state == -1) return;
-    if (state == -2) {
+    atomic_fetch_add_explicit(&g_presents, 1, memory_order_relaxed);
+    dynamic_resolution_tick();
+    if (g_tick.state == -1) return;
+    if (g_tick.state == -2) {
         pthread_once(&g_found, lock_find);
-        if (!nrow && !nier && !fb.n && !uq.base && !ue_missing) { state = -1; return; }
+        if (!nrow && !nier && !fb.n && !uq.base && !ue_missing) { g_tick.state = -1; return; }
         int t = dm_fps_target();
         if (t && ue_missing) LOG("[RED] main: Unreal %s not found by the rewriter (ue_cvar.py NAMES; game profile ue_fps_cvar): the game's own frame limit stays", DM_GAME_UE_FPS_CVAR);
-        if (!nrow && !nier && !fb.n && !uq.base) { state = -1; return; }
-        state = 0;
+        if (!nrow && !nier && !fb.n && !uq.base) { g_tick.state = -1; return; }
+        g_tick.state = 0;
     }
     int g = dm_fps_target_gen();
-    if (g != gen) {   // the start, or a cap set while the game runs
-        int first = gen < 0, t = dm_fps_target(); gen = g; src = g_target_src;
-        if (!t) {
-            if (first) { for (int r = 0; r < nrow; r++) LOG("main: %s left as the game sets it (%s)", rows[r]->what, src); if (nier) LOG("main: NieR frame interval left as the game sets it (%s)", src);
-                         if (fb.n) LOG("main: Frostbite simulation rate left as the game sets it (%s)", src); if (uq.base) LOG("main: Unity vSyncCount left as the game sets it (%s)", src); }
-            else if (uq.base) unity_vsync_restore(src);
-            if (!first) for (int r = 0; r < nrow; r++) {   // back to the game's own: the values the game had before the host wrote them (NieR and Frostbite keep the last cap until the game sets them again)
-                uint64_t obj = row_obj(rows[r]); if (!obj) continue;
-                if (rows[r]->kind == EXTRA_VSYNCS_U8) {   // the two bytes the game had (least 0, most 1 in play)
-                    if (have_orig[r][0]) { uint16_t *p = (uint16_t *)(uintptr_t)(obj + rows[r]->field); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, (uint16_t)orig[r][0], __ATOMIC_RELAXED);
-                                           LOG("main: %s back to the game's least %u most %u (%s)", rows[r]->what, orig[r][0] & 0xff, (orig[r][0] >> 8) & 0xff, src); }
-                    continue;
-                }
-                for (int c = 0; c < rows[r]->copies && c < 2; c++) if (have_orig[r][c] && rows[r]->kind != FPS_F64) {
-                    uint32_t *p = (uint32_t *)(uintptr_t)(obj + rows[r]->field + 4 * (uint64_t)c); dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, orig[r][c], __ATOMIC_RELAXED);
-                    int k = rows[r]->kind; float fv; memcpy(&fv, &orig[r][c], sizeof fv);
-                    if (k == FPS_F32 || k == MS_F32 || k == SECS_F32) LOG("main: %s back to the game's %g (%s)", rows[r]->what, fv, src);
-                    else LOG("main: %s back to the game's %u (%s)", rows[r]->what, orig[r][c], src);
-                }
-            }
-        }
-        else for (int r = 0; r < nrow; r++) if (!rate_ok(rows[r]->kind, t) && rows[r]->kind != STEPS_I32) LOG("main: %s cannot hold %d fps (whole vsyncs only): left as the game sets it (%s)", rows[r]->what, t, src);
-        target = t; start_cap = first && t;
-        if (!first) for (int r = 0; r < NROWS; r++) nlog[r] = over[r] = 0;
-    }
-    for (int r = 0; r < nrow; r++) if (rows[r]->kind == STEPS_I32) steps_tick(rows[r], r, target, src);   // every frame: the frame limit counts too, without a cap
-    if (!target) {   // no cap: the decoupling and the pin run in sead_rate, the controller's own gate
-        // Without that gate in the pack (a pack the rewriter made before the profile opted in, or by a build that did not find the site) nothing else holds the pin, and the
-        // controller flipped 1 <-> 2 under the host's tick: the 2x speed phases of #207 again. The floor row names the same controller, so the pin is held from here
-        // with decoupling off (it cannot be on without the gate)
+    if (g != g_tick.gen) fps_lock_handle_gen(g);
+    for (int r = 0; r < nrow; r++) if (rows[r]->kind == STEPS_I32) steps_tick(rows[r], r, g_tick.target, g_tick.src);
+    if (!g_tick.target) {
         if (!gate_obs_present(OBS_SEAD_RATE)) for (int r = 0; r < nrow; r++) if (rows[r]->kind == MIN_VSYNCS_I32) { uint64_t obj = row_obj(rows[r]); if (obj) sead_pin(obj + rows[r]->field, sead_pin_wanted(0)); }
         return;
     }
-    // The cap at start (DM_FPS_TARGET: the Android panel's saved cap, env.txt; or the profile) may be one this game cannot hold: 15 on Donkey Kong Bananza, whose controller goes to
-    // 3 vsyncs at most. Once every floor's maximum is known, such a cap becomes 0, the game's own, so the front end and presentation show what the game really does
-    if (start_cap) {
+    if (g_tick.start_cap) {
         int known = 1; for (int r = 0; r < nrow; r++) if (rows[r]->kind == MIN_VSYNCS_I32 && !floor_max(rows[r])) known = 0;
         if (known) {
-            start_cap = 0;
-            if (!holds(target)) {
-                LOG("main: frame rate cap %d fps (%s) is not one this game can hold: the game's own frame rate instead", target, src);
-                dm_fps_target_set(0, "a start cap this game cannot hold"); return;
-            }
+            g_tick.start_cap = 0;
+            if (!holds(g_tick.target)) { LOG("main: frame rate cap %d fps (%s) is not one this game can hold: the game's own frame rate instead", g_tick.target, g_tick.src); dm_fps_target_set(0, "a start cap this game cannot hold"); return; }
         }
     }
-    if (nier && 60 % target == 0) {
-        // NieR:Automata US/EU 1.0.3 (3c10ec35c5ef4c3686b4053afb0e58e7):
-        // - [base + 0x192be00] points to the NVN graphics device object whose +0x9c160 holds the present interval (1 = 60 FPS, 2 = 30 FPS),
-        //   and base + 0x192c304 (+0x504) holds the requested interval mode (0 = 60 FPS, 1 = 30 FPS).
-        // Resolution policy is applied independently above, so 30/60 FPS does
-        // not implicitly enable or disable the native resolution controller.
-        uint64_t p = 0; static int nlog_nier;
-        uint32_t want = (uint32_t)(60 / target), want_mode = want - 1, cur_mode = 0;
-        if (rd((uint64_t)(uintptr_t)(base + display + 0x504), &cur_mode, sizeof cur_mode) && cur_mode != want_mode && (cur_mode == 0 || cur_mode == 1)) {
-            uint32_t *dst = (uint32_t *)(uintptr_t)(base + display + 0x504);
-            dm_guest_write_prepare(dst, sizeof *dst);
-            __atomic_store_n(dst, want_mode, __ATOMIC_RELAXED);
-        }
-        if (rd((uint64_t)(uintptr_t)(base + display), &p, sizeof p) && p) {
-            uint64_t a = p + 0x9c160; uint32_t cur = 0;
-            if (rd(a, &cur, sizeof cur) && cur != want && (cur == 1 || cur == 2)) {
-                uint32_t *dst = (uint32_t *)(uintptr_t)a;
-                dm_guest_write_prepare(dst, sizeof *dst); __atomic_store_n(dst, want, __ATOMIC_RELAXED);
-                if (nlog_nier++ < 8) LOG("main: NieR frame interval %u → %u (%d fps; %s)", cur, want, target, src);
-            }
-        }
-    }
-    if (fb.n) fb_tick(target, src);
-    if (uq.base && 60 % target == 0 && 60 / target <= 4) unity_vsync_tick(target, src);   // a count of whole vsyncs: 40 and 45 leave it (targetFrameRate, where found, takes them)
+    if (nier && 60 % g_tick.target == 0) fps_lock_nier_tick();
+    if (fb.n) fb_tick(g_tick.target, g_tick.src);
+    if (uq.base && 60 % g_tick.target == 0 && 60 / g_tick.target <= 4) unity_vsync_tick(g_tick.target, g_tick.src);
     for (int r = 0; r < nrow; r++) {
-        const lock_t *L = rows[r]; if (!rate_ok(L->kind, target) || L->kind == STEPS_I32) continue;   // step counts: steps_tick
-        uint64_t obj = row_obj(L); if (!obj) continue;   // not created yet
-        if (L->flag) { uint8_t b; if (!rd(obj + (L->flag >> 8), &b, 1) || !(b & (L->flag & 0xff))) continue; }   // the object's flag is off (Unreal: no fixed frame rate in use)
-        if (L->kind == MIN_VSYNCS_I32) { sead_pin(obj + L->field, 0); sead_ctl_tune(obj + L->field, target, src); }
-        if (L->kind == FPS_F64) {
-            for (int c = 0; c < L->copies; c++) {
-                uint64_t a = obj + L->field + 8 * (uint64_t)c; double cur, want = target;
-                if (!rd(a, &cur, sizeof cur)) break;
-                if (cur == want || !(cur >= 10 && cur <= 120)) continue;   // already set, or not set yet
-                double *p = (double *)(uintptr_t)a;
-                dm_guest_write_prepare(p, sizeof *p); __atomic_store_n((uint64_t *)p, *(uint64_t *)&want, __ATOMIC_RELAXED);
-                if (nlog[r] < 8) { nlog[r]++; LOG("main: %s%s %g → %d fps (%s)", L->what, L->copies > 1 ? (c ? " (reported rate)" : " (target)") : "", cur, target, src); }
-            }
-            continue;
-        }
-        if (L->kind == EXTRA_VSYNCS_U8) {   // the least and the most extra vsyncs, two bytes, re-asserted every frame (the game rewrites them)
-            uint64_t a = obj + L->field; uint16_t cur, want = target == 60 ? 0x0000 : target == 30 ? 0x0101 : 0xffff;
-            if (want == 0xffff || !rd(a, &cur, sizeof cur) || cur == want) continue;
-            if (!have_orig[r][0]) { orig[r][0] = cur; have_orig[r][0] = 1; }
-            uint16_t *p = (uint16_t *)(uintptr_t)a; dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
-            if (nlog[r] < 8) { nlog[r]++; LOG("main: %s least %u most %u → least %u most %u (%d fps; %s)", L->what, cur & 0xff, cur >> 8, want & 0xff, want >> 8, target, src); }
-            continue;
-        }
-        for (int c = 0; c < L->copies; c++) {
-            uint64_t a = obj + L->field + 4 * (uint64_t)c; uint32_t cur, want; char was[16];
-            if (!rd(a, &cur, sizeof cur)) break;
-            if (L->kind == FPS_F32 || L->kind == MS_F32) {
-                int ms = L->kind == MS_F32; float f, w = ms ? ms_want(target) : (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
-                if (cur == want || !(ms ? f >= 8 && f <= 100 : f >= 10 && f <= 120)) continue;   // already set, or not set yet (RE Engine: 6000 at boot; Unreal: 0 = no limit until the config sets it)
-                snprintf(was, sizeof was, ms ? "%.3f ms" : "%g", f);
-            } else if (L->kind == SECS_F32) {
-                float f, w = 1.0f / (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
-                if (cur == want || !(f >= 1.0f / 120 && f <= 0.1f)) continue;   // not set yet (0 before the game's first frame)
-                snprintf(was, sizeof was, "%.5f s", f);
-            } else if (L->kind == TICKS_U32) {
-                want = L->scale / (uint32_t)target;
-                if (cur == want || cur < L->scale / 120 || cur > L->scale / 10) continue;
-                snprintf(was, sizeof was, "%u", cur);
-            } else if (L->kind == MODE_U32) {
-                want = 1;
-                if (cur) continue;   // already 1, or not this switch: 0 is the engine's default
-                snprintf(was, sizeof was, "%u", cur);
-            } else {
-                int fps = L->kind == FPS_I32;
-                want = fps ? (uint32_t)target : 60 / (uint32_t)target;
-                uint32_t value = !cur && L->kind == VSYNCS_DEFAULT2_I32 ? 2 : cur;   // Monolith's zero means its native two-vsync default
-                if (value == want || value < (fps ? 10u : 1u) || value > (fps ? 120u : 4u)) continue;
-                if (L->kind == MIN_VSYNCS_I32) {   // never above the controller's own maximum (row_holds)
-                    int mx = floor_max(L); if (!mx) continue;   // not set yet
-                    if (want > (uint32_t)mx) { if (!over[r]) { over[r] = 1; LOG("main: %s left at %u: %d fps needs %u vsyncs, above the controller's maximum %d (%s)", L->what, cur, target, want, mx, src); } continue; }
-                }
-                snprintf(was, sizeof was, "%u", cur);
-            }
-            if (c < 2 && !have_orig[r][c]) { orig[r][c] = cur; have_orig[r][c] = 1; }
-            uint32_t *p = (uint32_t *)(uintptr_t)a;
-            dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
-            if (nlog[r] < 8) { nlog[r]++; char now[24];
-                if (L->kind == MS_F32) snprintf(now, sizeof now, "%.3f ms (%d fps)", ms_want(target), target);
-                else if (L->kind == SECS_F32) snprintf(now, sizeof now, "%.5f s (%d fps)", 1.0 / target, target);
-                else if (L->kind == TICKS_U32) snprintf(now, sizeof now, "%u (%d fps)", want, target);
-                else if (L->kind == MODE_U32) snprintf(now, sizeof now, "1 (%d fps)", target);
-                else snprintf(now, sizeof now, "%u%s", L->kind == FPS_F32 ? (unsigned)target : want, L->kind == FPS_F32 || L->kind == FPS_I32 ? " fps" : " vsyncs");
-                LOG("main: %s%s %s → %s (%s)", L->what, L->copies > 1 ? (c ? " (render thread)" : " (game thread)") : "", was, now, src); }
-        }
+        const lock_t *L = rows[r]; if (!rate_ok(L->kind, g_tick.target) || L->kind == STEPS_I32) continue;
+        uint64_t obj = row_obj(L); if (!obj) continue;
+        if (L->flag) { uint8_t b; if (!rd(obj + (L->flag >> 8), &b, 1) || !(b & (L->flag & 0xff))) continue; }
+        if (L->kind == MIN_VSYNCS_I32) { sead_pin(obj + L->field, 0); sead_ctl_tune(obj + L->field, g_tick.target, g_tick.src); }
+        fps_lock_apply_row(L, r, obj);
     }
 }
 

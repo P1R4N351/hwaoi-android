@@ -7,6 +7,7 @@
 // (rate 1.25), with no step between 1.0 and 1.375, never left the full size (#269). drs_steps_fit gives the step whose size is nearest the size chosen instead, as the
 // game will hold it under its own cap.
 #pragma once
+#include "fps_fast.h"
 #include <math.h>
 #include <stdint.h>
 
@@ -20,6 +21,7 @@ static inline int drs_steps_ok(const float *e, uint32_t n) {
 
 // The step whose size (1 / rate) is nearest the size of rate r (r > 0; a table drs_steps_ok accepts); a tie goes to the larger size. The result is the table's own value
 static inline float drs_steps_nearest(const float *e, uint32_t n, float r) {
+    if (dm_fps_fast_on()) return drs_steps_nearest_fast(e, n, r);
     float best = e[0], bd = fabsf(1.0f / e[0] - 1.0f / r);
     for (uint32_t i = 1; i < n; i++) { float d = fabsf(1.0f / e[i] - 1.0f / r); if (d < bd) { bd = d; best = e[i]; } }
     return best;
@@ -28,6 +30,7 @@ static inline float drs_steps_nearest(const float *e, uint32_t n, float r) {
 // The game's round-down (main+0x38deb0 to 0x38df08) of rate x under its cap: the first step whose next one is above min(cap, x), as the instructions take it (fcsel gt:
 // a NaN cap gives the cap; b.ls: a NaN ends the run). With an infinite cap it is also what the step down (main+0x38e0f0) returns at a step above the max rate x
 static inline float drs_steps_snap(const float *e, uint32_t n, float cap, float x) {
+    if (dm_fps_fast_on()) return drs_steps_snap_fast(e, n, cap, x);
     float v = cap > x ? x : cap;
     uint32_t i = 0; while (i + 1 < n && e[i + 1] <= v) i++;
     return e[i];
