@@ -1,7 +1,6 @@
 // Fast pipeline-cache stamp I/O, prewarm key check & layout front-cache (DM_VK_PCACHE_FAST=1, default on; =0 disables).
-#pragma once
-#include "vka_gkey.h"
-#include "vka_pwlist.h"
+#ifndef VKA_PCACHE_FAST_CORE_H
+#define VKA_PCACHE_FAST_CORE_H
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -226,42 +225,6 @@ static inline char *vka_pck_format_fast(uint64_t lib, uint64_t dead,
     return t;
 }
 
-static inline int vka_pw_rec_ok_fast(const pwrec *r, const uint8_t *kb, int fault_mode) {
-    if (r->kind > VKA_PW_MESH || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
-    if (r->kind == VKA_PW_CS) return r->klen == 0;
-    if (r->kind == VKA_PW_MESH && (!r->key[1] || r->key[3] || r->key[4] || r->inst[0] || r->inst[1])) return 0;
-    size_t pfx = offsetof(vka_gkey, va);
-    if (r->klen < pfx) return 0;
-    vka_gkey k;
-    size_t cpy = r->klen == pfx ? pfx : sizeof(vka_gkey);
-    if (cpy > r->klen) memset(&k, 0, cpy);
-    memcpy(&k, kb, r->klen);
-    if (k.ncolor > 8 || k.fs_variant > VKA_PW_FS_VARIANT_MAX || (k.samples != 1 && k.samples != 2 && k.samples != 4 && k.samples != 8)) return 0;
-    if (k.topo > VKA_PW_TOPO_MAX || k.poly_mode > VKA_PW_POLY_MAX || k.alpha_func > 8 || k.logic_op > VKA_PW_LOGIC_MAX) return 0;
-    if (k.depth_clamp > 1 || k.a2c > 1 || k.logic_en > 1 || k.gl_depth > 1 || k.gs_fx > 1 || k.vin_static > 1) return 0;
-    for (int i = 0; i < 8; i++) {
-        int bad_op = (fault_mode != 3) && (k.att[i].op > VKA_PW_BLENDOP_MAX || k.att[i].opa > VKA_PW_BLENDOP_MAX);
-        if (k.att[i].en > 1 || k.att[i].src > VKA_PW_BLENDF_MAX || k.att[i].dst > VKA_PW_BLENDF_MAX ||
-            k.att[i].srca > VKA_PW_BLENDF_MAX || k.att[i].dsta > VKA_PW_BLENDF_MAX || bad_op) return 0;
-    }
-    if (k.vin_static && r->klen > pfx) {
-        for (int i = 0; i < 32; i++) if (k.va[i].used > 1 || (k.va[i].used && k.va[i].binding > 32)) return 0;
-        for (int i = 0; i < 33; i++) if (k.vb[i].used > 1) return 0;
-    }
-    return 1;
-}
-
-static inline int vka_pw_next_fast(const uint8_t *d, size_t len, size_t *o,
-                                   pwrec *r, const uint8_t **kb, int *ok, int fault_mode) {
-    if (!d || *o + sizeof(pwrec) > len) return 0;
-    memcpy(r, d + *o, sizeof *r);
-    if (r->klen > sizeof(vka_gkey) || *o + vka_pw_size(r) > len) return 0;
-    *kb = d + *o + sizeof *r;
-    *ok = vka_pw_rec_ok_fast(r, *kb, fault_mode);
-    *o += vka_pw_size(r);
-    return 1;
-}
-
 typedef struct {
     _Atomic uint32_t seq;
     _Atomic uint32_t compute;
@@ -320,3 +283,42 @@ static inline int vka_lkey_eq_fast(const void *a, const void *b, uint32_t n,
     }
     return memcmp(a, b, active_bytes) == 0;
 }
+
+#endif
+
+#if defined(VKA_PWLIST_H) && !defined(VKA_PCACHE_FAST_PW_H)
+#define VKA_PCACHE_FAST_PW_H
+static inline int vka_pw_rec_ok_fast(const pwrec *r, const uint8_t *kb, int fault_mode) {
+    if (r->kind > VKA_PW_MESH || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
+    if (r->kind == VKA_PW_CS) return r->klen == 0;
+    if (r->kind == VKA_PW_MESH && (!r->key[1] || r->key[3] || r->key[4] || r->inst[0] || r->inst[1])) return 0;
+    size_t pfx = offsetof(vka_gkey, va);
+    if (r->klen < pfx) return 0;
+    vka_gkey k = {0};
+    memcpy(&k, kb, r->klen);
+    if (k.ncolor > 8 || k.fs_variant > VKA_PW_FS_VARIANT_MAX || (k.samples != 1 && k.samples != 2 && k.samples != 4 && k.samples != 8)) return 0;
+    if (k.topo > VKA_PW_TOPO_MAX || k.poly_mode > VKA_PW_POLY_MAX || k.alpha_func > 8 || k.logic_op > VKA_PW_LOGIC_MAX) return 0;
+    if (k.depth_clamp > 1 || k.a2c > 1 || k.logic_en > 1 || k.gl_depth > 1 || k.gs_fx > 1 || k.vin_static > 1) return 0;
+    for (int i = 0; i < 8; i++) {
+        int bad_op = (fault_mode != 3) && (k.att[i].op > VKA_PW_BLENDOP_MAX || k.att[i].opa > VKA_PW_BLENDOP_MAX);
+        if (k.att[i].en > 1 || k.att[i].src > VKA_PW_BLENDF_MAX || k.att[i].dst > VKA_PW_BLENDF_MAX ||
+            k.att[i].srca > VKA_PW_BLENDF_MAX || k.att[i].dsta > VKA_PW_BLENDF_MAX || bad_op) return 0;
+    }
+    if (k.vin_static && r->klen > pfx) {
+        for (int i = 0; i < 32; i++) if (k.va[i].used > 1 || (k.va[i].used && k.va[i].binding > 32)) return 0;
+        for (int i = 0; i < 33; i++) if (k.vb[i].used > 1) return 0;
+    }
+    return 1;
+}
+
+static inline int vka_pw_next_fast(const uint8_t *d, size_t len, size_t *o,
+                                   pwrec *r, const uint8_t **kb, int *ok, int fault_mode) {
+    if (!d || *o + sizeof(pwrec) > len) return 0;
+    memcpy(r, d + *o, sizeof *r);
+    if (r->klen > sizeof(vka_gkey) || *o + vka_pw_size(r) > len) return 0;
+    *kb = d + *o + sizeof *r;
+    *ok = vka_pw_rec_ok_fast(r, *kb, fault_mode);
+    *o += vka_pw_size(r);
+    return 1;
+}
+#endif

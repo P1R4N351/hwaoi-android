@@ -1,4 +1,5 @@
 // Unit, parity, TSan & benchmark harness for Wave 34 pipeline cache fast paths.
+#include "../../gfx/vk_android/vka_pwlist.h"
 #include "../../gfx/vk_android/vka_pckeep.h"
 #include <assert.h>
 #include <pthread.h>
@@ -7,6 +8,19 @@
 
 _Atomic int g_vka_pcache_fast_state;
 _Atomic int g_vka_w34_fault;
+
+
+static uint64_t w34_hash_sh8(const uintptr_t sh[8]) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < 8u; i++) { h = (h ^ (uint64_t)sh[i]) * UINT64_C(0x9E3779B97F4A7C15); h ^= h >> 29; }
+    return h ^ (h >> 32);
+}
+
+static uint64_t w34_hash_u64(const uint64_t *w, size_t n) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < n; i++) { h = (h ^ w[i]) * UINT64_C(0x9E3779B97F4A7C15); h ^= h >> 29; }
+    return h ^ (h >> 32);
+}
 
 static uint64_t w34_ns(void) {
     struct timespec ts;
@@ -67,14 +81,17 @@ static size_t w34_make_pw(uint8_t *buf, uint32_t count) {
 }
 
 static void w34_check_pw_and_lshort(void) {
-    uint8_t buf[8192];
+    static uint8_t buf[8192];
     size_t len = w34_make_pw(buf, 16u);
     size_t o0 = 0, o1 = 0, first0 = 0, first1 = 0;
     uint32_t n0 = 0, n1 = 0;
     assert(vka_pw_header(buf, len, &first0, &n0) == VKA_PW_OK);
     assert(vka_pw_header(buf, len, &first1, &n1) == VKA_PW_OK);
     o0 = first0; o1 = first1;
-    pwrec r0, r1; const uint8_t *kb0 = NULL, *kb1 = NULL; int ok0 = 0, ok1 = 0;
+    pwrec r0 = {0}, r1 = {0}; const uint8_t *kb0 = NULL, *kb1 = NULL; int ok0 = 0, ok1 = 0;
+    vka_gkey gk = {0}; gk.cfmt[0] = 37u; gk.dfmt = 126u; gk.ncolor = 1u; gk.samples = 1u; gk.topo = 3u; gk.att[0].mask = 0xfu;
+    pwrec gr = {.kind = VKA_PW_GFX, .klen = (uint32_t)offsetof(vka_gkey, va), .key = {0x11u, 0x22u}};
+    pwrec grb = gr; grb.bad = 1u; assert(vka_pw_hash(&gr, &gk) == vka_pw_hash(&grb, &gk));
     while (vka_pw_next(buf, len, &o0, &r0, &kb0, &ok0)) {
         assert(vka_pw_next_fast(buf, len, &o1, &r1, &kb1, &ok1, 0) == 1);
         assert(o0 == o1 && ok0 == ok1 && ok0 == 1 && r0.key[0] == r1.key[0]);
@@ -82,7 +99,7 @@ static void w34_check_pw_and_lshort(void) {
     static vka_lshort_cache lc;
     uintptr_t sh0[8] = {11u, 22u, 0, 0, 0, 0, 0, 0};
     uint8_t in[24] = {1, 2, 3, 4}, out[24] = {0};
-    uint64_t h = vka_pw_fnv(sh0, sizeof sh0, VKA_PW_FNV0);
+    uint64_t h = w34_hash_sh8(sh0);
     vka_lshort_put(&lc, h, sh0, 0u, in, sizeof in);
     assert(vka_lshort_get(&lc, h, sh0, 0u, out, sizeof out, 0) == 1 && memcmp(in, out, sizeof in) == 0);
     assert(vka_lshort_get(&lc, h, sh0, 1u, out, sizeof out, 0) == 0);
@@ -94,7 +111,7 @@ static void w34_check_fault(int fm) {
     vka_w34_set_fault(fm);
     if (fm == 1) {
         const char *u = "00000000000000aa\nkeep 1 dead 0 shaders 2\n0000000000000002 00000000000000b2\n0000000000000001 00000000000000b1\n";
-        vka_pck_stamp s;
+        vka_pck_stamp s = {0};
         vka_pcache_fast_reset_for_test(1);
         vka_pck_parse(u, strlen(u), &s);
         assert(s.table && s.n == 2 && s.ent[0].key == 1u);
@@ -104,22 +121,22 @@ static void w34_check_fault(int fm) {
         size_t len = 0;
         vka_pcache_fast_reset_for_test(1);
         char *txt = vka_pck_format(7u, 0u, k, 1u, r, 1u, &len);
-        vka_pck_stamp s; vka_pck_parse(txt, len, &s);
+        vka_pck_stamp s = {0}; vka_pck_parse(txt, len, &s);
         assert(s.n == 1 && s.ent[0].hash == 0x99u);
         vka_pck_free(&s); free(txt);
     } else if (fm == 3) {
-        uint8_t buf[1024]; w34_make_pw(buf, 1u);
+        static uint8_t fbuf[1024]; w34_make_pw(fbuf, 1u);
         size_t off = sizeof(pwhdr2) + sizeof(pwrec);
         vka_gkey g = {0}; g.ncolor = 1u; g.samples = 1u; g.att[0].op = 9u;
-        memcpy(buf + off, &g, offsetof(vka_gkey, va));
-        size_t o = sizeof(pwhdr2); pwrec pr; const uint8_t *kb = NULL; int ok = 1;
-        assert(vka_pw_next_fast(buf, sizeof(pwhdr2) + sizeof(pwrec) + 200u, &o, &pr, &kb, &ok, fm) == 1);
+        memcpy(fbuf + off, &g, offsetof(vka_gkey, va));
+        size_t o = sizeof(pwhdr2); pwrec pr = {0}; const uint8_t *kb = NULL; int ok = 1;
+        assert(vka_pw_next_fast(fbuf, sizeof(pwhdr2) + sizeof(pwrec) + 200u, &o, &pr, &kb, &ok, fm) == 1);
         assert(ok == 0);
     } else if (fm == 4) {
         static vka_lshort_cache lc;
         uintptr_t sh[8] = {1u, 2u, 0, 0, 0, 0, 0, 0};
         uint8_t in[24] = {9}, out[24] = {0};
-        uint64_t h = vka_pw_fnv(sh, sizeof sh, VKA_PW_FNV0);
+        uint64_t h = w34_hash_sh8(sh);
         vka_lshort_put(&lc, h, sh, 0u, in, sizeof in);
         assert(vka_lshort_get(&lc, h, sh, 1u, out, sizeof out, fm) == 0);
     } else if (fm == 5) {
@@ -136,31 +153,31 @@ static uint64_t w34_bench_once(const vka_pck_ent *keep, const vka_pck_ent *run,
     for (int it = 0; it < 20; it++) {
         size_t len = 0;
         char *txt = vka_pck_format(0xabcdu, 4u, keep, 2048u, run, 256u, &len);
-        vka_pck_stamp s; vka_pck_parse(txt, len, &s);
+        vka_pck_stamp s = {0}; vka_pck_parse(txt, len, &s);
         sink += s.n + s.ent[s.n - 1u].hash;
         vka_pck_free(&s); free(txt);
     }
     for (int it = 0; it < 8; it++) {
-        size_t o = sizeof(pwhdr2); pwrec pr; const uint8_t *kb = NULL; int ok = 0;
+        size_t o = sizeof(pwhdr2); pwrec pr = {0}; const uint8_t *kb = NULL; int ok = 0;
         while (fast ? vka_pw_next_fast(pw_buf, pw_len, &o, &pr, &kb, &ok, 0) : vka_pw_next(pw_buf, pw_len, &o, &pr, &kb, &ok)) {
             sink += (uint64_t)ok + pr.key[0];
         }
     }
     static vka_lshort_cache lc;
-    static struct { uint32_t n, pc; uint64_t b[384]; } lkA = {8u, 1u, {1, 2, 3, 4, 5, 6, 7, 8}}, lkB = {8u, 1u, {1, 2, 3, 4, 5, 6, 7, 8}};
+    static const uint64_t lkA[385] = {8u, 1u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}, lkB[385] = {8u, 1u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
     uintptr_t sh[8] = {0x10u, 0x20u, 0, 0, 0, 0, 0, 0};
     uint8_t val[24] = {0x7au, 0x11u}, out[24] = {0};
-    uint64_t h = vka_pw_fnv(sh, sizeof sh, VKA_PW_FNV0);
+    uint64_t h = w34_hash_sh8(sh);
     vka_lshort_put(&lc, h, sh, 0u, val, sizeof val);
     for (uint32_t q = 0; q < 100000u; q++) {
         if (fast) {
             if (vka_lshort_get(&lc, h, sh, 0u, out, sizeof out, 0)) sink += out[0];
-            if ((q & 7u) == 0u) sink += (uint64_t)vka_lkey_eq_fast(&lkA, &lkB, 8u, 8u + 8u * 8u, 0);
+            if ((q & 7u) == 0u) sink += (uint64_t)vka_lkey_eq_fast(lkA, lkB, 8u, 8u + 8u * 8u, 0);
         } else {
-            uint64_t hh = vka_pw_fnv(sh, sizeof sh, VKA_PW_FNV0);
-            uint64_t lk_h = vka_pw_fnv(&lkA, sizeof lkA, VKA_PW_FNV0);
+            uint64_t hh = w34_hash_sh8(sh);
+            uint64_t lk_h = w34_hash_u64(lkA, 385u);
             sink += (uint64_t)val[0] + (hh & 0u);
-            if ((q & 7u) == 0u) sink += (uint64_t)(memcmp(&lkA, &lkB, sizeof lkA) == 0) + (lk_h & 0u);
+            if ((q & 7u) == 0u) sink += (uint64_t)(memcmp(lkA, lkB, sizeof lkA) == 0) + (lk_h & 0u);
         }
     }
     return sink;
@@ -172,7 +189,7 @@ static void *w34_tsan_worker(void *arg) {
     uint64_t id = (uint64_t)(uintptr_t)arg;
     uintptr_t sh[8] = {id + 1u, id + 9u, 0, 0, 0, 0, 0, 0};
     uint8_t in[24] = {(uint8_t)(id + 1u)}, out[24] = {0};
-    uint64_t h = vka_pw_fnv(sh, sizeof sh, VKA_PW_FNV0);
+    uint64_t h = w34_hash_sh8(sh);
     if (id == 0u) vka_lshort_put(&g_tsan_lc, h, sh, 0u, in, sizeof in);
     uint64_t s = 0;
     for (int i = 0; i < 4000; i++) {
@@ -193,7 +210,7 @@ int main(void) {
     pthread_t th[4];
     uintptr_t sh0[8] = {1u, 9u, 0, 0, 0, 0, 0, 0};
     uint8_t v0[24] = {1u};
-    vka_lshort_put(&g_tsan_lc, vka_pw_fnv(sh0, sizeof sh0, VKA_PW_FNV0), sh0, 0u, v0, sizeof v0);
+    vka_lshort_put(&g_tsan_lc, w34_hash_sh8(sh0), sh0, 0u, v0, sizeof v0);
     for (int i = 0; i < 4; i++) assert(pthread_create(&th[i], NULL, w34_tsan_worker, (void *)(uintptr_t)i) == 0);
     for (int i = 0; i < 4; i++) { void *r = NULL; assert(pthread_join(th[i], &r) == 0); }
 
