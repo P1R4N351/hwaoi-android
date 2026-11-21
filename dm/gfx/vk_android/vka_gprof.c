@@ -13,6 +13,7 @@
 // key pair and by pixel key). The profiled frame then costs far more than the others (thousands of passes); its relative split is what counts
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_ovl_fast.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -82,56 +83,66 @@ typedef struct { char k; uint64_t key, pkey; uint32_t n; uint64_t work; double m
 static int sp_by_over(const void *a, const void *b) { double d = ((const sp_key *)b)->over - ((const sp_key *)a)->over; return d > 0 ? 1 : d < 0 ? -1 : 0; }
 static void split_report(const struct step_ *s, int ns);
 static int by_ms(const void *a, const void *b) { double d = ((const step *)b)->ms - ((const step *)a)->ms; return d > 0 ? 1 : d < 0 ? -1 : 0; }
+static void report_compute_summary(const step *s, int ns) {
+    struct { uint64_t key; int n; double ms; uint64_t wg; } cs[48]; int ncs = 0; double vms = 0, mms = 0, cms = 0; int nvs = 0, nms = 0;
+    for (int k = 0; k < ns; k++) {
+        const gp_what *w = &g_m[s[k].i].w;
+        if (w->nm) { mms += s[k].ms; nms++; } else if (w->nv) { vms += s[k].ms; nvs++; }
+        if (w->nc == 1 && !w->nv && !w->nm) {
+            int j = 0; cms += s[k].ms; while (j < ncs && cs[j].key != w->key[0].key) j++;
+            if (j == ncs) { if (ncs == 48) continue; cs[ncs++] = (typeof(cs[0])){w->key[0].key, 0, 0, 0}; }
+            cs[j].n++; cs[j].ms += s[k].ms; cs[j].wg += w->key[0].work;
+        }
+    }
+    for (int a = 0; a < ncs; a++) for (int b = a + 1; b < ncs; b++) if (cs[b].ms > cs[a].ms) { typeof(cs[0]) t = cs[a]; cs[a] = cs[b]; cs[b] = t; }
+    char line[1400]; size_t ln = 0; line[0] = 0;
+    for (int j = 0; j < ncs && j < 16 && ln < sizeof line; j++)
+        ln += (size_t)snprintf(line + ln, sizeof line - ln, " %016llx %dx %.2fms (%llu wg);", (unsigned long long)cs[j].key, cs[j].n, cs[j].ms, (unsigned long long)cs[j].wg);
+    VLOG("gpu prof: steps with mesh draws %.2f ms (%d), vertex draws only %.2f ms (%d), single dispatches %.2f ms; by compute shader:%s", mms, nms, vms, nvs, cms, line);
+}
+
+static void report_barrier_sites(const step *s, int ns) {
+    struct { const char *f; int l; int n; double ms; } site[64]; int nsite = 0;
+    for (int k = 0; k < ns; k++) {
+        const gp_mark *b = &g_m[s[k].i]; int j = 0;
+        while (j < nsite && !(site[j].l == b->line && site[j].f == b->file)) j++;
+        if (j == nsite) { if (nsite == 64) continue; site[nsite++] = (typeof(site[0])){b->file, b->line, 0, 0}; }
+        site[j].n++; site[j].ms += s[k].ms;
+    }
+    char line[1200]; size_t ln = 0; line[0] = 0;
+    for (int j = 0; j < nsite && ln < sizeof line; j++)
+        ln += (size_t)snprintf(line + ln, sizeof line - ln, " %s:%d %dx %.2fms;", site[j].f, site[j].l, site[j].n, site[j].ms);
+    VLOG("gpu prof: by site:%s", line);
+}
+
 static void report(void) {
     static uint64_t t[NQ];
     if (g_get(V.dev, g_qp, 0, (uint32_t)g_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT)) { VLOG("gpu prof: frame %llu: results not ready", (unsigned long long)g_frame); return; }
-    static step s[NQ]; int ns = 0; double tot = 0, pass = 0, xfer = 0, disp = 0, bare = 0, first = 0; int npass = 0, ndisp = 0;
-    double vka_ts_tick_ns(void); double tick = vka_ts_tick_ns(); if (!(tick > 0)) tick = g_tick_ns;   // (the tick measured against the host clock where the driver's period is off: vka_exec.c tick_sample)
+    static step s[NQ]; int ns = 0; double tot = 0, pass = 0, xfer = 0, disp = 0, bare = 0; int npass = 0, ndisp = 0;
+    double vka_ts_tick_ns(void); double tick = vka_ts_tick_ns(); if (!(tick > 0)) tick = g_tick_ns;
     for (int i = 1; i < g_n; i++) {
-        if (g_m[i].kind == 1 || g_m[i].kind == 2) continue;   // the gap before a submission or part: the GPU waited for recording
+        if (g_m[i].kind == 1 || g_m[i].kind == 2) continue;
         double ms = t[i] > t[i - 1] ? (t[i] - t[i - 1]) * tick / 1e6 : 0;
         tot += ms; s[ns++] = (step){i, ms};
-        // a dispatch counts neither as a draw nor as an op: its step is told by what it recorded (vka_gp_note), or it would be taken for a bare barrier
         if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; } else if (g_m[i].w.nc) { disp += ms; ndisp++; }
         else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws) xfer += ms; else bare += ms;
-        if (g_m[i - 1].kind == 1) first += ms;
     }
     VLOG("gpu prof: frame %llu: %d timestamps, %.2f ms GPU: passes %.2f ms (%d), dispatches %.2f ms (%d), clears / copies %.2f ms, steps with nothing recorded (barriers, uploads, writebacks) %.2f ms",
          (unsigned long long)g_frame, g_n, tot, pass, npass, disp, ndisp, xfer, bare);
-    if (VKA_ENV("DM_VK_GPUPROF_LIST", 0))   // every step in order
+    if (VKA_ENV("DM_VK_GPUPROF_LIST", 0))
         for (int k = 0; k < ns; k++) { const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i];
             char ws[200]; what_str(&b->w, ws, sizeof ws);
             VLOG("gpu prof: step #%d %.3f ms: %s:%d, %llu draws, %llu ops%s%s%s", s[k].i, s[k].ms, b->file, b->line, (unsigned long long)(b->draws - a->draws),
                  (unsigned long long)(b->ops - a->ops), b->desc[0] ? "; pass " : "", b->desc, ws); }
-    if (g_split) split_report(s, ns);   // the steps still in GPU order
+    if (g_split) split_report(s, ns);
     qsort(s, (size_t)ns, sizeof *s, by_ms);
     for (int k = 0; k < ns && k < 16; k++) {
-        const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i];
-        char ws[200]; what_str(&b->w, ws, sizeof ws);
+        const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i]; char ws[200]; what_str(&b->w, ws, sizeof ws);
         VLOG("gpu prof:  #%d %.3f ms: %s:%d, %llu draws, %llu passes, %llu ops%s%s%s", s[k].i, s[k].ms, b->file, b->line, (unsigned long long)(b->draws - a->draws),
              (unsigned long long)(b->passes - a->passes), (unsigned long long)(b->ops - a->ops), b->desc[0] ? "; pass " : "", b->desc, ws);
     }
-    {   // the dispatch steps by compute shader, and the draw steps by kind (vertex only, with mesh draws)
-        struct { uint64_t key; int n; double ms; uint64_t wg; } cs[48]; int ncs = 0; double vms = 0, mms = 0, cms = 0; int nvs = 0, nms = 0;
-        for (int k = 0; k < ns; k++) { const gp_what *w = &g_m[s[k].i].w;
-            if (w->nm) { mms += s[k].ms; nms++; } else if (w->nv) { vms += s[k].ms; nvs++; }
-            if (w->nc == 1 && !w->nv && !w->nm) { int j = 0; cms += s[k].ms; while (j < ncs && cs[j].key != w->key[0].key) j++;
-                if (j == ncs) { if (ncs == 48) continue; cs[ncs++] = (typeof(cs[0])){w->key[0].key, 0, 0, 0}; }
-                cs[j].n++; cs[j].ms += s[k].ms; cs[j].wg += w->key[0].work; } }
-        for (int a = 0; a < ncs; a++) for (int b = a + 1; b < ncs; b++) if (cs[b].ms > cs[a].ms) { typeof(cs[0]) t = cs[a]; cs[a] = cs[b]; cs[b] = t; }
-        char line[1400]; size_t ln = 0; line[0] = 0;
-        for (int j = 0; j < ncs && j < 16 && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %016llx %dx %.2fms (%llu wg);", (unsigned long long)cs[j].key, cs[j].n, cs[j].ms, (unsigned long long)cs[j].wg);
-        VLOG("gpu prof: steps with mesh draws %.2f ms (%d), vertex draws only %.2f ms (%d), single dispatches %.2f ms; by compute shader:%s", mms, nms, vms, nvs, cms, line);
-    }
-    // by barrier site: count and time
-    struct { const char *f; int l; int n; double ms; } site[64]; int nsite = 0;
-    for (int k = 0; k < ns; k++) { const gp_mark *b = &g_m[s[k].i]; int j = 0;
-        while (j < nsite && !(site[j].l == b->line && site[j].f == b->file)) j++;
-        if (j == nsite) { if (nsite == 64) continue; site[nsite++] = (typeof(site[0])){b->file, b->line, 0, 0}; }
-        site[j].n++; site[j].ms += s[k].ms; }
-    char line[1200]; size_t ln = 0; line[0] = 0;
-    for (int j = 0; j < nsite && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %s:%d %dx %.2fms;", site[j].f, site[j].l, site[j].n, site[j].ms);
-    VLOG("gpu prof: by site:%s", line);
+    report_compute_summary(s, ns);
+    report_barrier_sites(s, ns);
 }
 // mtl_sub_begin, after the command buffer begins: arms the profile at a new frame, reports a finished one
 void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
@@ -149,34 +160,104 @@ void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
     if (g_state == 1) { g_cb = cb; mark(cb, 1, "submission", 0); }
 }
 void vka_gp_commit(VkCommandBuffer cb, uint64_t fence) { if (g_state == 1 && cb == g_cb) { mark(cb, 3, "commit", 0); g_fence = fence; } }
+static int split_find_shape(
+    vka_gp_key3_ht *sh_ht, char shape[][DESC], double *floor_ms, double *shape_ms,
+    int *shape_n, int *shape_d, int *nsh, const char *cur, const char **prev_c, int *prev_j) {
+    if (*prev_c == cur && *prev_j >= 0) return *prev_j;
+    int j = -1;
+    if (vka_ovl_fast_on()) {
+        size_t slen = 0u; uint64_t sh_h = vka_ovl_fnv1a_cstr(cur, &slen); int32_t out = -1;
+        int ins = vka_gp_key3_ht_find_or_put(sh_ht, 1u, sh_h, (uint64_t)slen, *nsh, &out);
+        if (ins == 1) {
+            if (*nsh >= 128) return -1;
+            j = (*nsh)++; snprintf(shape[j], DESC, "%s", cur);
+            floor_ms[j] = 1e9; shape_ms[j] = 0; shape_n[j] = shape_d[j] = 0;
+        } else if (ins == 0 && strcmp(shape[out], cur) == 0) {
+            j = out;
+        }
+    }
+    if (j < 0) {
+        j = 0; while (j < *nsh && strcmp(shape[j], cur)) j++;
+        if (j == *nsh) {
+            if (*nsh == 128) return -1;
+            snprintf(shape[*nsh], DESC, "%s", cur); floor_ms[*nsh] = 1e9; shape_ms[*nsh] = 0; shape_n[*nsh] = shape_d[*nsh] = 0; (*nsh)++;
+        }
+    }
+    *prev_c = cur; *prev_j = j;
+    return j;
+}
+
+static void split_accum_keys(
+    const step *s, int ns, const int *sh_of, const double *floor_ms,
+    sp_key *kk, int *nk, double *tot, double *over) {
+    static vka_gp_key3_ht k_ht;
+    int fast = vka_ovl_fast_on();
+    if (fast) vka_gp_key3_ht_init(&k_ht);
+    for (int k = 0; k < ns; k++) {
+        if (sh_of[k] < 0) continue;
+        const gp_what *w = &g_m[s[k].i].w; uint32_t kn = 0;
+        for (uint32_t a = 0; a < w->nk; a++) kn += w->key[a].n;
+        if (!kn) continue;
+        double ov = s[k].ms - floor_ms[sh_of[k]]; if (ov < 0) ov = 0;
+        *tot += s[k].ms; *over += ov;
+        for (uint32_t a = 0; a < w->nk; a++) {
+            const gp_key *g = &w->key[a]; double f = (double)g->n / kn; int j = -1;
+            if (fast) {
+                int32_t out = -1;
+                int ins = vka_gp_key3_ht_find_or_put(&k_ht, (uint8_t)g->k, g->key, g->pkey, *nk, &out);
+                if (ins == 1) { if (*nk < 1024) { j = (*nk)++; kk[j] = (sp_key){g->k, g->key, g->pkey, 0, 0, 0, 0}; } else continue; }
+                else if (ins == 0) j = out;
+            } else {
+                int i = 0; while (i < *nk && !(kk[i].k == g->k && kk[i].key == g->key && kk[i].pkey == g->pkey)) i++;
+                if (i == *nk) { if (*nk == 1024) continue; kk[(*nk)++] = (sp_key){g->k, g->key, g->pkey, 0, 0, 0, 0}; }
+                j = i;
+            }
+            if (j >= 0) { kk[j].n += g->n; kk[j].work += g->work; kk[j].ms += s[k].ms * f; kk[j].over += ov * f; }
+        }
+    }
+}
+
+static void split_log_pkey(const sp_key *kk, int nk) {
+    static sp_key pk[1024]; static vka_gp_key3_ht pk_ht;
+    int np = 0, fast = vka_ovl_fast_on();
+    if (fast) vka_gp_key3_ht_init(&pk_ht);
+    for (int j = 0; j < nk; j++) {
+        int i = -1;
+        if (fast) {
+            int32_t out = -1;
+            int ins = vka_gp_key3_ht_find_or_put(&pk_ht, 'p', kk[j].pkey, 0u, np, &out);
+            if (ins == 1) { if (np < 1024) { i = np++; pk[i] = (sp_key){'p', 0, kk[j].pkey, 0, 0, 0, 0}; } else continue; }
+            else if (ins == 0) i = out;
+        } else {
+            int x = 0; while (x < np && pk[x].pkey != kk[j].pkey) x++;
+            if (x == np) { if (np == 1024) continue; pk[np++] = (sp_key){'p', 0, kk[j].pkey, 0, 0, 0, 0}; }
+            i = x;
+        }
+        if (i >= 0) { pk[i].n += kk[j].n; pk[i].ms += kk[j].ms; pk[i].over += kk[j].over; }
+    }
+    qsort(pk, (size_t)np, sizeof *pk, sp_by_over);
+    char line[1400]; size_t ln = 0; line[0] = 0;
+    for (int j = 0; j < np && j < 24 && ln < sizeof line; j++)
+        ln += (size_t)snprintf(line + ln, sizeof line - ln, " %016llx x%u %.2f/%.2fms;", (unsigned long long)pk[j].pkey, pk[j].n, pk[j].over, pk[j].ms);
+    VLOG("gpu prof split: by pixel shader (above the floor / all):%s", line);
+}
+
 static void split_report(const step *s, int ns) {
     enum { NSH = 128, NSK = 1024 };
-    static char shape[NSH][DESC]; static double floor_ms[NSH], shape_ms[NSH]; static int shape_n[NSH], shape_d[NSH]; int nsh = 0;
-    static int sh_of[NQ];
-    const char *cur = "";   // the pass shape a step belongs to: the last pass desc seen (a split pass opens again with the same desc)
+    static char shape[NSH][DESC]; static double floor_ms[NSH], shape_ms[NSH]; static int shape_n[NSH], shape_d[NSH], sh_of[NQ];
+    static vka_gp_key3_ht sh_ht; static sp_key kk[NSK];
+    int nsh = 0, prev_j = -1; const char *cur = "", *prev_c = NULL;
+    vka_gp_key3_ht_init(&sh_ht);
     for (int k = 0; k < ns; k++) {
         const gp_mark *b = &g_m[s[k].i]; sh_of[k] = -1;
         if (b->desc[0]) cur = b->desc;
         if (!(b->w.nv + b->w.nm) || !cur[0]) continue;
-        int j = 0; while (j < nsh && strcmp(shape[j], cur)) j++;
-        if (j == nsh) { if (nsh == NSH) continue; snprintf(shape[nsh], DESC, "%s", cur); floor_ms[nsh] = 1e9; shape_ms[nsh] = 0; shape_n[nsh] = shape_d[nsh] = 0; nsh++; }
+        int j = split_find_shape(&sh_ht, shape, floor_ms, shape_ms, shape_n, shape_d, &nsh, cur, &prev_c, &prev_j);
+        if (j < 0) continue;
         sh_of[k] = j; shape_n[j]++; shape_d[j] += (int)(b->w.nv + b->w.nm); shape_ms[j] += s[k].ms; if (s[k].ms < floor_ms[j]) floor_ms[j] = s[k].ms;
     }
-    static sp_key kk[NSK]; int nk = 0; double tot = 0, over = 0;
-    for (int k = 0; k < ns; k++) {
-        if (sh_of[k] < 0) continue;
-        const gp_what *w = &g_m[s[k].i].w; uint32_t nd = w->nv + w->nm, kn = 0;
-        for (uint32_t a = 0; a < w->nk; a++) kn += w->key[a].n;
-        if (!kn) continue;
-        double ov = s[k].ms - floor_ms[sh_of[k]]; if (ov < 0) ov = 0;
-        tot += s[k].ms; over += ov; (void)nd;
-        for (uint32_t a = 0; a < w->nk; a++) {   // a step of several keys: its time shared by their draws
-            const gp_key *g = &w->key[a]; double f = (double)g->n / kn; int j = 0;
-            while (j < nk && !(kk[j].k == g->k && kk[j].key == g->key && kk[j].pkey == g->pkey)) j++;
-            if (j == nk) { if (nk == NSK) continue; kk[nk++] = (sp_key){g->k, g->key, g->pkey, 0, 0, 0, 0}; }
-            kk[j].n += g->n; kk[j].work += g->work; kk[j].ms += s[k].ms * f; kk[j].over += ov * f;
-        }
-    }
+    int nk = 0; double tot = 0, over = 0;
+    split_accum_keys(s, ns, sh_of, floor_ms, kk, &nk, &tot, &over);
     VLOG("gpu prof split: frame %llu, %d draws a step at most: draw steps %.2f ms, %.2f ms above the floors; %d pass shapes:", (unsigned long long)g_frame, g_split, tot, over, nsh);
     for (int j = 0; j < nsh; j++)
         VLOG("gpu prof split:  shape %s: %d steps, %d draws, %.2f ms, floor %.3f ms a step, %.2f ms above it", shape[j], shape_n[j], shape_d[j], shape_ms[j], floor_ms[j],
@@ -185,14 +266,6 @@ static void split_report(const step *s, int ns) {
     for (int j = 0; j < nk && j < 40; j++)
         VLOG("gpu prof split:  %c %016llx/%016llx x%u (%llu %s): %.3f ms, %.3f above the floor (%.1f %%)", kk[j].k, (unsigned long long)kk[j].key, (unsigned long long)kk[j].pkey,
              kk[j].n, (unsigned long long)kk[j].work, kk[j].k == 'v' ? "vertices" : "workgroups", kk[j].ms, kk[j].over, over > 0 ? 100 * kk[j].over / over : 0);
-    // by pixel key alone
-    static sp_key pk[NSK]; int np = 0;
-    for (int j = 0; j < nk; j++) { int i = 0; while (i < np && pk[i].pkey != kk[j].pkey) i++;
-        if (i == np) pk[np++] = (sp_key){'p', 0, kk[j].pkey, 0, 0, 0, 0};
-        pk[i].n += kk[j].n; pk[i].ms += kk[j].ms; pk[i].over += kk[j].over; }
-    qsort(pk, (size_t)np, sizeof *pk, sp_by_over);
-    char line[1400]; size_t ln = 0; line[0] = 0;
-    for (int j = 0; j < np && j < 24 && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %016llx x%u %.2f/%.2fms;", (unsigned long long)pk[j].pkey, pk[j].n, pk[j].over, pk[j].ms);
-    VLOG("gpu prof split: by pixel shader (above the floor / all):%s", line);
+    split_log_pkey(kk, nk);
 }
 #endif

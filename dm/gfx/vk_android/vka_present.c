@@ -21,6 +21,7 @@
 #endif
 #include "vka_present_fit.h"
 #include "vka_ovl.h"
+#include "vka_ovl_fast.h"
 #include <android/native_window.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -551,19 +552,26 @@ static struct {
     VkPipeline pipe; VkFormat fmt; VkDescriptorPool pool; VkDescriptorSet set;
     uint64_t gen; int w_[OVL_SLOTS], h_[OVL_SLOTS], y[OVL_SLOTS];               // what the image holds
 } g_ovl;
+static vka_ovl_pub_state g_opub;
 static int ovl_wanted(void) { return VKA_ENV("DM_VK_OVERLAY", 1) != 0; }
 
 int nxhost_overlay_set(int slot, const void *px, int w, int h, int stride) {
     if (slot < 0 || slot >= OVL_SLOTS) return 0;
     if (!px || w <= 0 || h <= 0 || stride < w * 4 || w > 4096 || h > 4096) w = h = 0;
     pthread_mutex_lock(&g_omu);
-    int ok = 1;
+    int ok = 1, chg = 0;
     if (w && (size_t)w * h * 4 > (size_t)g_oin[slot].cap) {
         uint8_t *p = realloc(g_oin[slot].px, (size_t)w * h * 4);
         if (p) { g_oin[slot].px = p; g_oin[slot].cap = w * h * 4; } else { w = h = 0; ok = 0; }
     }
-    for (int y = 0; y < h; y++) memcpy(g_oin[slot].px + (size_t)y * w * 4, (const uint8_t *)px + (size_t)y * stride, (size_t)w * 4);
-    g_oin[slot].w = w; g_oin[slot].h = h; g_ogen++;
+    vka_ovl_copy_changed(g_oin[slot].px, g_oin[slot].w, g_oin[slot].h,
+                         w ? (const uint8_t *)px : NULL, w, h, stride, &chg);
+    g_oin[slot].w = w; g_oin[slot].h = h;
+    if (chg) {
+        g_ogen++;
+        int any = (g_oin[0].w > 0) || (g_oin[1].w > 0);
+        vka_ovl_pub_bump(&g_opub, any);
+    }
     pthread_mutex_unlock(&g_omu);
     return ok && nxhost_overlay_state() >= 0;
 }
@@ -627,57 +635,42 @@ static int ovl_image(uint32_t w, uint32_t h) {
 }
 // Frame k: the blocks set since the last upload into the overlay image (frame k's upload buffer is free: its fence was waited for), then each block drawn over swapchain
 // image idx (in PRESENT_SRC, the picture in it) in its corner of the display. Nothing at all while no block is set
-static void ovl_draw(VkCommandBuffer cb, unsigned k, uint32_t idx) {
-    if (!ovl_wanted() || atomic_load(&g_dev_on) || atomic_load(&g_ostate) < 0) return;
-    pthread_mutex_lock(&g_omu);
-    uint64_t gen = g_ogen; int need_w = 0, need_h = 0, any = 0;
-    for (int s = 0; s < OVL_SLOTS; s++) { if (g_oin[s].w > need_w) need_w = g_oin[s].w; need_h += g_oin[s].h; any |= g_oin[s].w > 0; }
-    pthread_mutex_unlock(&g_omu);
-    if (!any) { g_ovl.gen = gen; for (int s = 0; s < OVL_SLOTS; s++) g_ovl.w_[s] = 0; return; }   // the overlay off: no pass at all
-    if (!g_sview[idx]) { ovl_fail("no attachment view of the swapchain image", VK_ERROR_INITIALIZATION_FAILED); return; }
-    if (!rot_ready(g_swap_fmt)) { ovl_fail("the rotated copy's layout", VK_ERROR_INITIALIZATION_FAILED); return; }
+static int ovl_prepare_upload(VkCommandBuffer cb, unsigned k, uint32_t idx, uint64_t gen, int need_w, int need_h) {
+    if (!g_sview[idx]) { ovl_fail("no attachment view of the swapchain image", VK_ERROR_INITIALIZATION_FAILED); return 0; }
+    if (!rot_ready(g_swap_fmt)) { ovl_fail("the rotated copy's layout", VK_ERROR_INITIALIZATION_FAILED); return 0; }
     if (!g_ovl.pipe || g_ovl.fmt != g_swap_fmt) {
         if (g_ovl.pipe) { vka_queue_idle(); rk.vkDestroyPipeline(V.dev, g_ovl.pipe, NULL); g_ovl.pipe = VK_NULL_HANDLE; }
         VkResult r = rot_pipeline(g_swap_fmt, 1, &g_ovl.pipe);
-        if (r) { g_ovl.pipe = VK_NULL_HANDLE; ovl_fail("pipeline", r); return; }
+        if (r) { g_ovl.pipe = VK_NULL_HANDLE; ovl_fail("pipeline", r); return 0; }
         g_ovl.fmt = g_swap_fmt;
     }
-    if (gen != g_ovl.gen) {   // the new blocks: packed one below the other into frame k's buffer, copied into the image
-        if (!ovl_image((uint32_t)need_w, (uint32_t)need_h)) return;
-        pthread_mutex_lock(&g_omu);
-        int y = 0, fits = 1; VkBufferImageCopy rg[OVL_SLOTS]; uint32_t nrg = 0; VkDeviceSize off = 0;
-        for (int s = 0; s < OVL_SLOTS; s++) {
-            int w = g_oin[s].w, h = g_oin[s].h;
-            if ((uint32_t)w > g_ovl.w || (uint32_t)(y + h) > g_ovl.h) { fits = 0; break; }   // set again, larger, since: the next present
-            g_ovl.w_[s] = w; g_ovl.h_[s] = h; g_ovl.y[s] = y;
-            if (w > 0) {
-                memcpy((uint8_t *)g_ovl.map[k] + off, g_oin[s].px, (size_t)w * h * 4);
-                rg[nrg++] = (VkBufferImageCopy){off, (uint32_t)w, (uint32_t)h, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, y, 0}, {(uint32_t)w, (uint32_t)h, 1}};
-                off += (VkDeviceSize)w * h * 4;
-            }
-            y += h;
+    if (gen == g_ovl.gen) return 1;
+    if (!ovl_image((uint32_t)need_w, (uint32_t)need_h)) return 0;
+    pthread_mutex_lock(&g_omu);
+    int y = 0, fits = 1; VkBufferImageCopy rg[OVL_SLOTS]; uint32_t nrg = 0; VkDeviceSize off = 0;
+    for (int s = 0; s < OVL_SLOTS; s++) {
+        int w = g_oin[s].w, h = g_oin[s].h;
+        if ((uint32_t)w > g_ovl.w || (uint32_t)(y + h) > g_ovl.h) { fits = 0; break; }
+        g_ovl.w_[s] = w; g_ovl.h_[s] = h; g_ovl.y[s] = y;
+        if (w > 0) {
+            memcpy((uint8_t *)g_ovl.map[k] + off, g_oin[s].px, (size_t)w * h * 4);
+            rg[nrg++] = (VkBufferImageCopy){off, (uint32_t)w, (uint32_t)h, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, y, 0}, {(uint32_t)w, (uint32_t)h, 1}};
+            off += (VkDeviceSize)w * h * 4;
         }
-        if (fits) gen = g_ogen;
-        pthread_mutex_unlock(&g_omu);
-        if (!fits) { for (int s = 0; s < OVL_SLOTS; s++) g_ovl.w_[s] = 0; return; }
-        vka_img_barrier(cb, g_ovl.img, VK_IMAGE_ASPECT_COLOR_BIT, g_ovl.fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);   // earlier presents' reads
-        g_ovl.fresh = 0;
-        vk.vkCmdCopyBufferToImage(cb, g_ovl.buf[k], g_ovl.img, VK_IMAGE_LAYOUT_GENERAL, nrg, rg);
-        vka_barrier(cb);
-        g_ovl.gen = gen;
+        y += h;
     }
-    if (!g_ovl.img) return;
-    int ew = (int)(rot_quarter(g_pre) ? g_ext.height : g_ext.width), eh = (int)(rot_quarter(g_pre) ? g_ext.width : g_ext.height);   // the display, as the user sees it
-    vko_draw d[OVL_SLOTS]; int nd = 0, x0 = INT32_MAX, y0 = INT32_MAX, x1 = 0, y1 = 0;
-    for (int s = 0; s < OVL_SLOTS; s++)
-        if (vko_place((int)g_pre, (int)g_ext.width, (int)g_ext.height, ew, eh, g_ocorner[s], g_ovl.w_[s], g_ovl.h_[s], (int)g_ovl.w, (int)g_ovl.h, g_ovl.y[s], &d[nd])) {
-            if (d[nd].x < x0) x0 = d[nd].x;
-            if (d[nd].y < y0) y0 = d[nd].y;
-            if (d[nd].x + d[nd].w > x1) x1 = d[nd].x + d[nd].w;
-            if (d[nd].y + d[nd].h > y1) y1 = d[nd].y + d[nd].h;
-            nd++;
-        }
-    if (!nd) return;
+    if (fits) gen = g_ogen;
+    pthread_mutex_unlock(&g_omu);
+    if (!fits) { for (int s = 0; s < OVL_SLOTS; s++) g_ovl.w_[s] = 0; return 0; }
+    vka_img_barrier(cb, g_ovl.img, VK_IMAGE_ASPECT_COLOR_BIT, g_ovl.fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    g_ovl.fresh = 0;
+    vk.vkCmdCopyBufferToImage(cb, g_ovl.buf[k], g_ovl.img, VK_IMAGE_LAYOUT_GENERAL, nrg, rg);
+    vka_barrier(cb);
+    g_ovl.gen = gen;
+    return 1;
+}
+
+static void ovl_emit_quads(VkCommandBuffer cb, uint32_t idx, const vko_draw *d, int nd, int x0, int y0, int x1, int y1) {
     vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_sview[idx], .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
@@ -696,6 +689,32 @@ static void ovl_draw(VkCommandBuffer cb, unsigned k, uint32_t idx) {
     vk.vkCmdEndRendering(cb);
     vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     if (atomic_load(&g_ostate) == 0) { atomic_store(&g_ostate, 1); VLOG("overlay: drawn by the present (DM_VK_OVERLAY=0: the launcher's views)"); }
+}
+
+static void ovl_draw(VkCommandBuffer cb, unsigned k, uint32_t idx) {
+    if (!ovl_wanted() || atomic_load(&g_dev_on) || atomic_load(&g_ostate) < 0) return;
+    uint64_t gen = g_ovl.gen; int need_w = 0, need_h = 0, any = 0;
+    if (vka_ovl_can_skip_lock(&g_opub, g_ovl.gen, &gen)) {
+        any = (g_ovl.w_[0] > 0) || (g_ovl.w_[1] > 0);
+    } else {
+        pthread_mutex_lock(&g_omu);
+        gen = g_ogen;
+        for (int s = 0; s < OVL_SLOTS; s++) { if (g_oin[s].w > need_w) need_w = g_oin[s].w; need_h += g_oin[s].h; any |= g_oin[s].w > 0; }
+        pthread_mutex_unlock(&g_omu);
+        if (!any) { g_ovl.gen = gen; for (int s = 0; s < OVL_SLOTS; s++) g_ovl.w_[s] = 0; return; }
+    }
+    if (!any || !ovl_prepare_upload(cb, k, idx, gen, need_w, need_h) || !g_ovl.img) return;
+    int ew = (int)(rot_quarter(g_pre) ? g_ext.height : g_ext.width), eh = (int)(rot_quarter(g_pre) ? g_ext.width : g_ext.height);
+    vko_draw d[OVL_SLOTS]; int nd = 0, x0 = INT32_MAX, y0 = INT32_MAX, x1 = 0, y1 = 0;
+    for (int s = 0; s < OVL_SLOTS; s++)
+        if (vko_place((int)g_pre, (int)g_ext.width, (int)g_ext.height, ew, eh, g_ocorner[s], g_ovl.w_[s], g_ovl.h_[s], (int)g_ovl.w, (int)g_ovl.h, g_ovl.y[s], &d[nd])) {
+            if (d[nd].x < x0) x0 = d[nd].x;
+            if (d[nd].y < y0) y0 = d[nd].y;
+            if (d[nd].x + d[nd].w > x1) x1 = d[nd].x + d[nd].w;
+            if (d[nd].y + d[nd].h > y1) y1 = d[nd].y + d[nd].h;
+            nd++;
+        }
+    if (nd) ovl_emit_quads(cb, idx, d, nd, x0, y0, x1, y1);
 }
 
 static void swap_destroy(int surface_too) {

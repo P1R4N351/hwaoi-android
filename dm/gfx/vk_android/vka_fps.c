@@ -5,6 +5,8 @@
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vk_android.h"
+#include "vka_ovl_fast.h"
+#include <pthread.h>
 
 static uint64_t g_win_t0, g_base_n, g_out_n, g_base_ns_sum, g_last_base, g_log_t;   // present thread only
 static _Atomic uint32_t g_pub_base, g_pub_out, g_pub_ft;   // published: fps x 100, fps x 100, frame time in µs
@@ -41,10 +43,14 @@ void vka_fps_note(int shown, int generated) {
 // The GPU's busy time a frame, averaged over up to 32 recent frames whose time is in (vka_exec.c reads two timestamps per submission; a frame's time is in 8 frames
 // later): only when the overlay asks (twice a second), a few atomic loads a frame. -1 without GPU timestamps
 uint64_t vka_frame(void); double mtl_gpu_ms(uint64_t f);
+static double fps_gpu_sample(uint64_t frame, void *ctx) { (void)ctx; return mtl_gpu_ms(frame); }
 static float gpu_ms(void) {
-    uint64_t f = vka_frame(); double sum = 0; int n = 0;
-    for (uint64_t i = f > 41 ? f - 41 : 0; i + 9 <= f; i++) { double g = mtl_gpu_ms(i); if (g >= 0) { sum += g; n++; } }
-    return n ? (float)(sum / n) : -1;
+    static pthread_mutex_t g_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
+    static vka_ovl_gpu_avg_memo g_gpu_memo;
+    pthread_mutex_lock(&g_gpu_mu);
+    float r = vka_ovl_gpu_avg(&g_gpu_memo, vka_frame(), fps_gpu_sample, NULL);
+    pthread_mutex_unlock(&g_gpu_mu);
+    return r;
 }
 
 int nxhost_fps(float *out, int n) {
