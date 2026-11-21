@@ -119,7 +119,6 @@ dm/gfx/vk_android/vka_layerreq.h	bugprone-signed-char-misuse	1
 dm/gfx/vk_android/vka_memu_spv.c	clang-analyzer-security.ArrayBound	1
 dm/gfx/vk_android/vka_pwlist.h	clang-analyzer-core.NullPointerArithm	1
 dm/gfx/vk_android/vka_shlib.c	clang-analyzer-unix.Malloc	1
-dm/gfx/vk_android/vka_spvpatch.c	clang-analyzer-security.ArrayBound	1
 dm/gfx/vk_android/vka_state_fast.h	bugprone-suspicious-memory-comparison	1
 dm/host/crash.c	bugprone-command-processor	1
 dm/host/haptics_apple.m	clang-analyzer-nullability.NullablePassedToNonnull	1
