@@ -291,6 +291,7 @@ DM_NVN_WAITS	developer	Diagnostics			text			both
 DM_NVN_XV	developer	Graphics			text			both							
 DM_NVN_ZBLOCK	developer	Diagnostics			text			both							
 DM_NVN_ZSKIP	developer	Graphics			text			both							
+DM_OE_FAST	developer	Game			text			both							
 DM_OE_SCRIPT	developer	Diagnostics			text			both							
 DM_ONLINE	developer	Game			text			both							
 DM_OODLE_HOST	internal	Diagnostics			text			both						Mac or iOS only	

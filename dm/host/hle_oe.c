@@ -6,10 +6,11 @@
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
+#include "oe_fast.h"
 static _Atomic int g_opmode = -1;
 int dm_opmode(void) {
-    int m = g_opmode;
-    if (m < 0) { const char *e = getenv("DM_OPMODE"); int v = e ? atoi(e) : DM_GAME_OPMODE; int exp = -1; atomic_compare_exchange_strong(&g_opmode, &exp, v); m = g_opmode; }
+    int m = oe_fast_load_int(&g_opmode);
+    if (m < 0) { const char *e = getenv("DM_OPMODE"); int v = e ? atoi(e) : DM_GAME_OPMODE; int exp = -1; atomic_compare_exchange_strong(&g_opmode, &exp, v); m = oe_fast_load_int(&g_opmode); }
     return m;
 }
 // ---------- System notification queue (AppletMessage): front end state changes → fetched by the game every frame with TryPopNotificationMessage ----------
@@ -19,7 +20,7 @@ int dm_opmode(void) {
 enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31, MSG_STARTUP_LOGO = 95, MSG_GFXSCALE = 300 };
 #define MQ 32
 static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_mq_cond = PTHREAD_COND_INITIALIZER;   // cond: wakes the blocking PopNotificationMessage
-static uint32_t g_mq[MQ]; static int g_mqh, g_mqn;
+static uint32_t g_mq[MQ]; static int g_mqh; static _Atomic int g_mqn;
 static _Atomic int g_ntf_opmode, g_ntf_perfmode, g_ntf_gfxscale;          // only pushed after the game turns it on with Set*NotificationEnabled
 // Notification event (Hades main+0x3ed18c polls it every frame and pops one message each time it fires): the SDK's version returns the event oe::Initialize would have
 // created, and the host's oe::Initialize is a no-op, so TryWaitSystemEvent asserted on it. A host-owned auto-clear SystemEvent instead, which follows the queue as the am service's
@@ -30,9 +31,10 @@ static _Atomic int g_ntf_opmode, g_ntf_perfmode, g_ntf_gfxscale;          // onl
 static uint8_t g_mq_ev[0x80] __attribute__((aligned(16)));
 static _Atomic int g_mq_ev_on;
 static void mq_ev_sync(void) {
-    if (!atomic_load(&g_mq_ev_on)) return;
+    if (!oe_fast_load_int(&g_mq_ev_on)) return;
     pthread_mutex_lock(&g_mq_lock);
-    if (g_mqn) hle_signal_system_event(g_mq_ev); else hle_clear_system_event(g_mq_ev);
+    int n = atomic_load_explicit(&g_mqn, memory_order_relaxed);
+    if (n) hle_signal_system_event(g_mq_ev); else hle_clear_system_event(g_mq_ev);
     pthread_mutex_unlock(&g_mq_lock);
 }
 static void mq_push_(uint32_t m);
@@ -44,11 +46,13 @@ static void mq_push_(uint32_t m) {
     // Only these four state notifications are merged; future per-occurrence events (such as Resume/Exit) must not use this rule.
     // Legitimate state producers only send these four, so at most four of them are pending, and any number of focus losses/restores no longer hits the 32-slot limit; after a pop, new changes are enqueued as usual.
     // Per-occurrence messages (95, startup logo disappeared) keep a position each.
+    int n = atomic_load_explicit(&g_mqn, memory_order_relaxed);
     if (m == MSG_FOCUS || m == MSG_OPMODE || m == MSG_PERFMODE || m == MSG_GFXSCALE)
-        for (int i = 0; i < g_mqn; i++)
+        for (int i = 0; i < n; i++)
             if (g_mq[(g_mqh + i) % MQ] == m) { pthread_mutex_unlock(&g_mq_lock); return; }
-    if (g_mqn == MQ) die("oe notification queue overflow (is the game not popping?)");
-    g_mq[(g_mqh + g_mqn++) % MQ] = m;
+    if (n == MQ) die("oe notification queue overflow (is the game not popping?)");
+    g_mq[(g_mqh + n) % MQ] = m;
+    atomic_store_explicit(&g_mqn, n + 1, memory_order_release);
     pthread_cond_broadcast(&g_mq_cond);
     pthread_mutex_unlock(&g_mq_lock);
 }
@@ -177,12 +181,12 @@ HLE_FORCE("_ZN2nn2oe22SetCpuOverclockEnabledEb", "CPU overclock switch (through 
 // The setting is runtime state like the operation mode: the launcher's in-game panel changes it while the game runs (nxhost_graphics_mode_set, below)
 static _Atomic int g_gfx_scale = -1;   // -1 not read yet, 0-2 DM_GRAPHICS_SCALE (or the panel's), 3 following the operation mode
 static int gfx_setting(void) {
-    int v = g_gfx_scale;
+    int v = oe_fast_load_int(&g_gfx_scale);
     if (v < 0) {
         const char *e = getenv("DM_GRAPHICS_SCALE");
         if (e && *e >= '0' && *e <= '2' && !e[1]) { v = *e - '0'; LOG("oe: graphics scale %d in every operation mode (DM_GRAPHICS_SCALE)", v); }
         else { if (e && *e) LOG("[RED] DM_GRAPHICS_SCALE=%s: must be 0, 1 or 2; the scale follows the operation mode", e); v = 3; }
-        int exp = -1; atomic_compare_exchange_strong(&g_gfx_scale, &exp, v); v = g_gfx_scale;
+        int exp = -1; atomic_compare_exchange_strong(&g_gfx_scale, &exp, v); v = oe_fast_load_int(&g_gfx_scale);
     }
     return v;
 }
@@ -207,7 +211,7 @@ static void oe_state_set(int m, int scale, int64_t size) {
     int om = opmode(), os = gfx_setting(), nm = m < 0 ? om : m, ns = scale == -2 ? os : scale < 0 || scale > 2 ? 3 : scale;
     int scale_changed = gfx_scale_of(ns, nm) != gfx_scale_of(os, om);
     int size_changed = size >= 0 && gfx_size_store(size);
-    g_opmode = nm; g_gfx_scale = ns;
+    atomic_store_explicit(&g_opmode, nm, memory_order_release); atomic_store_explicit(&g_gfx_scale, ns, memory_order_release);
     pthread_mutex_unlock(&g_state_lock);
     if (nm != om) LOG("oe operation mode %d → %d", om, nm);
     if (ns != os) LOG("oe: graphics scale setting %d → %d (3: following the operation mode), the game's scale %d", os, ns, gfx_scale_of(ns, nm));
@@ -243,11 +247,11 @@ static uint32_t gfx_size_parse(const char *e) {
     return w << 16 | h;
 }
 void dm_graphics_size(int *w, int *h) {
-    uint32_t v = g_gfx_size;
+    uint32_t v = oe_fast_load_u32(&g_gfx_size);
     if (v == UINT32_MAX) {
         uint32_t want = gfx_size_parse(getenv("DM_GRAPHICS_SIZE")), exp = UINT32_MAX;
         if (want) LOG("oe: graphics size %ux%u for a game's size gate (DM_GRAPHICS_SIZE)", want >> 16, want & 0xffff);
-        atomic_compare_exchange_strong(&g_gfx_size, &exp, want); v = g_gfx_size;
+        atomic_compare_exchange_strong(&g_gfx_size, &exp, want); v = oe_fast_load_u32(&g_gfx_size);
     }
     *w = (int)(v >> 16); *h = (int)(v & 0xffff);
 }
@@ -266,7 +270,7 @@ HLE_FORCE("_ZN2nn2gs3sdk26SetGraphicsFrameLengthModeENS1_23GraphicsFrameLengthMo
     static int last = -1; if (mode != last) { LOG("gs: graphics frame length mode %d (0 auto, 1 30 fps, 2 60 fps, 3 120 fps)", mode); last = mode; }
 }
 HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
-    int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
+    oe_fast_def_res(opmode(), w, h);
 }
 HLE_FORCE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", "default display resolution change event: signalled when the operation mode changes",
           void, h_oe_DefResEv, void *ev) {
@@ -325,6 +329,12 @@ static void oe_script_start(void) {
     pthread_detach(th);
 }
 static pthread_once_t g_oe_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_oe_script_ready;
+static void oe_script_ensure(void) {
+    if (oe_fast_active() && atomic_load_explicit(&g_oe_script_ready, memory_order_acquire)) return;
+    pthread_once(&g_oe_once, oe_script_start);
+    atomic_store_explicit(&g_oe_script_ready, 1, memory_order_release);
+}
 
 HLE_FORCE("_ZN2nn2oe20GetCurrentFocusStateEv", "foreground / background state; the front end's dm_focus_set, out of focus while a library applet is open", int, h_oe_GetFocus, void) { return atomic_load(&g_seen); }
 HLE_FORCE("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", "focus handling mode; 1 and 2 get focus notifications, 0 and 3 none (see g_focus_mode)", void, h_oe_SetFocusMode, int m) {
@@ -333,23 +343,30 @@ HLE_FORCE("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", "focus han
 
 // Notification: returns bool (w0), the host has no system notifications
 HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "system notification queue; front end state changes are queued", unsigned, h_oe_TryPopMsg, uint32_t *msg) {
-    pthread_once(&g_oe_once, oe_script_start);
+    oe_script_ensure();
+    unsigned fast_ret = 0;
+    if (oe_fast_try_pop_empty(&g_mqn, &g_mq_ev_on, msg, &fast_ret)) return fast_ret;
+    uint32_t popped = 0;
     pthread_mutex_lock(&g_mq_lock);
-    int ok = g_mqn > 0;
-    if (ok) { *msg = g_mq[g_mqh]; g_mqh = (g_mqh + 1) % MQ; g_mqn--; }
+    int n = atomic_load_explicit(&g_mqn, memory_order_relaxed);
+    int ok = n > 0;
+    if (ok) { popped = g_mq[g_mqh]; g_mqh = (g_mqh + 1) % MQ; atomic_store_explicit(&g_mqn, n - 1, memory_order_release); }
     pthread_mutex_unlock(&g_mq_lock);
-    if (ok) LOG("oe notification popped by the game: %u", *msg);   // state changes are rare, printing each one does not flood the log
+    if (ok) {
+        if (msg) *msg = popped;
+        LOG("oe notification popped by the game: %u", popped);   // state changes are rare, printing each one does not flood the log
+    }
     mq_ev_sync();   // signalled again while notifications remain, cleared when the queue is empty (also a signal left behind by a pop that found it empty)
-    return ok;
+    return (unsigned)ok;
 }
 // The blocking form (Link's Awakening pops on a thread of its own, main+0xfa1ff8): the SDK's version waits on the system event oe::Initialize would have created,
 // and the host's oe::Initialize is a no-op, so it aborted on an uninitialized event. Wait for the host queue instead, then take the message the Try path's way
 HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "system notification queue (blocking); waits on the host queue", uint32_t, h_oe_PopMsg, void) {
-    pthread_once(&g_oe_once, oe_script_start);   // DM_OE_SCRIPT also for games that only pop this way (Mario Kart 8 Deluxe): the wait below reaches the Try path only once a notification is queued
+    oe_script_ensure();   // DM_OE_SCRIPT also for games that only pop this way (Mario Kart 8 Deluxe): the wait below reaches the Try path only once a notification is queued
     uint32_t m = 0;
     for (;;) {
         pthread_mutex_lock(&g_mq_lock);
-        while (!g_mqn) {
+        while (!atomic_load_explicit(&g_mqn, memory_order_relaxed)) {
             dm_thread_native_wait(1);
             pthread_cond_wait(&g_mq_cond, &g_mq_lock);
             dm_thread_native_wait(0);
@@ -359,8 +376,8 @@ HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "system notification queue (blo
     }
 }
 HLE_FORCE("_ZN2nn2oe27GetNotificationMessageEventEv", "notification event: the host's auto-clear SystemEvent, signalled while the queue holds notifications", void *, h_oe_GetMsgEv, void) {
-    pthread_once(&g_oe_once, oe_script_start);   // DM_OE_SCRIPT also for games that wait on the event and pop only once it fires (Monster Hunter Rise)
-    if (!atomic_load(&g_mq_ev_on)) { hle_bind_system_event(g_mq_ev, 1); atomic_store(&g_mq_ev_on, 1); mq_ev_sync(); }   // bound on the game's thread (it runs SDK code)
+    oe_script_ensure();   // DM_OE_SCRIPT also for games that wait on the event and pop only once it fires (Monster Hunter Rise)
+    if (!oe_fast_load_int(&g_mq_ev_on)) { hle_bind_system_event(g_mq_ev, 1); atomic_store_explicit(&g_mq_ev_on, 1, memory_order_release); mq_ev_sync(); }   // bound on the game's thread (it runs SDK code)
     return g_mq_ev;
 }
 // bool arguments: Switch callers do not extend them, declared as unsigned and only the low 8 bits are looked at
@@ -437,36 +454,60 @@ static int dm_lang_limit(const char *list, char code[8]) {
 }
 
 // The language the game is given: DM_LANG through dm_lang_code (en-US when unset), limited to the game's own languages (profile `languages`), logged once with what it was mapped from
-static void dm_lang(char out[8]) {
+static oe_fast_lang_slot g_lang_fast;
+static pthread_mutex_t g_lang_fast_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_lang_done;
+static int g_lang_logged;
+
+static void dm_lang_resolve(char out[8], int *reg_out) {
     const char *e = getenv("DM_LANG");
-    char asked[8];
+    uint64_t cu = 0;
+    int r = 0;
+    if (atomic_load_explicit(&g_lang_done, memory_order_acquire) && oe_fast_lang_get(&g_lang_fast, e, &cu, &r)) {
+        memcpy(out, &cu, 8);
+        if (reg_out) *reg_out = r;
+        return;
+    }
+    char asked[8] = {0};
     int ok = 1;
     if (!e || !*e) { memset(out, 0, 8); strcpy(out, "en-US"); }
     else ok = dm_lang_code(e, out);
     memcpy(asked, out, 8);
     int limited = dm_lang_limit(DM_GAME_LANGUAGES, out);
-    static int once;
-    if (!once++) {
+    r = oe_fast_region_of(out);
+    memcpy(&cu, out, 8);
+    pthread_mutex_lock(&g_lang_fast_mu);
+    if (!g_lang_logged) {
+        g_lang_logged = 1;
         if (e && *e && !ok) LOG("[RED] DM_LANG=%s: no console language for it: en-US (the codes: ja, en-US, en-GB, fr, fr-CA, de, it, es, es-419, nl, pt, pt-BR, ru, ko, zh-Hans, zh-Hant, pl, th)", e);
         else if (e && *e && strcmp(e, asked)) LOG("language: DM_LANG=%s is %s", e, asked);
         if (limited) LOG("language: the game has no %s (profile languages: %s): %s, as a console gives a game only a language it lists", asked, DM_GAME_LANGUAGES, out);
     }
+    oe_fast_lang_put(&g_lang_fast, e, cu, r);
+    atomic_store_explicit(&g_lang_done, 1, memory_order_release);
+    pthread_mutex_unlock(&g_lang_fast_mu);
+    if (reg_out) *reg_out = r;
+}
+
+static void dm_lang(char out[8]) {
+    dm_lang_resolve(out, NULL);
 }
 
 // nn::settings::LanguageCode = struct { char string[8]; }, 8 bytes returned by value in x0
 HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from DM_LANG", uint64_t, h_oe_GetLang, void) {
-    char code[8];
+    char code[8] = {0};
     dm_lang(code);
-    uint64_t v; memcpy(&v, code, 8);
+    uint64_t v = 0; memcpy(&v, code, 8);
     return v;
 }
 
 // The console's region (Animal Crossing: New Horizons 3.0.3): the SDK asks settings::system::GetRegionCode, which reaches set:sys. A region that fits the language the game is given:
 // 0 Japan, 1 the Americas, 2 Europe, 4 Hong Kong / Taiwan / Korea (nn::settings::system::RegionCode; 3 Australia and 5 China are left out, no language points at them alone)
 HLE_FORCE("_ZN2nn2oe13GetRegionCodeEv", "console region (set:sys); from DM_LANG", int, h_oe_GetRegion, void) {
-    char e[8]; dm_lang(e);
-    int r = !strncmp(e, "ja", 2) ? 0 : !strncmp(e, "ko", 2) || !strncmp(e, "zh", 2) ? 4 : !strcmp(e, "en-US") || !strcmp(e, "fr-CA") || !strcmp(e, "es-419") || !strcmp(e, "pt-BR") ? 1 : 2;
-    static int once; if (!once++) LOG("oe::GetRegionCode: %d for language %s", r, e);
+    char e[8] = {0}; int r = 0;
+    dm_lang_resolve(e, &r);
+    static _Atomic int once;
+    if (!atomic_exchange_explicit(&once, 1, memory_order_relaxed)) LOG("oe::GetRegionCode: %d for language %s", r, e);
     return r;
 }
 
