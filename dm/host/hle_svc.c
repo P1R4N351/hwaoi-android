@@ -3,6 +3,7 @@
 #include "dm.h"
 #include <sys/mman.h>
 #include "plat/plat_guestmap.h"
+#include "svc_fast.h"
 #include <errno.h>
 #include <unistd.h>
 #include <unistd.h>
@@ -123,6 +124,8 @@ static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++)
 // and the heap it opens = pool − 64 MB − 1.75 GB virtual address memory − 1 MB = 0x5be00000, as on hardware); Metroid Dread's main has about 1.8 GB of bss, the engine's static heap, which the Switch counts as used;
 // without it the game asks for pool − 64 MB = 3.15 GB of heap
 // Like image_bytes, exclude NROs: their buffers already belong to the game's heap. Counting every offline-mapped NRO's bss made FFX/X-2's used memory exceed its pool before any LoadModule.
+static _Atomic uint32_t g_map_seq = 2;
+static _Thread_local svc_fast_qmem_tls g_qmem_tls;
 static size_t big_bss_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) if (!g_mod[i].nro && g_mod[i].patch_off < 0) n += g_mod[i].size - g_mod[i].back_len - g_mod[i].file_image_len; return n; }
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
@@ -395,7 +398,7 @@ int svc_nro_deactivate(module_t *m) {
         if (g_map[i].src < base + m->size && base < g_map[i].src + g_map[i].size) {
             pthread_mutex_unlock(&g_map_lock); return 0;
         }
-    m->loaded = 0;
+    svc_fast_seq_begin(&g_map_seq); m->loaded = 0; svc_fast_seq_end(&g_map_seq);
     pthread_mutex_unlock(&g_map_lock); return 1;
 }
 static void map_source_query(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *attr, uint64_t *perm) {
@@ -602,13 +605,15 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (DM_GAME_MEM_MAP_LIMIT && (charged > APP_POOL || size > APP_POOL - charged)) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
+        svc_fast_seq_begin(&g_map_seq);
         int rc = 0;
         if (size > g_heap_cur) { dm_gfx_guest_open(g_heap + g_heap_cur, size - g_heap_cur); rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE); }
         else if (size < g_heap_cur) (void)guest_release((uintptr_t)g_heap + size, (uintptr_t)g_heap + g_heap_cur);
         if (rc) { int err = errno; maps_red("SetHeapSize mprotect", (uintptr_t)g_heap + g_heap_cur, size - g_heap_cur, err); die("SetHeapSize mprotect failed: req=%#zx errno=%d", size, err); }
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
         else if (size > g_heap_cur) LOG("[mem] heap %.2f GB (heap region %.2f GB)", size / 1073741824.0, g_heap_cap / 1073741824.0);
-        g_heap_cur = size;
+        atomic_store_explicit(&g_heap_cur, size, memory_order_release);
+        svc_fast_seq_end(&g_map_seq);
         pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; regs[1] = (uint64_t)g_heap; return 0;
     }
@@ -634,12 +639,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         else if (g_nmap == MAX_MAP) { result = 0xCE01; snprintf(why, sizeof why, "%d mappings already", MAX_MAP); }
         if (result) { pthread_mutex_unlock(&g_map_lock); regs[0] = result; LOG("[RED] MapMemory refused (%#x): %#llx <- %#llx +%#llx: %s", result, (unsigned long long)dst, (unsigned long long)src, (unsigned long long)size, why); return 0; }
         // Apple pages are 16K, Horizon pages 4K: the accessible region is extended to a 16K boundary (the extra pages opened are unused pages of the same region, semantics unaffected)
+        svc_fast_seq_begin(&g_map_seq);
         uint64_t mask = (size_t)getpagesize() - 1;
         uint64_t lo = dst & ~mask, hi = (dst + size + mask) & ~mask;
         if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
         dm_guest_write_prepare((void *)lo, hi - lo);
         memcpy((void *)dst, (void *)src, size);   // move semantics: the source region is not accessed while mapped (Horizon makes it inaccessible)
-        map_add(dst, size, src, 0x0B /*MappedMemory*/);
+        map_add(dst, size, src, 0x0B /*MappedMemory*/); svc_fast_seq_end(&g_map_seq);
         pthread_mutex_unlock(&g_map_lock);
         { static _Atomic int nl; if (g_flag.svc || atomic_fetch_add(&nl, 1) < 256) LOG("MapMemory %#llx <- %#llx +%#llx", dst, src, size); }
         regs[0] = 0; return 0;
@@ -652,16 +658,25 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         int k = map_find(dst, size);
         if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
             pthread_mutex_unlock(&g_map_lock); LOG("UnmapMemory does not match a mapping %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
+        svc_fast_seq_begin(&g_map_seq);
         dm_guest_write_prepare((void *)src, size);
         memcpy((void *)src, (void *)dst, size);
         map_del(k - 1);
-        guest_drop_pages(dst, size);
+        guest_drop_pages(dst, size); svc_fast_seq_end(&g_map_seq);
         pthread_mutex_unlock(&g_map_lock);
         { static _Atomic int nl; if (g_flag.svc || atomic_fetch_add(&nl, 1) < 256) LOG("UnmapMemory %#llx -> %#llx +%#llx (contents copied back)", dst, src, size); }
         regs[0] = 0; return 0;
     }
     case 0x06: {  // QueryMemory(MemoryInfo* out, PageInfo* pout, addr) → x1 = pageinfo
         uint64_t mi = regs[0], addr = regs[2];
+        if (svc_fast_enabled()) {
+            svc_fast_qmem_info ci;
+            uint32_t mseq = atomic_load_explicit(&g_map_seq, memory_order_acquire);
+            if (svc_fast_qmem_lookup(&g_qmem_tls, addr, mseq, &ci)) {
+                if (mi) memcpy((void *)(uintptr_t)mi, &ci, sizeof ci);
+                regs[0] = 0; regs[1] = 0; return 0;
+            }
+        }
         // MemoryInfo: base(0) size(8) state(0x10) attr(0x14) perm(0x18) ...
         uint8_t *a = (uint8_t *)addr;
         uint64_t base, size, state, perm;
@@ -725,13 +740,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             // Other host memory: report "free, no permissions" (the 4 KiB page around it) as Horizon does for unmapped addresses. It used to report Code+RX, and GetExceptionInfo walking back from main merged on through host memory down to 0
             else { base=addr & ~0xFFFull; size=0x1000; state=0/*Free*/; perm=0; } }
         map_source_query(addr, &base, &size, &attr, &perm);
+        uint32_t seq_snap = atomic_load_explicit(&g_map_seq, memory_order_acquire);
+        uintptr_t as_u = (uintptr_t)g_as;
         pthread_mutex_unlock(&g_map_lock);
-        if (mi) {
-            struct { uint64_t base, size; uint32_t state, attr, perm, ipc, device, reserved; }
-                out = {base, size, (uint32_t)state, attr, (uint32_t)perm, 0, 0, 0};
-            _Static_assert(sizeof out == 40, "MemoryInfo ABI size");
-            memcpy((void *)(uintptr_t)mi, &out, sizeof out);
-        }
+        svc_fast_qmem_info out = {base, size, (uint32_t)state, attr, (uint32_t)perm, 0, 0, 0};
+        if (svc_fast_enabled() && ((addr >= as_u && addr - as_u < g_reserve) || state == 0xB))
+            svc_fast_qmem_store(&g_qmem_tls, seq_snap, &out);
+        if (mi) memcpy((void *)(uintptr_t)mi, &out, sizeof out);
         regs[0] = 0; regs[1] = 0; return 0;
     }
     case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
@@ -763,6 +778,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         // Host pages are 16 KB, Horizon pages 4 KB: a map is rounded out to host pages (the extra neighboring 4K pages are inside the alias region and merely become writable early, harmless);
         // An edge host page is reclaimed only when no live logical neighbor remains.
+        svc_fast_seq_begin(&g_map_seq);
         uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
         uintptr_t mlo = lo & ~(pg - 1), mhi = (hi + pg - 1) & ~(pg - 1);
         int commit = num == 0x2C;
@@ -798,7 +814,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Total actually mapped in the alias region (one line per 256 MB crossed, up or down): how much physical memory the game uses and whether it keeps growing. Counted with a page bitmap, only pages whose state really changed --
         // the SDK maps pages that are already mapped and unmaps ranges larger than what it mapped (Engage unmaps 0x1000000 and then 0x103f000 at the same address), so counting requested sizes went negative
         { int64_t d = unmapped_bits ? unmap_d : alias_pages(off, size, commit) * 4096, before = atomic_fetch_add(&g_alias_mapped, d), after = before + d;
-          pthread_mutex_unlock(&g_map_lock);
+          svc_fast_seq_end(&g_map_seq); pthread_mutex_unlock(&g_map_lock);
           if (before >> 28 != after >> 28) { uint64_t rt = reported_total(); char t[48] = "";
               if (rt != APP_POOL) snprintf(t, sizeof t, ", reported total %.2f GB", rt / 1073741824.0);
               LOG("[mem] alias region mapped %.2f GB (application pool %.2f GB%s)", after / 1073741824.0, APP_POOL / 1073741824.0, t); } }
@@ -828,6 +844,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_AslrAddr:  v = (uint64_t)g_as;    break;   case I_AslrSize:  v = g_reserve;   break;
         case I_StackAddr: v = (uint64_t)g_stack; break;   case I_StackSize: v = g_stack_cap; break;
         case I_TotalMem: case I_TotalNonSys: case I_UsedMem: case I_UsedNonSys: {
+            if (svc_fast_enabled()) {
+                uint64_t f_used = atomic_load_explicit(&g_heap_cur, memory_order_acquire) + DM_GAME_MEM_USED + big_bss_bytes();
+                if (DM_GAME_MEM_MAP_LIMIT) f_used += (uint64_t)atomic_load_explicit(&g_alias_mapped, memory_order_acquire);
+                uint64_t f_rt = reported_total();
+                if (!(f_rt < APP_POOL && f_used + REP_LIFT_MARGIN > f_rt)) {
+                    v = (id == I_TotalMem || id == I_TotalNonSys) ? f_rt : f_used; break;
+                }
+            }
             pthread_mutex_lock(&g_map_lock);
             uint64_t used = g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes();   // profile mem_used, 64 MB unless the game needs more (see mem_used in dm/games/README.md)
             // with mem_map_limit, the pages mapped in the alias region count too, as on Horizon (the limit in MapPhysicalMemory is the pool less this)

@@ -16,7 +16,7 @@ GAME_H = ../gen/$(GAME)/game_profile.h
 # reference to an undefined symbol only when it is named as allowed to stay undefined
 WEAK_HOST = -Wl,-U,_vka_swap_rb
 
-run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
+run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
 	$(B)/t_language
 	$(B)/t_heap_size
 	$(B)/t_touch
@@ -34,6 +34,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_opus_fast
 	$(B)/t_sync_fast
 	$(B)/t_hid_fast_w23
+	$(B)/t_svc_fast_w24
 	$(B)/t_output_stream
 	$(B)/t_opus_hw
 	$(B)/t_audio_spsc
@@ -258,6 +259,8 @@ $(B)/t_sync_fast: t_sync_fast.c ../hle_sync_fast.h | $(B)
 	$(CC) $(SAN) -std=c11 -O2 -Wall -Wextra -Werror -DW7_TEST_HOOKS -I.. -o $@ t_sync_fast.c -lpthread
 $(B)/t_hid_fast_w23: t_hid_fast_w23.c ../hle_hid.c ../hle_haptics.c ../hid_fast.h ../motion_fusion.h ../hle_haptics.h ../dm_input.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O2 -g -std=c11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W23_TEST_HOOKS -I.. $(GINC) -o $@ t_hid_fast_w23.c ../hle_haptics.c -lpthread -lm
+$(B)/t_svc_fast_w24: t_svc_fast_w24.c ../hle_thread.c ../hle_svc.c ../svc_fast.h ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W24_TEST_HOOKS -I.. $(GINC) -o $@ t_svc_fast_w24.c ../hle_svc.c -lpthread
 run: $(B)/t_audio_stats
 $(B)/t_audio_device: t_audio_device.c ../hle_audio.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_audio_device.c ../hle_bigstack.c -framework AudioToolbox
