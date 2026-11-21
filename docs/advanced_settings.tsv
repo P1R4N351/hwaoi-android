@@ -166,6 +166,7 @@ DM_MOTION_GAIN	developer	Input			text			both
 DM_MOTION_HID	internal	Input			text			both						Mac or iOS only	
 DM_MOTION_LOG	developer	Diagnostics			text			both							
 DM_MOTION_SENS	advanced	Input	Motion sensitivity		toggle			game		Game settings > Motion sensitivity					
+DM_MOVIE_FAST	developer	Performance			text			both							
 DM_MOVIE_FAST_NV12	developer	Performance			text			both							
 DM_MOVIE_LETTERBOX	developer	Game			text			both							
 DM_MOVIE_LOOP_OPT	developer	Performance			text			both							

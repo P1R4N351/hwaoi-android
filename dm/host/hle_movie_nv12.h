@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "movie_fast.h"
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -23,23 +24,16 @@ static inline void dm_nv12_pack_y(const uint8_t *y_src, int y_stride, int cw, in
     if (ch < h && fault_mode != 1) memset(dst + (size_t)ch * (size_t)w, 16, (size_t)(h - ch) * (size_t)w);
 }
 
-static inline void dm_nv12_uv_row(const uint8_t *u, const uint8_t *v, int cw2, uint8_t *o, int w, int fast, int fault_mode) {
+static inline void dm_nv12_uv_row(const uint8_t * restrict u, const uint8_t * restrict v,
+                                  int cw2, uint8_t * restrict o, int w, int fast, int fault_mode) {
     int limit = w / 2;
     if (cw2 < limit) limit = cw2;
-    int x = 0;
-#if defined(__aarch64__)
-    if (fast) {
-        for (; x + 16 <= limit; x += 16) {
-            uint8x16x2_t t = {{vld1q_u8(u + x), vld1q_u8(v + x)}};
-            vst2q_u8(o + 2 * x, t);
-        }
-    }
-#else
-    (void)fast;
-#endif
+    int x = 0, fm = fast ? dm_w31_fault_mode() : 0;
+    if (fast) x = dm_nv12_uv_swar_span(u, v, o, x, limit, fm);
     for (; x < limit; x++) {
-        o[2 * x] = u[x];
-        o[2 * x + 1] = v[x];
+        int sw = fm == 1;
+        o[2 * x] = sw ? v[x] : u[x];
+        o[2 * x + 1] = sw ? u[x] : v[x];
     }
     int written = 2 * limit;
     if (written < w && fault_mode != 1) memset(o + written, 128, (size_t)(w - written));
@@ -73,7 +67,7 @@ static inline void dm_movie_nv12_pack(const uint8_t *y_src, int y_stride, const 
         int cw2 = (cw + 1) / 2, ch2 = (ch + 1) / 2;
         for (int y = 0; y < ch2 && y < h / 2; y++) {
             const uint8_t *u = u_src + (size_t)y * (size_t)u_stride, *v = v_src + (size_t)y * (size_t)v_stride;
-            dm_nv12_uv_row(u, v, cw2, dst + (size_t)w * (size_t)h + (size_t)y * (size_t)w, w, 1, 0);
+            dm_nv12_uv_row(u, v, cw2, dst + (size_t)w * (size_t)h + (size_t)y * (size_t)w, w, 0, 0);
         }
         return;
     }

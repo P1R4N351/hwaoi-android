@@ -11,6 +11,7 @@
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #include "hle_movie_yuv.h"   // md_nv12 / md_rgba, shared with hle_codec_video.c
 #include "hle_movie_nv12.h"
+#include "movie_fast.h"
 #if PLAT_APPLE
 #include <AudioToolbox/AudioToolbox.h>   // AAC
 #else
@@ -81,12 +82,13 @@ typedef struct {
     uint8_t *in[MD_NIN]; int infree[MD_NIN], ninfree;                     // queue of free input indices
     int inown[MD_NIN]; uint64_t instale[MD_NIN];                          // inown: acquired by the client and not sent yet; instale: when a Flush / Stop found it held (the client may still send it), 0 if not
     struct { int used, pic, cli, rnd; int64_t pts; uint32_t flags; uint8_t *frm; size_t cap, bytes; } out[MD_NOUT];   // pic: frm holds a decoded picture (audio: bytes of PCM); cli: acquired by the client and not released; rnd: written into the client's texture, waiting for the client's release (md_rendered); cap: bytes in frm
+    uint64_t used_mask, rnd_cli_mask; int mask_on;
     int tex_rel;                                                          // the client released a slot written into its texture itself: rendered slots wait for its release (md_rendered)
     int outq[MD_NOUT], noutq;                                             // queue of ready output indices
     struct { int in, off, size; int64_t pts; uint32_t flags; } pend[MD_NIN]; int npend;   // input packets waiting to be decoded (in arrival order)
     // Decoding: dmu lets only one guest thread take and decode packets at a time (packets enter libvpx in order); wmu / wcv hand one job to the host thread and wait for it
     pthread_mutex_t dmu, wmu; pthread_cond_t wcv; pthread_t wk;
-    pthread_mutex_t pkm; pthread_cond_t pkc; pthread_t pk; int pk_go, pk_quit, pk_on;   // the decoder's own thread (md_pump_thread): the SDK decodes on a codec thread, not on the caller's
+    pthread_mutex_t pkm; pthread_cond_t pkc; pthread_t pk; int pk_go, pk_quit, pk_on, pk_waiting; uint64_t pk_elided;   // the decoder's own thread (md_pump_thread): the SDK decodes on a codec thread, not on the caller's
     int job; const uint8_t *jp; int jn, jslot, jgot; int64_t jpts, jpts_out; int jflush;
     mavc *avc; int avc_drain; int64_t drain_pts; // H.264 (hle_movie_avc.c); avc_drain: the end-of-stream packet's output had a picture; the pictures still queued leave one per free slot, then an empty output with the
                                                  // end-of-stream flag and the packet's time (drain_pts)
@@ -208,6 +210,7 @@ static int md_trace_all(void) { static int on = -1; if (on < 0) on = getenv("DM_
 
 // VP9 key frame uncompressed header → width and height (VP9 spec 6.2: frame_marker, profile, show_existing_frame, frame_type, show_frame, error_resilient_mode, sync code, color config, frame_size)
 static int vp9_size(const uint8_t *p, int n, int *w, int *h) {
+    if (dm_movie_fast_on()) return dm_movie_vp9_size_fast(p, n, w, h, 0);
     int bit = 0;
     #define RB(k) ({ unsigned v_ = 0; for (int i_ = 0; i_ < (k); i_++, bit++) { if (bit >> 3 >= n) return 0; v_ = v_ << 1 | (p[bit >> 3] >> (7 - (bit & 7)) & 1); } v_; })
     if (RB(2) != 2) return 0;
@@ -255,84 +258,78 @@ __attribute__((weak)) int vka_swap_rb(void);
 
 // I420 → RGBA (native texture mode): by the colour space and range the picture declares (VP9 colour config; when undeclared BT.709 from 720 lines up, else BT.601), 16-bit fixed point; a smaller picture is padded with black, a larger one cropped
 static int g_rgba_neon = -1;   // DM_MOVIE_RGBA_NEON=0: the scalar loop only (A/B)
+static inline uint32_t md_cl(int v) { return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+static inline uint32_t md_pack_px(int l, int cr, int cg, int cb, int swap_rb) {
+    uint32_t c0 = md_cl((l + (swap_rb ? cb : cr)) >> 16), c1 = md_cl((l + cg) >> 16), c2 = md_cl((l + (swap_rb ? cr : cb)) >> 16);
+    return c0 | (c1 << 8) | (c2 << 16) | 0xff000000u;
+}
+static void md_rgba_scalar_row(uint32_t *o32, const uint8_t *py, const uint8_t *pu, const uint8_t *pv,
+                               int x, int cw, int swap_rb, const int k[6]) {
+    int Y = k[0], RV = k[1], GU = k[2], GV = k[3], BU = k[4], y0 = k[5];
+    for (; x + 4 <= cw; x += 4) {
+        int u0 = pu[x >> 1] - 128, v0 = pv[x >> 1] - 128, u1 = pu[(x >> 1) + 1] - 128, v1 = pv[(x >> 1) + 1] - 128;
+        int cr0 = RV * v0 + 32768, cg0 = -GU * u0 - GV * v0 + 32768, cb0 = BU * u0 + 32768;
+        int cr1 = RV * v1 + 32768, cg1 = -GU * u1 - GV * v1 + 32768, cb1 = BU * u1 + 32768;
+        o32[x] = md_pack_px((py[x] - y0) * Y, cr0, cg0, cb0, swap_rb);
+        o32[x + 1] = md_pack_px((py[x + 1] - y0) * Y, cr0, cg0, cb0, swap_rb);
+        o32[x + 2] = md_pack_px((py[x + 2] - y0) * Y, cr1, cg1, cb1, swap_rb);
+        o32[x + 3] = md_pack_px((py[x + 3] - y0) * Y, cr1, cg1, cb1, swap_rb);
+    }
+    for (; x < cw; x++) {
+        int l = (py[x] - y0) * Y, u = pu[x >> 1] - 128, v = pv[x >> 1] - 128;
+        o32[x] = md_pack_px(l, RV * v + 32768, -GU * u - GV * v + 32768, BU * u + 32768, swap_rb);
+    }
+}
+#if defined(__aarch64__)
+static int md_rgba_neon_row(uint32_t *o32, const uint8_t *py, const uint8_t *pu, const uint8_t *pv,
+                            int cw, int swap_rb, const int k[6]) {
+    int x = 0, Y = k[0], RV = k[1], GU = k[2], GV = k[3], BU = k[4], y0 = k[5];
+    for (; x + 16 <= cw; x += 16) {
+        uint8x16_t yy = vld1q_u8(py + x); uint8x8_t u8 = vld1_u8(pu + x / 2), v8 = vld1_u8(pv + x / 2);
+        uint8x8x2_t uz = vzip_u8(u8, u8), vz = vzip_u8(v8, v8);
+        uint8x8_t ys[2] = {vget_low_u8(yy), vget_high_u8(yy)}, r8[2], g8[2], b8[2];
+        for (int p = 0; p < 2; p++) {
+            int16x8_t y16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(ys[p])), vdupq_n_s16((int16_t)y0));
+            int16x8_t u16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uz.val[p])), vdupq_n_s16(128)), v16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vz.val[p])), vdupq_n_s16(128));
+            uint16x4_t rr[2], gg[2], bb[2];
+            for (int h2 = 0; h2 < 2; h2++) {
+                int32x4_t l = vmulq_n_s32(vmovl_s16(h2 ? vget_high_s16(y16) : vget_low_s16(y16)), Y);
+                int32x4_t uu = vmovl_s16(h2 ? vget_high_s16(u16) : vget_low_s16(u16)), vv = vmovl_s16(h2 ? vget_high_s16(v16) : vget_low_s16(v16));
+                l = vaddq_s32(l, vdupq_n_s32(32768));
+                rr[h2] = vqmovun_s32(vshrq_n_s32(vmlaq_n_s32(l, vv, RV), 16));
+                gg[h2] = vqmovun_s32(vshrq_n_s32(vmlsq_n_s32(vmlsq_n_s32(l, uu, GU), vv, GV), 16));
+                bb[h2] = vqmovun_s32(vshrq_n_s32(vmlaq_n_s32(l, uu, BU), 16));
+            }
+            r8[p] = vqmovn_u16(vcombine_u16(rr[0], rr[1])); g8[p] = vqmovn_u16(vcombine_u16(gg[0], gg[1])); b8[p] = vqmovn_u16(vcombine_u16(bb[0], bb[1]));
+        }
+        uint8x16_t R = vcombine_u8(r8[0], r8[1]), G = vcombine_u8(g8[0], g8[1]), B = vcombine_u8(b8[0], b8[1]);
+        uint8x16x4_t px = {{swap_rb ? B : R, G, swap_rb ? R : B, vdupq_n_u8(255)}};
+        vst4q_u8((uint8_t *)(o32 + x), px);
+    }
+    return x;
+}
+#endif
 void md_rgba(const vpx_image_t *im, uint8_t *dst, int w, int h) {
     if (g_rgba_neon < 0) { const char *e = getenv("DM_MOVIE_RGBA_NEON"); g_rgba_neon = !(e && *e == '0'); }
     int full = im->range == VPX_CR_FULL_RANGE, b709 = im->cs == VPX_CS_BT_709 || (im->cs == VPX_CS_UNKNOWN && h >= 720);
     double ky = full ? 1.0 : 255.0 / 219.0, kc = full ? 1.0 : 255.0 / 224.0;
     double rv = b709 ? 1.5748 : 1.402, gu = b709 ? 0.1873 : 0.3441, gv = b709 ? 0.4681 : 0.7141, bu = b709 ? 1.8556 : 1.772;
-    int Y = (int)(ky * 65536), RV = (int)(rv * kc * 65536), GU = (int)(gu * kc * 65536), GV = (int)(gv * kc * 65536), BU = (int)(bu * kc * 65536), y0 = full ? 0 : 16;
+    int c[6] = {(int)(ky * 65536), (int)(rv * kc * 65536), (int)(gu * kc * 65536), (int)(gv * kc * 65536), (int)(bu * kc * 65536), full ? 0 : 16};
     int cw = (int)im->d_w < w ? (int)im->d_w : w, ch = (int)im->d_h < h ? (int)im->d_h : h;
-    if (cw < w || ch < h) for (size_t i = 0; i < (size_t)w * h; i++) ((uint32_t *)dst)[i] = 0xff000000u;
+    if (cw < w || ch < h) {
+        if (dm_movie_fast_on()) dm_movie_rgba_pad_borders(dst, cw, ch, w, h, 0);
+        else for (size_t i = 0; i < (size_t)w * h; i++) ((uint32_t *)dst)[i] = 0xff000000u;
+    }
     int swap_rb = MD_SWAP_RB();
-    #define CL(v) ((v) < 0 ? 0 : (v) > 255 ? 255 : (v))
     for (int y = 0; y < ch; y++) {
         const uint8_t *py = im->planes[0] + (size_t)y * im->stride[0], *pu = im->planes[1] + (size_t)(y >> 1) * im->stride[1], *pv = im->planes[2] + (size_t)(y >> 1) * im->stride[2];
         uint32_t *o32 = (uint32_t *)(dst + (size_t)y * w * 4);
         int x = 0;
 #if defined(__aarch64__)
-        if (g_rgba_neon) for (; x + 16 <= cw; x += 16) {   // the same 16.16 arithmetic, 16 pixels at a time (a 2560x1440 AV1 picture each video frame: Fire Emblem Fortune's Weave)
-            uint8x16_t yy = vld1q_u8(py + x); uint8x8_t u8 = vld1_u8(pu + x / 2), v8 = vld1_u8(pv + x / 2);
-            uint8x8x2_t uz = vzip_u8(u8, u8), vz = vzip_u8(v8, v8);
-            uint8x8_t ys[2] = {vget_low_u8(yy), vget_high_u8(yy)}, r8[2], g8[2], b8[2];
-            for (int k = 0; k < 2; k++) {
-                int16x8_t y16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(ys[k])), vdupq_n_s16((int16_t)y0));
-                int16x8_t u16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uz.val[k])), vdupq_n_s16(128)), v16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vz.val[k])), vdupq_n_s16(128));
-                uint16x4_t rr[2], gg[2], bb[2];
-                for (int h2 = 0; h2 < 2; h2++) {
-                    int32x4_t l = vmulq_n_s32(vmovl_s16(h2 ? vget_high_s16(y16) : vget_low_s16(y16)), Y), uu = vmovl_s16(h2 ? vget_high_s16(u16) : vget_low_s16(u16)), vv = vmovl_s16(h2 ? vget_high_s16(v16) : vget_low_s16(v16));
-                    l = vaddq_s32(l, vdupq_n_s32(32768));
-                    rr[h2] = vqmovun_s32(vshrq_n_s32(vmlaq_n_s32(l, vv, RV), 16));
-                    gg[h2] = vqmovun_s32(vshrq_n_s32(vmlsq_n_s32(vmlsq_n_s32(l, uu, GU), vv, GV), 16));
-                    bb[h2] = vqmovun_s32(vshrq_n_s32(vmlaq_n_s32(l, uu, BU), 16));
-                }
-                r8[k] = vqmovn_u16(vcombine_u16(rr[0], rr[1])); g8[k] = vqmovn_u16(vcombine_u16(gg[0], gg[1])); b8[k] = vqmovn_u16(vcombine_u16(bb[0], bb[1]));
-            }
-            uint8x16_t R = vcombine_u8(r8[0], r8[1]), G = vcombine_u8(g8[0], g8[1]), B = vcombine_u8(b8[0], b8[1]);
-            uint8x16x4_t px = {{swap_rb ? B : R, G, swap_rb ? R : B, vdupq_n_u8(255)}};
-            vst4q_u8((uint8_t *)(o32 + x), px);
-        }
+        if (g_rgba_neon) x = md_rgba_neon_row(o32, py, pu, pv, cw, swap_rb, c);
 #endif
-        if (swap_rb) {
-            for (; x + 4 <= cw; x += 4) {
-                int u0 = pu[x >> 1] - 128, v0 = pv[x >> 1] - 128;
-                int cr0 = RV * v0 + 32768, cg0 = - GU * u0 - GV * v0 + 32768, cb0 = BU * u0 + 32768;
-                int l0 = (py[x] - y0) * Y, l1 = (py[x + 1] - y0) * Y;
-                o32[x] = (uint32_t)CL((l0 + cb0) >> 16) | ((uint32_t)CL((l0 + cg0) >> 16) << 8) | ((uint32_t)CL((l0 + cr0) >> 16) << 16) | 0xff000000u;
-                o32[x + 1] = (uint32_t)CL((l1 + cb0) >> 16) | ((uint32_t)CL((l1 + cg0) >> 16) << 8) | ((uint32_t)CL((l1 + cr0) >> 16) << 16) | 0xff000000u;
-
-                int u1 = pu[(x >> 1) + 1] - 128, v1 = pv[(x >> 1) + 1] - 128;
-                int cr1 = RV * v1 + 32768, cg1 = - GU * u1 - GV * v1 + 32768, cb1 = BU * u1 + 32768;
-                int l2 = (py[x + 2] - y0) * Y, l3 = (py[x + 3] - y0) * Y;
-                o32[x + 2] = (uint32_t)CL((l2 + cb1) >> 16) | ((uint32_t)CL((l2 + cg1) >> 16) << 8) | ((uint32_t)CL((l2 + cr1) >> 16) << 16) | 0xff000000u;
-                o32[x + 3] = (uint32_t)CL((l3 + cb1) >> 16) | ((uint32_t)CL((l3 + cg1) >> 16) << 8) | ((uint32_t)CL((l3 + cr1) >> 16) << 16) | 0xff000000u;
-            }
-            for (; x < cw; x++) {
-                int l = (py[x] - y0) * Y, u = pu[x >> 1] - 128, v = pv[x >> 1] - 128;
-                int r = (l + RV * v + 32768) >> 16, g = (l - GU * u - GV * v + 32768) >> 16, b = (l + BU * u + 32768) >> 16;
-                o32[x] = (uint32_t)CL(b) | ((uint32_t)CL(g) << 8) | ((uint32_t)CL(r) << 16) | 0xff000000u;
-            }
-        } else {
-            for (; x + 4 <= cw; x += 4) {
-                int u0 = pu[x >> 1] - 128, v0 = pv[x >> 1] - 128;
-                int cr0 = RV * v0 + 32768, cg0 = - GU * u0 - GV * v0 + 32768, cb0 = BU * u0 + 32768;
-                int l0 = (py[x] - y0) * Y, l1 = (py[x + 1] - y0) * Y;
-                o32[x] = (uint32_t)CL((l0 + cr0) >> 16) | ((uint32_t)CL((l0 + cg0) >> 16) << 8) | ((uint32_t)CL((l0 + cb0) >> 16) << 16) | 0xff000000u;
-                o32[x + 1] = (uint32_t)CL((l1 + cr0) >> 16) | ((uint32_t)CL((l1 + cg0) >> 16) << 8) | ((uint32_t)CL((l1 + cb0) >> 16) << 16) | 0xff000000u;
-
-                int u1 = pu[(x >> 1) + 1] - 128, v1 = pv[(x >> 1) + 1] - 128;
-                int cr1 = RV * v1 + 32768, cg1 = - GU * u1 - GV * v1 + 32768, cb1 = BU * u1 + 32768;
-                int l2 = (py[x + 2] - y0) * Y, l3 = (py[x + 3] - y0) * Y;
-                o32[x + 2] = (uint32_t)CL((l2 + cr1) >> 16) | ((uint32_t)CL((l2 + cg1) >> 16) << 8) | ((uint32_t)CL((l2 + cb1) >> 16) << 16) | 0xff000000u;
-                o32[x + 3] = (uint32_t)CL((l3 + cr1) >> 16) | ((uint32_t)CL((l3 + cg1) >> 16) << 8) | ((uint32_t)CL((l3 + cb1) >> 16) << 16) | 0xff000000u;
-            }
-            for (; x < cw; x++) {
-                int l = (py[x] - y0) * Y, u = pu[x >> 1] - 128, v = pv[x >> 1] - 128;
-                int r = (l + RV * v + 32768) >> 16, g = (l - GU * u - GV * v + 32768) >> 16, b = (l + BU * u + 32768) >> 16;
-                o32[x] = (uint32_t)CL(r) | ((uint32_t)CL(g) << 8) | ((uint32_t)CL(b) << 16) | 0xff000000u;
-            }
-        }
+        md_rgba_scalar_row(o32, py, pu, pv, x, cw, swap_rb, c);
     }
-    #undef CL
 }
 // decode one packet into output slot slot: 1 = a picture came out, 0 = none (hidden frame or error)
 static int md_vpx(mdec_t *d, const uint8_t *p, int n, int slot) {
@@ -564,6 +561,11 @@ static void md_job(mdec_t *d, int job) {
 // their players feed one packet per signal and a packet decodes quickly
 static void md_pump_ev(mdec_t *d, int ev) { if (MD_AUDIO(d)) md_event(d, ev); else md_defer_at(d, ev, now_ns()); }
 static void md_pump(mdec_t *d);
+static int md_take_free_slot(mdec_t *d) {
+    if (d->mask_on) return dm_movie_first_free_slot(d->used_mask, d->nout, 0);
+    for (int k = 0; k < d->nout; k++) if (!d->out[k].used) return k;
+    return -1;
+}
 static void *md_pump_thread(void *arg) {
     mdec_t *d = arg;
 #ifdef __APPLE__
@@ -573,7 +575,7 @@ static void *md_pump_thread(void *arg) {
 #endif
     pthread_mutex_lock(&d->pkm);
     for (;;) {
-        while (!d->pk_go && !d->pk_quit) pthread_cond_wait(&d->pkc, &d->pkm);
+        while (!d->pk_go && !d->pk_quit) { d->pk_waiting++; pthread_cond_wait(&d->pkc, &d->pkm); d->pk_waiting--; }
         if (d->pk_quit) break;
         d->pk_go = 0; pthread_mutex_unlock(&d->pkm);
         md_pump(d);
@@ -584,7 +586,9 @@ static void *md_pump_thread(void *arg) {
 }
 static void md_pump_async(mdec_t *d) {   // decode what is queued on the decoder's thread
     if (!d->pk_on) { md_pump(d); return; }
-    pthread_mutex_lock(&d->pkm); d->pk_go = 1; pthread_cond_signal(&d->pkc); pthread_mutex_unlock(&d->pkm);
+    pthread_mutex_lock(&d->pkm);
+    dm_movie_pump_wake(&d->pk_go, d->pk_waiting, &d->pk_elided, &d->pkc, dm_movie_fast_on());
+    pthread_mutex_unlock(&d->pkm);
 }
 // while packets are queued and an output slot is free, decode the head packet, until the queue is empty or every slot is taken; signal the input / output events by the result
 static void md_pump(mdec_t *d) {
@@ -592,9 +596,9 @@ static void md_pump(mdec_t *d) {
     for (;;) {
         dm_host_mutex_lock(&d->mu);
         if (d->avc_drain) {   // H.264 end of stream: the pictures still queued leave one per free slot, then an output without a picture carries the end-of-stream flag
-            int s = -1; for (int k = 0; k < d->nout; k++) if (!d->out[k].used) { s = k; break; }
+            int s = md_take_free_slot(d);
             if (s < 0) { pthread_mutex_unlock(&d->mu); break; }
-            d->out[s].used = 1; pthread_mutex_unlock(&d->mu);
+            d->out[s].used = 1; d->used_mask |= UINT64_C(1) << s; pthread_mutex_unlock(&d->mu);
             d->jslot = s; d->jflush = 1; md_job(d, MDJ_TAKE); int got = d->jgot;
             dm_host_mutex_lock(&d->mu);
             d->out[s].pic = got; d->out[s].pts = got ? d->jpts_out : d->drain_pts; d->out[s].flags = got ? 0 : 4; d->outq[d->noutq++] = s;
@@ -603,12 +607,11 @@ static void md_pump(mdec_t *d) {
             md_pump_ev(d, 1);
             continue;
         }
-        int slot = -1;
-        if (d->npend) for (int k = 0; k < d->nout; k++) if (!d->out[k].used) { slot = k; break; }
+        int slot = d->npend ? md_take_free_slot(d) : -1;
         if (slot < 0) { pthread_mutex_unlock(&d->mu); break; }
         __typeof__(d->pend[0]) pk = d->pend[0];
         memmove(d->pend, d->pend + 1, --d->npend * sizeof *d->pend);
-        d->out[slot].used = 1;
+        d->out[slot].used = 1; d->used_mask |= UINT64_C(1) << slot;
         pthread_mutex_unlock(&d->mu);
         int got = 0, avc = d->type == MD_TYPE_AVC;
         int eos = (pk.flags & 4) != 0;   // MediaCodec BUFFER_FLAG_END_OF_STREAM
@@ -623,7 +626,7 @@ static void md_pump(mdec_t *d) {
         d->infree[d->ninfree++] = pk.in;
         int ready = got || eos;   // an end-of-stream packet without a picture still yields an output to carry the flag back
         if (ready) { d->out[slot].pic = got; d->out[slot].pts = got && avc ? d->jpts_out : pk.pts; d->out[slot].flags = more ? pk.flags & ~4u : pk.flags; d->outq[d->noutq++] = slot; }
-        else d->out[slot].used = 0;
+        else { d->out[slot].used = 0; d->used_mask &= ~(UINT64_C(1) << slot); }
         if (more) { d->avc_drain = 1; d->drain_pts = pk.pts; }
         int ineos = d->in_eos;
         pthread_mutex_unlock(&d->mu);
@@ -645,7 +648,7 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     if (!audio && (type < 1 || type > 3 || (fmt != MD_FMT_NV12 && !(fmt == MD_FMT_ABGR && mode == MD_MODE_TEX)))) { LOG("[RED] movie: decoder type %d output %d mode %d not supported by the host, every method returns failure", type, fmt, mode); return; }
     mdec_t *d = calloc(1, sizeof *d);
     pthread_mutex_init(&d->mu, NULL); pthread_mutex_init(&d->dmu, NULL); pthread_mutex_init(&d->wmu, NULL); pthread_cond_init(&d->wcv, NULL);
-    d->type = type; d->fmt = fmt; d->mode = mode;
+    d->type = type; d->fmt = fmt; d->mode = mode; d->mask_on = dm_movie_fast_on();
     // A Vorbis decoder keeps 64 outputs, an AAC decoder 32 (about 0.7 s), a video decoder 16. The host decodes far faster than the Switch, and a player that feeds its decoders in file order
     // stops at the first track with no free input. DRAGON QUEST XI S's player fills every track before it plays (IsPreDecodingCompleted: one output queued on each, polled once a frame),
     // while its render thread's first fetch takes every decoded picture and shows the newest. With 8 audio outputs, both audio tracks were full before 240 ms of video was decoded: the
@@ -776,6 +779,7 @@ static void md_reset(mdec_t *d, int close) {
     for (int i = 0; i < MD_NIN; i++) { d->infree[i] = i; d->instale[i] = d->inown[i] ? now : 0; d->inown[i] = 0; }
     d->ninfree = MD_NIN; d->noutq = 0; d->npend = 0; d->avc_drain = 0; d->in_eos = 0; d->hold_n = 0; d->vb_prev = 0;
     // a flush keeps each slot's last picture: the same game reads an output it acquired before the flush right after it (a black frame in the loop otherwise)
+    d->used_mask = 0u; d->rnd_cli_mask = 0u;
     for (int i = 0; i < MD_NOUT; i++) { d->out[i].used = 0; d->out[i].cli = 0; d->out[i].rnd = 0; if (close) d->out[i].pic = 0; }
     pthread_mutex_unlock(&d->mu);
     pthread_mutex_unlock(&d->dmu);
@@ -881,7 +885,9 @@ HLE_FORCE("_ZN5movie7Decoder24AcquireOutputBufferIndexEPiPlPjS1_", "movie decode
     int r = MD_NO_OUTPUT; *idx = -1; *left = 0;
     if (d->noutq && d->started) {
         int s = d->outq[0]; memmove(d->outq, d->outq + 1, --d->noutq * sizeof *d->outq);
-        *idx = s; *pts = d->out[s].pts; *flags = d->out[s].flags; *left = d->noutq; d->out[s].cli = 1; r = 0;
+        *idx = s; *pts = d->out[s].pts; *flags = d->out[s].flags; *left = d->noutq; d->out[s].cli = 1;
+        if (d->out[s].rnd) d->rnd_cli_mask |= UINT64_C(1) << s;
+        r = 0;
     }
     pthread_mutex_unlock(&d->mu);
     if (!r && !MD_AUDIO(d)) atomic_store_explicit(&g_movie_pic_ns, now_ns(), memory_order_relaxed);
@@ -943,9 +949,22 @@ int nvn_host_signal_sync(void *nvnsync);
 // and Metroid Prime 4: Beyond never release, and their decoders stopped with all 16 slots held when the slots waited for good). Called with mu held; → slots returned
 static int md_rendered(mdec_t *d, int i) {
     int n = 0;
-    if (!d->tex_rel) for (int k = 0; k < d->nout; k++) if (k != i && d->out[k].rnd && d->out[k].cli) {
-        d->out[k].used = 0; d->out[k].pic = 0; d->out[k].cli = 0; d->out[k].rnd = 0; n++; }
-    if (d->out[i].cli) d->out[i].rnd = 1;
+    if (!d->tex_rel) {
+        if (d->mask_on) {
+            uint64_t drop = d->rnd_cli_mask & ~(UINT64_C(1) << i);
+            for (int step = 0; step < MD_NOUT && drop; step++) {
+                int k = __builtin_ctzll(drop);
+                drop &= drop - 1u;
+                d->out[k].used = 0; d->out[k].pic = 0; d->out[k].cli = 0; d->out[k].rnd = 0;
+                d->used_mask &= ~(UINT64_C(1) << k); d->rnd_cli_mask &= ~(UINT64_C(1) << k); n++;
+            }
+        } else {
+            for (int k = 0; k < d->nout; k++) if (k != i && d->out[k].rnd && d->out[k].cli) {
+                d->out[k].used = 0; d->out[k].pic = 0; d->out[k].cli = 0; d->out[k].rnd = 0; n++;
+            }
+        }
+    }
+    if (d->out[i].cli) { d->out[i].rnd = 1; d->rnd_cli_mask |= UINT64_C(1) << i; }
     return n;
 }
 // A native-aspect variant (DM_PATCH_VARIANT, e.g. Fire Emblem Fortune's Weave's 4:3) lays the game out for a taller picture (DM_VK_PICTURE_ASPECT) inside its 16:9 frame,
@@ -974,7 +993,10 @@ static void md_lb_rows(uint8_t *dst, const uint8_t *src, int rows, size_t rowb, 
         memcpy(dst + (size_t)r * rowb, src + (size_t)sr * rowb, rowb);
     }
 }
-static void md_fill_rgba(uint8_t *p, size_t n) { for (size_t k = 0; k + 3 < n; k += 4) { p[k] = p[k + 1] = p[k + 2] = 0; p[k + 3] = 255; } }
+static void md_fill_rgba(uint8_t *p, size_t n) {
+    if (dm_movie_fast_on()) { dm_movie_rgba_fill_px(p, n); return; }
+    for (size_t k = 0; k + 3 < n; k += 4) { p[k] = p[k + 1] = p[k + 2] = 0; p[k + 3] = 255; }
+}
 static void md_fill_y(uint8_t *p, size_t n) { memset(p, 16, n); }
 static void md_fill_uv(uint8_t *p, size_t n) { memset(p, 128, n); }
 static int md_letterbox_tex(mdec_t *d, const uint8_t **src, int h, size_t rowb) {   // native-texture mode: *src becomes the letterboxed copy
@@ -1004,7 +1026,8 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
         if (bgr) {   // into a copy: the slot's picture stays RGBA for another GetOutputBuffer of the same slot
             size_t n = (size_t)d->w * h * 4;
             if (d->bgra_cap < n) { free(d->bgra); d->bgra = malloc(n); d->bgra_cap = n; }
-            for (size_t k = 0; k < n; k += 4) { d->bgra[k] = src[k + 2]; d->bgra[k + 1] = src[k + 1]; d->bgra[k + 2] = src[k]; d->bgra[k + 3] = src[k + 3]; }
+            if (dm_movie_fast_on()) dm_movie_rgba_to_bgra(d->bgra, src, n, 0);
+            else for (size_t k = 0; k < n; k += 4) { d->bgra[k] = src[k + 2]; d->bgra[k + 1] = src[k + 1]; d->bgra[k + 2] = src[k]; d->bgra[k + 3] = src[k + 3]; }
             src = d->bgra;
         }
         md_letterbox_tex(d, &src, h, (size_t)d->w * 4);
@@ -1066,7 +1089,10 @@ static int md_rel(mdec_t *d, int i) {
     dm_host_mutex_lock(&d->mu);
     int held = d->out[i].cli;
     if (held && d->out[i].rnd) d->tex_rel = 1;   // this client releases what it rendered: md_rendered leaves its slots to it
-    if (held) { d->out[i].used = 0; d->out[i].pic = 0; d->out[i].cli = 0; d->out[i].rnd = 0; }
+    if (held) {
+        d->out[i].used = 0; d->out[i].pic = 0; d->out[i].cli = 0; d->out[i].rnd = 0;
+        d->used_mask &= ~(UINT64_C(1) << i); d->rnd_cli_mask &= ~(UINT64_C(1) << i);
+    }
     int queued = d->npend, drain = d->avc_drain;
     pthread_mutex_unlock(&d->mu);
     MD_TRACE(d, 13, "release output index %d%s (%d packets queued%s)", i, held ? "" : ": not held by the client, nothing to release", queued, drain ? ", H.264 pictures draining" : "");
