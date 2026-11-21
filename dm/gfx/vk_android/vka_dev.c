@@ -12,6 +12,7 @@
 #include "vka_tlsig.h"
 #include "vka_auto.h"
 #include "vka_scr_fast.h"
+#include "vka_imgmem_fast.h"
 _Static_assert(VKA_DRV_QCOM == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && VKA_DRV_TURNIP == VK_DRIVER_ID_MESA_TURNIP, "vka_auto.h driver IDs");
 
 // One "[auto] KEY=value because driver_id=N (name)" line for each automatic default by driver this device takes (vka_auto.h), once per run at device creation; a switch
@@ -66,7 +67,10 @@ static int g_fault_on;   // VK_EXT_device_fault enabled (fault_report)
 static pthread_mutex_t g_init_mu = PTHREAD_MUTEX_INITIALIZER;
 
 
+static vka_memtype_lut g_vka_memtype_lut;
 uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
+    if (vka_imgmem_fast_on() && g_vka_memtype_lut.ready && g_vka_memtype_lut.count == V.memp.memoryTypeCount)
+        return vka_memtype_pick_fast(&g_vka_memtype_lut, bits, want, avoid, 0);
     for (uint32_t i = 0; i < V.memp.memoryTypeCount; i++)
         if ((bits >> i & 1) && (V.memp.memoryTypes[i].propertyFlags & want) == want && !(V.memp.memoryTypes[i].propertyFlags & avoid)) return i;
     return UINT32_MAX;
@@ -144,6 +148,9 @@ static int init_once(void) {
     if (vk.vkEnumeratePhysicalDevices(V.inst, &npd, pd) < 0 || !npd) { VRED("no Vulkan physical device"); return 0; }
     V.pd = pd[0];
     vk.vkGetPhysicalDeviceProperties(V.pd, &V.props); vk.vkGetPhysicalDeviceMemoryProperties(V.pd, &V.memp);
+    { uint32_t fl[32] = {0}; uint32_t n = V.memp.memoryTypeCount < 32u ? V.memp.memoryTypeCount : 32u;
+      for (uint32_t i = 0; i < n; i++) fl[i] = V.memp.memoryTypes[i].propertyFlags;
+      vka_memtype_lut_build(&g_vka_memtype_lut, n, fl); }
     if (V.props.apiVersion < VK_API_VERSION_1_3) { VRED("device %s is Vulkan %u.%u: the replay needs 1.3", V.props.deviceName, VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion)); return 0; }
     uint32_t nq = 0; vk.vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &nq, NULL);
     VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp); vk.vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &nq, qp);

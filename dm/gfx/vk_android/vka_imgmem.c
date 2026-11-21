@@ -21,6 +21,7 @@
 #define VKA_IMEM_MAX (4ull << 20)            // images of at least 4 MiB keep their own allocation
 typedef struct iblock { struct iblock *next; VkDeviceMemory dm; uint32_t type; vke_list free; } iblock;
 static iblock *g_blocks[VK_MAX_MEMORY_TYPES];
+static uint32_t g_empty_blocks[VK_MAX_MEMORY_TYPES];
 static pthread_mutex_t g_imu = PTHREAD_MUTEX_INITIALIZER;
 // Stats (under g_imu): blocks, images in blocks (count, units' bytes, the images' own sizes), dedicated allocations (count, bytes), blocks freed, block allocations that failed
 static struct { uint64_t blocks, runs, run_bytes, req_bytes, ded, ded_bytes, freed, fail; } S;
@@ -46,8 +47,10 @@ static VkResult dedicated(VkImage img, uint32_t type, const VkMemoryRequirements
     return VK_SUCCESS;
 }
 static int take(iblock *b, uint32_t n, uint32_t al, const VkMemoryRequirements *mr, vka_imem *m) {   // n units of b (caller holds g_imu): 1, or 0 when they do not fit
+    int was_empty = vke_empty(&b->free);
     int64_t u = vke_alloc(&b->free, n, al);
     if (u < 0) return 0;
+    if (was_empty && g_empty_blocks[b->type] > 0u) g_empty_blocks[b->type]--;
     S.runs++; S.run_bytes += n * UNIT; S.req_bytes += mr->size;
     m->dm = b->dm; m->off = (uint64_t)u * UNIT; m->blk = b; m->units = n; m->size = mr->size;
     return 1;
@@ -71,7 +74,7 @@ VkResult vka_imem_bind(VkImage img, uint32_t type, const VkMemoryRequirements *m
         if (nb && !ok) nb->dm = VK_NULL_HANDLE;
         pthread_mutex_lock(&g_imu);
         for (iblock *b = g_blocks[type]; b && !got; b = b->next) got = take(b, n, al, mr, m);
-        if (!got && ok) { nb->type = type; nb->next = g_blocks[type]; g_blocks[type] = nb; S.blocks++; got = take(nb, n, al, mr, m); nb = NULL; }
+        if (!got && ok) { nb->type = type; nb->next = g_blocks[type]; g_blocks[type] = nb; g_empty_blocks[type]++; S.blocks++; got = take(nb, n, al, mr, m); nb = NULL; }
         if (!ok) S.fail++;
         pthread_mutex_unlock(&g_imu);
         if (nb) { if (nb->dm) vk.vkFreeMemory(V.dev, nb->dm, NULL); vke_fini(&nb->free); free(nb); }   // not needed (another thread's block had room) or not allocated
@@ -116,7 +119,7 @@ VkResult vka_imem_bind_zero(VkImage img, uint32_t type, const VkMemoryRequiremen
     return VK_SUCCESS;
 }
 uint64_t vka_imem_zbytes(void) { uint64_t b; pthread_mutex_lock(&g_imu); vkz_stats(&Z, NULL, NULL, &b, NULL); pthread_mutex_unlock(&g_imu); return b; }
-uint64_t vka_imem_zbytes_nolock(void) { uint64_t b = 0; for (int i = 0; i < Z.n; i++) b += Z.e[i].size; return b; }   // (a log line's value, read without the lock)
+uint64_t vka_imem_zbytes_nolock(void) { if (vka_imgmem_fast_on() && !Z.idx_off) return Z.live_bytes; uint64_t b = 0; for (int i = 0; i < Z.n; i++) b += Z.e[i].size; return b; }   // (a log line's value, read without the lock)
 void vka_imem_zowned(void) { pthread_mutex_lock(&g_imu); vkz_note_own(&Z); pthread_mutex_unlock(&g_imu); }
 
 // The memory back (after vkDestroyImage of the image bound to it, once the GPU is done with it)
@@ -135,15 +138,19 @@ void vka_imem_free(vka_imem *m) {
     }
     iblock *b = m->blk, *gone = NULL;
     pthread_mutex_lock(&g_imu);
+    int was_empty = vke_empty(&b->free);
     int fr = vke_free(&b->free, (uint32_t)(m->off / UNIT), m->units);
     if (fr == -2) VRED_ONCE("image memory block: units %llu+%u given back twice or never given (left as they are)", (unsigned long long)(m->off / UNIT), m->units);
     else if (fr) { VRED_ONCE("image memory block: free extent list not grown, %u units lost to reuse until the block empties", m->units); b->free.used -= m->units; }   // still counted free: the block can be released
     if (fr != -2) { S.runs--; S.run_bytes -= m->units * UNIT; S.req_bytes -= m->size; }   // a bad free was never a run
-    if (vke_empty(&b->free)) {   // freed unless it is the memory type's only empty block
-        int empties = 0; for (iblock *x = g_blocks[b->type]; x; x = x->next) empties += vke_empty(&x->free);
-        if (empties > 1) {
+    if (!was_empty && vke_empty(&b->free)) {   // freed unless it is the memory type's only empty block
+        g_empty_blocks[b->type]++;
+        int do_free = 0;
+        if (vka_imgmem_fast_on()) do_free = vka_imem_empty_should_free(g_empty_blocks[b->type], 0);
+        else { uint32_t empties = 0u; for (iblock *x = g_blocks[b->type]; x; x = x->next) empties += (uint32_t)vke_empty(&x->free); do_free = empties > 1u; }
+        if (do_free) {
             for (iblock **p = &g_blocks[b->type]; *p; p = &(*p)->next) if (*p == b) { *p = b->next; break; }
-            gone = b; S.blocks--; S.freed++;
+            g_empty_blocks[b->type]--; gone = b; S.blocks--; S.freed++;
         }
     }
     pthread_mutex_unlock(&g_imu);

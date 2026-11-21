@@ -7,10 +7,19 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vka_imgmem_fast.h"
 
 enum { VKZ_KEY = 128 };
-typedef struct { uint8_t key[VKZ_KEY]; uint32_t klen; uint64_t h, size; int refs; } vkz_ent;
-typedef struct { vkz_ent *e; int n, cap; uint64_t made, owned; } vkz_tab;   // made: allocations ever made; owned: images that left their entry for memory of their own (vkz_note_own)
+typedef struct { uint8_t key[VKZ_KEY]; uint32_t klen; uint64_t khash, h, size; int refs; } vkz_ent;
+typedef struct {
+    vkz_ent *e;
+    int n, cap;
+    uint64_t made, owned;
+    uint64_t live_images, live_bytes, saved_bytes;
+    int16_t kslot[VKZ_IDX_SLOTS];
+    int16_t hslot[VKZ_IDX_SLOTS];
+    uint8_t idx_off;
+} vkz_tab;   // made: allocations ever made; owned: images that left their entry for memory of their own (vkz_note_own)
 
 // An image is a candidate when it is dense (no residency image), single-sampled, not 3D, not block-compressed, not linear and not a display (window) texture, and its storage
 // takes at least min_bytes and at most max_bytes (0: no upper limit). Whether its content is the GPU's (ST_ZERO) is the caller's: only those are bound to shared memory.
@@ -27,32 +36,125 @@ static inline uint64_t vkz_max(int depth, int big_color_ok, int64_t env_mb) {   
 static inline int vkz_candidate(uint64_t storage_bytes, uint64_t min_bytes, uint64_t max_bytes, int res, uint32_t samples, int is3d, int compressed, int linear_or_display) {
     return min_bytes && storage_bytes >= min_bytes && (!max_bytes || storage_bytes <= max_bytes) && !res && samples <= 1 && !is3d && !compressed && !linear_or_display;
 }
+static inline void vkz_slot_erase(int16_t *slots, uint32_t ideal, int16_t target, const vkz_ent *ents, int is_h) {
+    if (!slots || !ents) return;
+    uint32_t hole = VKZ_IDX_SLOTS;
+    for (uint32_t step = 0u; step < VKZ_IDX_SLOTS; step++) {
+        uint32_t pos = (ideal + step) & VKZ_IDX_MASK;
+        if (!slots[pos]) return;
+        if (slots[pos] == target) { hole = pos; break; }
+    }
+    if (hole == VKZ_IDX_SLOTS) return;
+    slots[hole] = 0;
+    uint32_t i = hole;
+    for (uint32_t step = 0u; step < VKZ_IDX_SLOTS; step++) {
+        i = (i + 1u) & VKZ_IDX_MASK;
+        int16_t v = slots[i];
+        if (!v) return;
+        uint32_t r = (uint32_t)(is_h ? vkz_hash_u64(ents[v - 1].h) : ents[v - 1].khash) & VKZ_IDX_MASK;
+        if (((hole - r) & VKZ_IDX_MASK) < ((i - r) & VKZ_IDX_MASK)) {
+            slots[hole] = v;
+            slots[i] = 0;
+            hole = i;
+        }
+    }
+}
 static inline int vkz_find(const vkz_tab *t, const void *key, uint32_t klen) {
-    for (int i = 0; i < t->n; i++) if (t->e[i].klen == klen && !memcmp(t->e[i].key, key, klen)) return i;
+    if (!t || t->n <= 0 || !t->e || (!key && klen) || klen > VKZ_KEY) return -1;
+    if (vka_imgmem_fast_on() && !t->idx_off) {
+        uint64_t kh = vkz_hash_bytes(key, klen);
+        uint32_t base = (uint32_t)kh & VKZ_IDX_MASK;
+        for (uint32_t step = 0u; step < VKZ_IDX_SLOTS; step++) {
+            int16_t slot = t->kslot[(base + step) & VKZ_IDX_MASK];
+            if (!slot) return -1;
+            const vkz_ent *e = &t->e[slot - 1];
+            if (e->khash == kh && e->klen == klen && (!klen || !memcmp(e->key, key, klen))) return slot - 1;
+        }
+        return -1;
+    }
+    for (int i = 0; i < t->n; i++) if (t->e[i].klen == klen && (!klen || !memcmp(t->e[i].key, key, klen))) return i;
     return -1;
 }
-static inline int vkz_find_h(const vkz_tab *t, uint64_t h) { for (int i = 0; i < t->n; i++) if (t->e[i].h == h) return i; return -1; }
+static inline int vkz_find_h(const vkz_tab *t, uint64_t h) {
+    if (!t || t->n <= 0 || !t->e || !h) return -1;
+    if (vka_imgmem_fast_on() && !t->idx_off) {
+        if (vka_w32_fault_mode() == 2) return -1;
+        uint32_t base = (uint32_t)vkz_hash_u64(h) & VKZ_IDX_MASK;
+        for (uint32_t step = 0u; step < VKZ_IDX_SLOTS; step++) {
+            int16_t slot = t->hslot[(base + step) & VKZ_IDX_MASK];
+            if (!slot) return -1;
+            if (t->e[slot - 1].h == h) return slot - 1;
+        }
+        return -1;
+    }
+    for (int i = 0; i < t->n; i++) if (t->e[i].h == h) return i;
+    return -1;
+}
 // One more image of key: the entry's index (refs counted), or -1 when there is none (the caller allocates and calls vkz_add)
-static inline int vkz_ref(vkz_tab *t, const void *key, uint32_t klen) { int i = klen <= VKZ_KEY ? vkz_find(t, key, klen) : -1; if (i >= 0) t->e[i].refs++; return i; }
+static inline int vkz_ref(vkz_tab *t, const void *key, uint32_t klen) {
+    int i = klen <= VKZ_KEY ? vkz_find(t, key, klen) : -1;
+    if (i >= 0) {
+        t->e[i].refs++;
+        t->live_images++;
+        t->saved_bytes += t->e[i].size;
+    }
+    return i;
+}
 // A new allocation h of size bytes for key, with its first image: the index, or -1 (no room; the caller frees h and binds the image as before)
 static inline int vkz_add(vkz_tab *t, const void *key, uint32_t klen, uint64_t h, uint64_t size) {
-    if (klen > VKZ_KEY || !h) return -1;
+    if (!t || (!key && klen) || klen > VKZ_KEY || !h) return -1;
     if (t->n == t->cap) { int c = t->cap ? 2 * t->cap : 16; vkz_ent *e = (vkz_ent *)realloc(t->e, (size_t)c * sizeof *e); if (!e) return -1; t->e = e; t->cap = c; }
-    vkz_ent *e = &t->e[t->n]; memset(e, 0, sizeof *e); memcpy(e->key, key, klen); e->klen = klen; e->h = h; e->size = size; e->refs = 1; t->made++;
+    int idx = t->n;
+    vkz_ent *e = &t->e[idx]; memset(e, 0, sizeof *e);
+    if (klen) memcpy(e->key, key, klen);
+    e->klen = klen; e->khash = vkz_hash_bytes(key, klen); e->h = h; e->size = size; e->refs = 1; t->made++;
+    t->live_images++; t->live_bytes += size;
+    if (!vka_imgmem_fast_on() || idx >= VKZ_IDX_MAX_N) {
+        t->idx_off = 1u;
+    } else if (!t->idx_off) {
+        vkz_slot_put(t->kslot, (uint32_t)e->khash & VKZ_IDX_MASK, (int16_t)(idx + 1));
+        vkz_slot_put(t->hslot, (uint32_t)vkz_hash_u64(h) & VKZ_IDX_MASK, (int16_t)(idx + 1));
+    }
     return t->n++;
 }
 // An image of allocation h let go: 1 when it was the last (the entry is gone; the caller frees h), 0 when others remain, -1 when h is no entry's
 static inline int vkz_unref(vkz_tab *t, uint64_t h) {
+    if (!t || !t->e) return -1;
     int i = vkz_find_h(t, h); if (i < 0) return -1;
-    if (--t->e[i].refs > 0) return 0;
-    t->e[i] = t->e[--t->n];
+    t->live_images--;
+    if (--t->e[i].refs > 0) {
+        t->saved_bytes -= t->e[i].size;
+        return 0;
+    }
+    t->live_bytes -= t->e[i].size;
+    int last = t->n - 1;
+    if (vka_imgmem_fast_on() && !t->idx_off) {
+        vkz_slot_erase(t->kslot, (uint32_t)t->e[i].khash & VKZ_IDX_MASK, (int16_t)(i + 1), t->e, 0);
+        vkz_slot_erase(t->hslot, (uint32_t)vkz_hash_u64(t->e[i].h) & VKZ_IDX_MASK, (int16_t)(i + 1), t->e, 1);
+        if (i < last) {
+            vkz_slot_rebind(t->kslot, (uint32_t)t->e[last].khash & VKZ_IDX_MASK, (int16_t)(last + 1), (int16_t)(i + 1));
+            vkz_slot_rebind(t->hslot, (uint32_t)vkz_hash_u64(t->e[last].h) & VKZ_IDX_MASK, (int16_t)(last + 1), (int16_t)(i + 1));
+        }
+    }
+    t->n = last;
+    if (i < last) t->e[i] = t->e[last];
     return 1;
 }
 static inline void vkz_note_own(vkz_tab *t) { t->owned++; }
 // The table now: images bound, allocations, their bytes, and the bytes they save (each image beyond an allocation's first would have had its own)
 static inline void vkz_stats(const vkz_tab *t, uint64_t *images, uint64_t *allocs, uint64_t *bytes, uint64_t *saved) {
+    if (vka_imgmem_fast_on() && !t->idx_off) {
+        if (images) *images = t->live_images;
+        if (allocs) *allocs = (uint64_t)t->n;
+        if (bytes) *bytes = t->live_bytes;
+        if (saved) *saved = t->saved_bytes + (vka_w32_fault_mode() == 3 ? 1u : 0u);
+        return;
+    }
     uint64_t im = 0, by = 0, sv = 0;
     for (int i = 0; i < t->n; i++) { im += (uint64_t)t->e[i].refs; by += t->e[i].size; sv += (uint64_t)(t->e[i].refs - 1) * t->e[i].size; }
-    if (images) *images = im; if (allocs) *allocs = (uint64_t)t->n; if (bytes) *bytes = by; if (saved) *saved = sv;
+    if (images) *images = im;
+    if (allocs) *allocs = (uint64_t)t->n;
+    if (bytes) *bytes = by;
+    if (saved) *saved = sv;
 }
 #endif

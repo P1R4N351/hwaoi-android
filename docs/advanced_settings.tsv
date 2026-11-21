@@ -588,6 +588,7 @@ DM_VK_HANG_EXIT	developer	Graphics			text			both
 DM_VK_HANG_S	developer	Graphics			text			both							
 DM_VK_HOOKDIR	developer	Diagnostics			text			both							
 DM_VK_IMGMEM	developer	Memory			text			both							
+DM_VK_IMGMEM_FAST	developer	Memory			text			both							
 DM_VK_IMG_DIAG	developer	Diagnostics			text			both							
 DM_VK_IMG_FAST	developer	Memory			text			both							
 DM_VK_IMG_LIMIT_MB	advanced	Memory	Texture cache limit	the game is killed for memory (lower it) or textures keep reloading (raise it)	number	512..8192 MiB|1024,2048,3072,4096	Measured from free memory	both	Too high a limit lets Android kill the game.						
