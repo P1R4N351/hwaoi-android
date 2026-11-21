@@ -1,6 +1,7 @@
 // The Vulkan shader library reader (vka_shlib.h). Every offset in the file is checked once at open, so lookups afterwards index the tables without further checks
 #include "vka_shlib.h"
 #include "vka_abi_compat.h"
+#include "vka_shlib_fast.h"
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -120,10 +121,14 @@ void vka_shlib_close(vka_shlib *L) {
     memset(L, 0, sizeof *L);
 }
 
-uint64_t vka_shlib_key(const uint8_t md[8]) { uint64_t k = 0; for (int i = 0; i < 8; i++) k = k << 8 | md[i]; return k; }
+uint64_t vka_shlib_key(const uint8_t md[8]) {
+    if (vka_shlib_fast_on()) return vka_shlib_key_fast(md, vka_w33_fault());
+    uint64_t k = 0; for (int i = 0; i < 8; i++) k = k << 8 | md[i]; return k;
+}
 
 const dmsh_vk_entry *vka_shlib_find(const vka_shlib *L, uint64_t key) {
     if (!L->h) return NULL;
+    if (vka_shlib_fast_on()) return vka_shlib_find_fast(L->ent, L->h->entry_count, key, vka_w33_fault());
     uint32_t lo = 0, hi = L->h->entry_count;
     while (lo < hi) {
         uint32_t m = lo + (hi - lo) / 2; uint64_t k = L->ent[m].key;

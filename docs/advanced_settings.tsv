@@ -733,6 +733,7 @@ DM_VK_SHARED_SPILL_MB	developer	Graphics			text			both
 DM_VK_SHLIB	developer	Diagnostics			text			both							
 DM_VK_SHLIB_ALL	internal	Diagnostics			text			both						test harness	
 DM_VK_SHLIB_CHECK	developer	Diagnostics			text			both							
+DM_VK_SHLIB_FAST	developer	Graphics			text			both							
 DM_VK_SHPOOL_LOG	developer	Diagnostics			text			both							
 DM_VK_SHUFFLE_LDS	developer	Graphics			text		1 (shuffles through workgroup memory) with Turnip, 0 with other drivers	both							
 DM_VK_SKIP_FS	developer	Graphics			text			both							

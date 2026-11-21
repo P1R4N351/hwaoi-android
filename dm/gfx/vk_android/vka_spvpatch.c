@@ -8,6 +8,7 @@
 // access chain, is followed by an OpBitcast back to the float type the body expects. The bits are then Maxwell's, and the attribute keeps its own integer format.
 // nvn_mtl.m reaches the same bits by converting such attributes on the CPU into float32 bits (vconv_int); the Apple chain's dmsh_vin is the reverse case (integer inputs fed float formats).
 #include "vka_spvpatch.h"
+#include "vka_shlib_fast.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -23,7 +24,11 @@ static int put(vec_t *v, uint32_t x) {
     if (v->n == v->cap) { size_t c = v->cap ? 2 * v->cap : 4096; uint32_t *p = realloc(v->w, c * 4); if (!p) return 0; v->w = p; v->cap = c; }
     v->w[v->n++] = x; return 1;
 }
-static int put_n(vec_t *v, const uint32_t *x, size_t n) { for (size_t i = 0; i < n; i++) if (!put(v, x[i])) return 0; return 1; }
+static int put_n(vec_t *v, const uint32_t *x, size_t n) {
+    if (vka_shlib_fast_on()) return vka_spv_put_words(&v->w, &v->n, &v->cap, x, n, vka_w33_fault());
+    for (size_t i = 0; i < n; i++) if (!put(v, x[i])) return 0;
+    return 1;
+}
 
 uint32_t *vka_spv_vin_retype(const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask, size_t *out_nw, char *err, size_t errn) {
 #define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
@@ -1092,6 +1097,7 @@ fail:
 // of them; a component the variable does not have (a vec3 output at an RGBA target) is never written. 0 = done; -1 when the module is not read (outputs split by Component
 // decorations, not SPIR-V): the caller then masks nothing more than before
 int vka_spv_fout_comps(const uint32_t *w, size_t nw, uint8_t comp[8]) {
+    if (vka_shlib_fast_on()) return vka_spv_fout_comps_fast(w, nw, comp, vka_w33_fault());
     enum { DecComponent = 2 };
     memset(comp, 0, 8);
     if (nw < 5 || w[0] != 0x07230203) return -1;
@@ -1313,11 +1319,13 @@ uint32_t *vka_spv_pool_fb(const uint32_t *w, size_t nw, uint32_t set, uint32_t t
     int s0 = 0, e0 = 0; if (!sites) sites = &s0; if (!early) early = &e0;
     *sites = 0; *early = 0; if (errn) err[0] = 0;
     if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    if (vka_shlib_fast_on() && !vka_spv_pool_fb_prescan(w, nw, set, tex_binding, vka_w33_fault())) return NULL;
     uint32_t *rec = calloc(w[3], 4); vec_t o = {0};
     if (!rec) { snprintf(err, errn, "out of memory"); return NULL; }
     int r = pf_pass(w, nw, set, tex_binding, fb_set, fb_binding, flags, alpha_spec, NULL, rec, &o, sites, early, err, errn);
     if (r <= 0) { free(rec); free(o.w); *sites = 0; return NULL; }   // (0: no pool read, err empty)
     free(o.w); o = (vec_t){0}; *sites = 0;
+    if (vka_shlib_fast_on()) (void)vka_spv_vec_reserve(&o.w, &o.cap, nw + 64u);
     r = pf_pass(w, nw, set, tex_binding, fb_set, fb_binding, flags, alpha_spec, rec, NULL, &o, sites, early, err, errn);
     free(rec);
     if (r <= 0) { free(o.w); *sites = 0; return NULL; }
