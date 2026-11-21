@@ -96,6 +96,7 @@ DM_GAMES_DIR	developer	Diagnostics			text			both
 DM_GAMES_FIRST	developer	Game			text			both							
 DM_GAME_ARGS_ADD	developer	Game			text			both							
 DM_GAME_ENV	developer	Game			text			both							
+DM_GATE_FAST	developer	Game			text			both							
 DM_GFX_FIXTURE_OUT	internal	Diagnostics			text			both						test harness	
 DM_GFX_QUALITY	friendly	Graphics	Graphics quality	the game looks too plain (Quality) or runs too slowly (Performance)	choice	Performance=performance;Quality=quality	Performance	game			render_cfg	04007EF01F8AE000			
 DM_GLSLC_CAPTURE	developer	Diagnostics			text			both							

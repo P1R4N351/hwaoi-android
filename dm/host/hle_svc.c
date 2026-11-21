@@ -711,14 +711,16 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 if (g_map[i].base > addr && g_map[i].base < hi) hi = g_map[i].base;
             }
             base=lo; size=hi-lo; state=0; perm=0; }
-        else if (module_of(a)) {
-            // Loaded module: report the regions in Horizon's layout -- code [0, ro) Code+RX, read-only [ro, data) Code+R, data and bss [data, patch area) CodeData+RW.
-            // The SDK's C++ exception unwinding (nn::ro::detail::GetExceptionInfo) walks back from the PC over "Code+RX" regions to find the module start, forward over Code then CodeData to find its end, then reads MOD0 at the module start for .eh_frame_hdr.
-            // Previously "the 4 KiB page around it, Code+RX" was reported: the backward walk ran on into other memory, found no MOD0 and aborted (Engage's IL2CPP throws a C++ exception for every managed exception).
-            // The rewriter's patch area is reported as CodeData+RX: modules sit back to back in the host, and an executable patch area reported as Code+RX would merge the previous module into the backward walk
-            // Modules with the patch area before the base (patch_off < 0): the patch area is reported alone as CodeData+RX, and data and bss run to the end of the image, or to a back patch area
-            // (patch_nso.py TWO), which is reported as CodeData+RX like a patch area after the image
-            module_t *mm = module_of(a); uint64_t off = (uint64_t)(a - mm->base), mb = (uint64_t)mm->base;
+        else {
+            module_t *mm = module_of(a);
+            if (mm) {
+                // Loaded module: report the regions in Horizon's layout -- code [0, ro) Code+RX, read-only [ro, data) Code+R, data and bss [data, patch area) CodeData+RW.
+                // The SDK's C++ exception unwinding (nn::ro::detail::GetExceptionInfo) walks back from the PC over "Code+RX" regions to find the module start, forward over Code then CodeData to find its end, then reads MOD0 at the module start for .eh_frame_hdr.
+                // Previously "the 4 KiB page around it, Code+RX" was reported: the backward walk ran on into other memory, found no MOD0 and aborted (Engage's IL2CPP throws a C++ exception for every managed exception).
+                // The rewriter's patch area is reported as CodeData+RX: modules sit back to back in the host, and an executable patch area reported as Code+RX would merge the previous module into the backward walk
+                // Modules with the patch area before the base (patch_off < 0): the patch area is reported alone as CodeData+RX, and data and bss run to the end of the image, or to a back patch area
+                // (patch_nso.py TWO), which is reported as CodeData+RX like a patch area after the image
+                uint64_t off = (uint64_t)(a - mm->base), mb = (uint64_t)mm->base;
             uint64_t ro = mm->ro_off ? mm->ro_off : mm->text_end, da = mm->data_off ? mm->data_off : ro, pa = mm->patch_off > 0 ? (uint64_t)mm->patch_off : mm->back_len ? mm->back_off : mm->size;
             if (a < mm->base)  { base = mb + mm->patch_off; size = mm->patch_len; state = 4/*CodeData*/; perm = 5; }
             else if (off < ro) { base = mb;      size = ro;            state = 3/*Code*/;     perm = 5; }
@@ -730,15 +732,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 module_data_query(mm, off, &lo, &hi, &perm);
                 base = mb + lo; size = hi - lo;
             }
-        }
-        else {
+            } else {
             // The address lies in "the current host thread's stack": report the whole stack (state 0xB = stack). When the SDK initializes the main thread record it queries here with the sp at that moment and takes the reported range as the main thread stack;
             // later nn::os::GetCurrentStackInfo asserts that sp is still inside that range and aborts if not. Previously every address outside the guest address space was reported as "the 4 KiB page containing it",
             // so the main thread stack was recorded as one page. Whether the sp at init and a later sp share a page depends on the absolute position of the host stack top, which moves with the total length of environment variables / launch arguments (a different environment occasionally aborts at startup).
             uint64_t top, ssz; plat_thread_stack(&top, &ssz);
             if (addr < top && addr >= top - ssz) { base = top - ssz; size = ssz; state = 0xB/*Stack*/; perm = 3; }
             // Other host memory: report "free, no permissions" (the 4 KiB page around it) as Horizon does for unmapped addresses. It used to report Code+RX, and GetExceptionInfo walking back from main merged on through host memory down to 0
-            else { base=addr & ~0xFFFull; size=0x1000; state=0/*Free*/; perm=0; } }
+            else { base=addr & ~0xFFFull; size=0x1000; state=0/*Free*/; perm=0; } } }
         map_source_query(addr, &base, &size, &attr, &perm);
         uint32_t seq_snap = atomic_load_explicit(&g_map_seq, memory_order_acquire);
         uintptr_t as_u = (uintptr_t)g_as;

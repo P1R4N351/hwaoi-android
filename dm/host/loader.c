@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <limits.h>
 #include "hle.h"
+#include "gate_fast.h"
+static gate_fast_mod_idx g_mod_fast;
 
 module_t *g_mod;
 int g_nmod;
@@ -89,12 +91,24 @@ void *guest_sym(const char *name) {
 }
 // For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test)
 module_t *module_of(const void *p) {
+    if (!p) return NULL;
+    int fast = gate_fast_active();
+    if (fast) {
+        void *hit = NULL;
+        if (gate_fast_mod_try(&g_mod_fast, p, &hit)) return (module_t *)hit;
+    }
+    module_t *res = NULL;
     for (int i = 0; i < g_nmod; i++) {
         const uint8_t *b = g_mod[i].base;
-        if ((const uint8_t *)p >= b && (const uint8_t *)p < b + g_mod[i].size) return &g_mod[i];
-        if (g_mod[i].patch_off < 0 && (const uint8_t *)p >= b + g_mod[i].patch_off && (const uint8_t *)p < b + g_mod[i].patch_off + g_mod[i].patch_len) return &g_mod[i];
+        if ((const uint8_t *)p >= b && (const uint8_t *)p < b + g_mod[i].size) { res = &g_mod[i]; break; }
+        if (g_mod[i].patch_off < 0 && (const uint8_t *)p >= b + g_mod[i].patch_off && (const uint8_t *)p < b + g_mod[i].patch_off + g_mod[i].patch_len) { res = &g_mod[i]; break; }
     }
-    return NULL;
+    if (res && fast) {
+        uintptr_t b = (uintptr_t)res->base, pb = 0, pe = 0;
+        if (res->patch_off < 0) { pb = b + (uintptr_t)res->patch_off; pe = pb + res->patch_len; }
+        gate_fast_mod_write(&g_mod_fast, p, res, b, b + res->size, pb, pe);
+    }
+    return res;
 }
 
 // Whether main or an NRO imports a symbol whose name starts with prefix (an undefined dynamic symbol: one the module calls but another module defines), for behaviour that
@@ -1019,6 +1033,13 @@ void load_modules(const char *dir, const char **names, int n) {
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
     preload_nros(dir, nros);   // mapped now, relocated when the game loads them (hle_ro.c)
+    { uintptr_t lo = UINTPTR_MAX, hi = 0; for (int i = 0; i < g_nmod; i++) {
+        uintptr_t b = (uintptr_t)g_mod[i].base, e = b + g_mod[i].size;
+        uintptr_t ml = (g_mod[i].patch_off < 0 && g_mod[i].patch_len) ? b + (uintptr_t)g_mod[i].patch_off : b;
+        if (ml < lo) lo = ml;
+        if (e > hi) hi = e;
+    }
+    gate_fast_mod_publish_span(&g_mod_fast, lo, hi); }
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK: %lu symbol lookups at load time, hash and linear disagree %lu", g_symchk_n, g_symchk_bad);
     if (g_flag.bootprof) LOG("① breakdown: mapping (read + copy + seal pages) %.1f ms, dynamic section parsing %.1f ms, gate registration %.1f ms, relocation + forced takeover %.1f ms, total %.1f ms",

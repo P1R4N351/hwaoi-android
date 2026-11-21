@@ -3,6 +3,9 @@
 #include <pthread.h>
 #include "hle.h"
 #include <stdatomic.h>
+#include "gate_fast.h"
+static gate_fast_om_cache g_om_fast;
+static gate_fast_ounce_slot g_ounce_fast;
 
 // ---------- Side table ----------
 // Guest object -> host state, linear probing with backward-shift deletion: no deleted markers, so every key sits once in the run of
@@ -19,8 +22,17 @@ static unsigned om_find(const void *k) {
     return i;
 }
 void *objmap_get(const void *k) {
+    int fast = gate_fast_active();
+    if (fast && k) {
+        void *cached = NULL;
+        if (gate_fast_om_get(&g_om_fast, k, &cached)) return cached;
+    }
     pthread_mutex_lock(&g_om_lock);
     void *r = g_om[om_find(k)].v;   // an empty slot holds NULL
+    if (fast && k && r) {
+        uint64_t g = atomic_load_explicit(&g_om_fast.gen, memory_order_relaxed);
+        gate_fast_om_put(&g_om_fast, k, r, g);
+    }
     pthread_mutex_unlock(&g_om_lock);
     return r;
 }
@@ -28,6 +40,10 @@ void objmap_put(const void *k, void *v) {
     pthread_mutex_lock(&g_om_lock);
     unsigned i = om_find(k);
     g_om[i].k = k; g_om[i].v = v;
+    if (gate_fast_active() && k) {
+        uint64_t g = gate_fast_om_invalidate(&g_om_fast, k);
+        if (v) gate_fast_om_put(&g_om_fast, k, v, g);
+    }
     pthread_mutex_unlock(&g_om_lock);
 }
 void *objmap_del(const void *k) {
@@ -40,13 +56,21 @@ void *objmap_del(const void *k) {
             if (((j - om_h(g_om[j].k)) & OM_MASK) >= ((j - i) & OM_MASK)) { g_om[i] = g_om[j]; i = j; }
         g_om[i].k = NULL; g_om[i].v = NULL;
     }
+    if (gate_fast_active() && k) (void)gate_fast_om_invalidate(&g_om_fast, k);
     pthread_mutex_unlock(&g_om_lock);
     return r;
 }
 uint64_t now_ns(void) {
-    static plat_timebase_t tb;
-    if (!tb.denom) plat_timebase(&tb);
-    return plat_abs_time() * tb.numer / tb.denom;
+    static _Atomic uint64_t tb_pack;
+    uint64_t pk = atomic_load_explicit(&tb_pack, memory_order_relaxed);
+    if (!pk) {
+        plat_timebase_t tb; plat_timebase(&tb);
+        pk = ((uint64_t)tb.numer << 32) | tb.denom;
+        atomic_store_explicit(&tb_pack, pk, memory_order_relaxed);
+    }
+    uint32_t numer = (uint32_t)(pk >> 32), denom = (uint32_t)pk;
+    if (gate_fast_active() && numer == denom) return plat_abs_time();
+    return plat_abs_time() * numer / denom;
 }
 // Guest clock: the system counters the guest can read (mrs cntpct gate, svc GetSystemTick) all go through here. Default = now_ns().
 // Freeze (only for the test driver DM_TICK_HOLD): while frozen the guest clock does not advance ⇒ the game's next tick never comes due; after unfreezing the frozen duration is subtracted, the guest clock is continuous with no jump
@@ -64,7 +88,17 @@ uint64_t guest_ns(void) { return atomic_load(&g_gdet_on) ? atomic_load(&g_gdet) 
 // The system counter on that clock: 19.2 MHz on the Switch, 31.25 MHz (32 ns a tick) on the Switch 2, whose SDK reads cntpct_el0 and converts with that rate
 // (nn::os::GetSystemTickFrequency answers 0x1dcd650, sdk 20.5.19 Ounce). Read at 19.2 MHz, every tick span a Switch 2 game measured came out 1.63 times too short, and the
 // same clock's GPU timestamps 1.63 times too late: Donkey Kong Bananza's frame-rate controller took its frame for seconds long and held it at 20 fps (present interval 3)
-uint64_t guest_ticks(void) { return dm_sdk_ounce() ? guest_ns() / 32 : guest_ns() * 12 / 625; }
+uint64_t guest_ticks(void) {
+    int oz = 0;
+    if (gate_fast_active()) {
+        int cur = g_nmod;
+        if (!gate_fast_ounce_read(&g_ounce_fast, cur, &oz)) {
+            oz = dm_sdk_ounce();
+            gate_fast_ounce_write(&g_ounce_fast, cur, oz);
+        }
+    } else { oz = dm_sdk_ounce(); }
+    return oz ? guest_ns() / 32 : guest_ns() * 12 / 625;
+}
 int dm_detclock_enabled(void) { return detclock_cfg() && atomic_load(&g_gdet_on); }
 void dm_guest_frame_tick(void) {
     crash_watch_frame();

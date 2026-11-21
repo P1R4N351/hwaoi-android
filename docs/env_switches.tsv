@@ -94,6 +94,7 @@ DM_GAMES_DIR	path	Profile folders outside the repository, separated by `:`, sear
 DM_GAMES_FIRST	switch	`=1` searches `DM_GAMES_DIR` before `dm/games`, so a provisional or derived profile wins over the game's own (the NSP script's `--provisional`)
 DM_GAME_ARGS_ADD	switch	Words, separated by spaces, that the game gets as arguments after the command line's or the profile's `game_args` (`main.c`, `game_args.h`; logged as `game arguments added:`); the Android launcher sets it to the chosen `scene_arg` row's arguments (Game settings › 3D scene), a line of the player's wins
 DM_GAME_ENV	switch	`KEY=VALUE` pairs, separated by spaces, that the game's own `getenv` returns, in place of the profile's `game_env` (`hle_os.c`); any other name goes to the SDK's empty environment
+DM_GATE_FAST	switch	`0` disables lock-free object side-table cache, Ounce tick cache and `module_of` span/seqlock memo (default `1`)
 DM_GFX_FIXTURE_OUT	test	`=<dir>`: graphics tests write their raw result textures and buffers there
 DM_GFX_QUALITY	player	For a game with a profile `render_cfg` row: `quality` or `performance` (the default), the graphics quality: the performance mode and smallest largest-buffer level of the profile's `render_quality` row (Fire Emblem Fortune's Weave: quality = Boost, its docked shadows and detail; performance = Normal, its handheld ones; `hle_render.c`)
 DM_GLSLC_CAPTURE	path	`=<dir>` saves every GLSLC output the game compiles at run time; `shader_split.py` reads it (default `<version dir>/glslc_capture`)
