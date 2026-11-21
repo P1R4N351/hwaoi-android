@@ -8,6 +8,7 @@
 // nxhost_framegen_set (the launcher's in-game settings)
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_fg_fast.h"
 #include "vk_android.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,8 @@
 #include "lsfg/lsfg.h"
 #endif
 
-static _Atomic int g_on = -1, g_mult = 2, g_target, g_flow = 75, g_state;   // g_state: 0 off, 1 generating, 2 on and not generating, -1 unavailable
+static _Atomic int g_on = -1, g_mult = 2, g_target, g_flow = 75, g_state;
+static _Atomic uint32_t g_fg_set_gen;   // g_state: 0 off, 1 generating, 2 on and not generating, -1 unavailable
 static char g_reason[256] = "off";
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 static void reason(const char *fmt, const char *a) { pthread_mutex_lock(&g_rmu); snprintf(g_reason, sizeof g_reason, fmt, a); pthread_mutex_unlock(&g_rmu); }
@@ -39,6 +41,7 @@ void nxhost_framegen_set(int on, int multiplier, int target_rate, int flow_pct) 
     atomic_store(&g_target, target_rate < 0 ? 0 : target_rate);
     atomic_store(&g_flow, flow_pct <= 0 ? 0 : flow_pct < 25 ? 25 : flow_pct > 100 ? 100 : flow_pct);
     atomic_store(&g_on, on ? 1 : 0);
+    atomic_fetch_add_explicit(&g_fg_set_gen, 1u, memory_order_release);
     VLOG("frame generation: %s, x%d, target %d fps, flow %d%%", on ? "on" : "off", atomic_load(&g_mult), atomic_load(&g_target), atomic_load(&g_flow));
 }
 
@@ -68,6 +71,28 @@ static struct {
     double out_period, longer_since;   // the output period the window's frame rate is set for, and since when a longer one is wanted
 } F;
 
+static vka_fmt_feat_cache g_fg_fmt_cache;
+static vka_fg_off_tracker g_fg_off_trk;
+static vka_fg_env_cache g_fg_env_cfg;
+static void fg_env_sync(void) {
+    uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+    if (g_fg_env_cfg.inited && g_fg_env_cfg.gen == g) return;
+    g_fg_env_cfg.gen = g;
+    g_fg_env_cfg.inited = 1;
+    g_fg_env_cfg.min_fps = VKA_ENV("DM_LSFG_MIN_FPS", 30);
+    g_fg_env_cfg.refresh_cap = VKA_ENV("DM_VK_FG_REFRESH_CAP", 1);
+    g_fg_env_cfg.dump_n = VKA_ENV("DM_LSFG_DUMP", 0);
+    g_fg_env_cfg.own_fmt = VKA_ENV("DM_VK_FG_OWNFMT", 1);
+}
+static VkFormatFeatureFlags fg_fmt_features(VkFormat fmt) {
+    uint32_t cached = 0;
+    if (vka_fg_fast_on() && vka_fmt_feat_get(&g_fg_fmt_cache, (uintptr_t)V.pd, (uint32_t)fmt, &cached))
+        return (VkFormatFeatureFlags)cached;
+    VkFormatProperties fp = {0};
+    vk.vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
+    if (vka_fg_fast_on()) vka_fmt_feat_put(&g_fg_fmt_cache, (uintptr_t)V.pd, (uint32_t)fmt, (uint32_t)fp.optimalTilingFeatures);
+    return fp.optimalTilingFeatures;
+}
 static double mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void unavailable(const char *why, const char *a) { F.state = -1; reason(why, a); atomic_store(&g_state, -1); VRED("frame generation unavailable: %s", g_reason); }
 
@@ -151,7 +176,8 @@ static VkFormat raw_unorm_twin(VkFormat f) {   // as vka_present.c's
 // DM_VK_FG_OWNFMT=0 (live) blits in the image's format as before (A/B)
 static VkFormat own_fmt(const vka_img *im, int format) {
     VkFormat own = raw_unorm_twin(im->f.vk); vka_fmt wf;
-    if (!format || !VKA_ENV("DM_VK_FG_OWNFMT", 1) || !vka_fmt_of(format, &wf)) return VK_FORMAT_UNDEFINED;
+    int own_on = vka_fg_fast_on() ? (fg_env_sync(), g_fg_env_cfg.own_fmt) : VKA_ENV("DM_VK_FG_OWNFMT", 1);
+    if (!format || !own_on || !vka_fmt_of(format, &wf)) return VK_FORMAT_UNDEFINED;
     VkFormat w = raw_unorm_twin(wf.vk);
     if (w == own || !(vkfl_has(&im->fl, im->f.vk, w) || vkfl_has(&im->fl, im->f.vk, wf.vk))) return VK_FORMAT_UNDEFINED;
     return w;
@@ -234,77 +260,47 @@ static void fg_dump(unsigned k, uint64_t count, size_t ng) {
     if (mem) vk.vkFreeMemory(V.dev, mem, NULL);
 }
 
-int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence, int format, vka_img **gen, double *hold, double *out_period) {
-    settings_init();
-    *hold = 0; *out_period = 0;
-    int on = atomic_load(&g_on) > 0, mult = atomic_load(&g_mult), target = atomic_load(&g_target), flow = atomic_load(&g_flow);
-    if (!on) {
-        if (F.chain) { teardown(); VLOG("frame generation off"); }
-        if (F.state >= 0) { atomic_store(&g_state, 0); reason("%s", "off"); }
-        vka_fps_fg(F.state < 0 ? -1 : 0, 1);
-        return 0;
-    }
-    if (!load()) { vka_fps_fg(-1, 1); return 0; }
-    // The game's frame period is never shorter than the host's frame limit allows (hle_fpslock.c): a game that asks for interval 1 (16.7 ms) but is held to 30 fps has two
-    // refreshes of a 60 Hz panel a frame, room for one generated frame, and its output rate is 60, not 120. Donkey Kong Bananza's presents ride the host's tick
-    // (DM_PRESENT_INTERVAL=display, 8.3 ms at 120 Hz) whatever its limit
-    int nxhost_fps_limit_get(void) __attribute__((weak)), nxhost_fps_decoupled(void) __attribute__((weak));
-    { int lim = &nxhost_fps_limit_get ? nxhost_fps_limit_get() : 0; if (lim > 0 && period < 1.0 / lim) period = 1.0 / lim; }
-    // The window's frame rate: a shorter output period at once, a longer one only after it held for 2 s. DKB switches its own present interval between 1 and 2 (60 and
-    // 30 fps) many times a minute, and each switch would change the panel's mode (120 <-> 60 Hz); the generated frames are paced by hold, not by the panel's rate
-    double want = target > 0 ? 1.0 / target : period / (mult < 2 ? 2 : mult > 4 ? 4 : mult), tnow = mono_s();
+static int fg_handle_off(void) {
+    uint32_t sgen = atomic_load_explicit(&g_fg_set_gen, memory_order_acquire);
+    if (vka_fg_fast_on() && vka_fg_off_is_settled(&g_fg_off_trk, sgen, F.chain != NULL, F.state)) return 0;
+    if (F.chain) { teardown(); VLOG("frame generation off"); }
+    if (F.state >= 0) { atomic_store(&g_state, 0); reason("%s", "off"); }
+    vka_fps_fg(F.state < 0 ? -1 : 0, 1);
+    if (vka_fg_fast_on()) vka_fg_off_mark_settled(&g_fg_off_trk, sgen, F.state);
+    return 0;
+}
+static double fg_calc_out_period(double period, int mult, int target, double tnow) {
+    double want = target > 0 ? 1.0 / target : period / (mult < 2 ? 2 : mult > 4 ? 4 : mult);
     if (F.out_period <= 0 || want < F.out_period - 1e-4) { F.out_period = want; F.longer_since = 0; }
-    else if (want > F.out_period + 1e-4) { if (!F.longer_since) F.longer_since = tnow; else if (tnow - F.longer_since >= 2.0) { F.out_period = want; F.longer_since = 0; } }
-    else F.longer_since = 0;
-    *out_period = F.out_period;
-    vka_img *im = vka_tex_acquire(serial);
-    if (!im) return 0;
-    int cx = 0, cy = 0, cw = (int)im->w, ch = (int)im->h;
-    if (crop && crop[2] > 0 && crop[3] > 0) { cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3]; }
-    VkFormatProperties fp = {0}; vk.vkGetPhysicalDeviceFormatProperties(V.pd, im->f.vk, &fp);
-    if (!im->inited || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || im->f.kind || im->samples != 1 || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || cw <= 0 || ch <= 0) {
+    else if (want > F.out_period + 1e-4) {
+        if (!F.longer_since) F.longer_since = tnow;
+        else if (tnow - F.longer_since >= 2.0) { F.out_period = want; F.longer_since = 0; }
+    } else F.longer_since = 0;
+    return F.out_period;
+}
+static vka_img *fg_acquire_valid_input(uint64_t serial, const int *crop, int format, int flow, int *cx, int *cy, int *cw, int *ch, VkFormat *wv) {
+    vka_img *im = vka_tex_acquire(serial); if (!im) return NULL;
+    *cx = 0; *cy = 0; *cw = (int)im->w; *ch = (int)im->h;
+    if (crop && crop[2] > 0 && crop[3] > 0) { *cx = crop[0]; *cy = crop[1]; *cw = crop[2]; *ch = crop[3]; }
+    VkFormatFeatureFlags feats = fg_fmt_features(im->f.vk);
+    if (!im->inited || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || im->f.kind || im->samples != 1 || !(feats & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || *cw <= 0 || *ch <= 0) {
         VRED_ONCE("frame generation: window texture serial %llu (format %#x) cannot be copied into the chain: not generating", (unsigned long long)im->serial, im->d.format);
-        vka_tex_drop(im); F.warm_streak = 0; atomic_store(&g_state, 2); vka_fps_fg(2, 1); return 0;
+        vka_tex_drop(im); F.warm_streak = 0; atomic_store(&g_state, 2); vka_fps_fg(2, 1); return NULL;
     }
-    // A window texture over an image of another format: copied bit for bit (both 32-bit formats, one sample) into the RGBA8 input (lsfg_chain.c LSFG_FORMAT), so the chain reads it in its own format.
-    // Any other format has no such copy into the input: no frame generated
-    VkFormat wv = own_fmt(im, format);
-    if (wv && (wv != VK_FORMAT_R8G8B8A8_UNORM || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) || !(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))) {
+    *wv = own_fmt(im, format);
+    if (*wv && (*wv != VK_FORMAT_R8G8B8A8_UNORM || !(feats & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) || !(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))) {
         VRED_ONCE("frame generation: window texture serial %llu (NVN format %#x, VkFormat %d) shares an image of VkFormat %d (owner serial %llu) and cannot be copied into the chain in its own format: not generating",
-                  (unsigned long long)serial, format, wv, im->f.vk, (unsigned long long)im->serial);
-        vka_tex_drop(im); F.warm_streak = 0; atomic_store(&g_state, 2); vka_fps_fg(2, 1); return 0;
+                  (unsigned long long)serial, format, *wv, im->f.vk, (unsigned long long)im->serial);
+        vka_tex_drop(im); F.warm_streak = 0; atomic_store(&g_state, 2); vka_fps_fg(2, 1); return NULL;
     }
-    if (wv) { static int told; if (!told++) VLOG("frame generation: window texture serial %llu (NVN format %#x, VkFormat %d) shares an image of VkFormat %d (owner serial %llu): copied in its own format",
-                                                (unsigned long long)serial, format, wv, im->f.vk, (unsigned long long)im->serial); }
-    VkExtent2D e = {(uint32_t)cw, (uint32_t)ch};
+    if (*wv) { static int told; if (!told++) VLOG("frame generation: window texture serial %llu (NVN format %#x, VkFormat %d) shares an image of VkFormat %d (owner serial %llu): copied in its own format", (unsigned long long)serial, format, *wv, im->f.vk, (unsigned long long)im->serial); }
+    VkExtent2D e = {(uint32_t)*cw, (uint32_t)*ch};
     if (!F.chain || F.ext.width != e.width || F.ext.height != e.height || F.flow != flow) {
-        if (!rebuild(e, flow)) { vka_tex_drop(im); unavailable("%s", "the frame generation chain could not be made (see the [RED] lines)"); vka_fps_fg(-1, 1); return 0; }
+        if (!rebuild(e, flow)) { vka_tex_drop(im); unavailable("%s", "the frame generation chain could not be made (see the [RED] lines)"); vka_fps_fg(-1, 1); return NULL; }
     }
-    F.pacer.decoupled = &nxhost_fps_decoupled && nxhost_fps_decoupled();   // the game's speed follows its measured rate (hle_fpslock.c sead_rate), not only held by the limiter
-    F.pacer.min_base = (float)VKA_ENV("DM_LSFG_MIN_FPS", 30);   // its floor (live)
-    lsfg_plan plan = lsfg_pacer_plan(&F.pacer, LSFG_MAX_GENERATIONS, mult, target, mono_s());
-    uint64_t count = F.count++;
-    int warm = plan.warm && count + 1 >= 2;
-    F.warm_streak = warm ? F.warm_streak + 1 : 0;
-    size_t ng = warm && F.warm_streak >= 2 ? plan.generations : 0;
-    if (ng > LSFG_MAX_GENERATIONS) ng = LSFG_MAX_GENERATIONS;
-    // The panel shows one image a refresh (FIFO): more images per game frame than refreshes in the game's period hold the present thread, and the game behind it, to a
-    // fraction of its rate. The window asks for the output rate (out_period above), but the system may keep the panel lower: on the Honor phone (LTPO) it sometimes stayed at
-    // 60 Hz with the request for 120, and x2 held Donkey Kong Bananza's 60 fps menus at 30 fps (its level was reached 18 s later, int-792f6e4d t1). Generated frames only
-    // as many as the refreshes in the game's own period leave room for (its requested period, not the measured interval, which a throttled game would lengthen)
-    // DM_VK_FG_REFRESH_CAP=0: no cap (a driver whose display timing reports a refresh the panel does not run at)
-    uint64_t rns = VKA_ENV("DM_VK_FG_REFRESH_CAP", 1) ? vka_refresh_ns() : 0; int capped = 0;
-    if (ng && rns && period > 0) {
-        // The game's frame period: the present's (at least the frame limit's, above), or the measured one when longer. With DM_PRESENT_INTERVAL=display (Donkey Kong
-        // Bananza's uncapped mode) every present declares the host's tick (8.3 ms at 120 Hz) whatever the game's own rate, which left no refresh for a generated frame and
-        // generation never started; held at 60 on a 120 Hz panel its measured interval came out at 15.3-15.5 ms (1.85 refreshes, under the 1.9 below), where the limit's
-        // 16.7 ms leaves room for the one generated frame that fits
-        double gp = F.pacer.smoothed_interval > period ? F.pacer.smoothed_interval : period;
-        double n = gp * 1e9 / (double)rns;   // refreshes in a game frame (60 fps on 120.46 Hz: 2.01; on 60.00 Hz: 1.00)
-        size_t fit = n < 1.9 ? 0 : (size_t)(n + 0.1) - 1;
-        if (ng > fit) { ng = fit; capped = 1; F.pacer.issued = ng; }   // the pacer counts what was generated (its unloaded rate is measured on frames without)
-    }
-
+    return im;
+}
+static void fg_submit_chain_work(vka_img *im, const int r[4], VkFormat wv, uint64_t count, int warm, size_t *ng, uint64_t fence) {
     unsigned k = F.fi++ % NFG;
     if (!F.fr[k].cb) {
         if (!F.pool) { VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qf}; vk.vkCreateCommandPool(V.dev, &pi, NULL, &F.pool); }
@@ -317,36 +313,28 @@ int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence
     vk.vkResetFences(V.dev, 1, &F.fr[k].fence);
     VkCommandBuffer cb = F.fr[k].cb; vk.vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    vk.vkBeginCommandBuffer(cb, &bi);
-    vka_barrier(cb);   // the replay's writes to the window texture, and the presents still reading the outputs (earlier submissions)
-    if (wv) {   // the same rectangle as the blit (1:1, no flip), without the read in the image's format
-        VkImageCopy c = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {cx, cy, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)cw, (uint32_t)ch, 1}};
+    vk.vkBeginCommandBuffer(cb, &bi); vka_barrier(cb);
+    if (wv) {
+        VkImageCopy c = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {r[0], r[1], 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)r[2], (uint32_t)r[3], 1}};
         vk.vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, lsfg_chain_input(F.chain, count), VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     } else {
-        VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {cw, ch, 1}}};
+        VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{r[0], r[1], 0}, {r[0] + r[2], r[1] + r[3], 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {r[2], r[3], 1}}};
         vk.vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, lsfg_chain_input(F.chain, count), VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
     }
     if (warm) lsfg_chain_shared(F.chain, cb, count);
-    for (size_t g = 0; g < ng; g++) lsfg_chain_generate(F.chain, cb, count, ng, g);
-    vka_barrier(cb);   // the outputs for the presents after this
-    vk.vkEndCommandBuffer(cb);
+    for (size_t g = 0; g < *ng; g++) lsfg_chain_generate(F.chain, cb, count, *ng, g);
+    vka_barrier(cb); vk.vkEndCommandBuffer(cb);
     VkPipelineStageFlags st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &fence};
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = fence ? 1 : 0, .pWaitSemaphores = &V.tl, .pWaitDstStageMask = &st,
-                       .commandBufferCount = 1, .pCommandBuffers = &cb};
-    pthread_mutex_lock(&V.qmu); VkResult r = vk.vkQueueSubmit(V.q, 1, &si, F.fr[k].fence); pthread_mutex_unlock(&V.qmu);
-    F.fr[k].held = im;   // the window texture stays alive until this submission is done
-    if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("frame generation submission %d", r); ng = 0; }
-    { static int last, left; int d = VKA_ENV("DM_LSFG_DUMP", 0);   // (see fg_dump)
-      if (d != last) { last = d; left = d > 0 ? d : 0; }
-      if (left > 0 && ng) { left--; fg_dump(k, count, ng); } }
-    for (size_t g = 0; g < ng; g++) gen[g] = F.out[g];
-    double interval = F.pacer.smoothed_interval > 0 ? F.pacer.smoothed_interval : period;
-    if (interval < period) interval = period;
-    if (ng) *hold = interval / (double)(ng + 1);
-    // A hold within 0.15 refresh of a whole number of refreshes is that number: the measured interval runs a little long (34 ms at a 30 fps frame step), and a hold of 17 ms on a
-    // 16.7 ms panel let each image's desired time (vka_present.c, the previous one's plus the hold) drift across a refresh every few dozen frames, two images in one refresh
-    if (ng && rns) { double r = *hold * 1e9 / (double)rns, w = floor(r + 0.5); if (w >= 1 && fabs(r - w) <= 0.15) *hold = w * (double)rns / 1e9; }
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = fence ? 1 : 0, .pWaitSemaphores = &V.tl, .pWaitDstStageMask = &st, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    pthread_mutex_lock(&V.qmu); VkResult res = vk.vkQueueSubmit(V.q, 1, &si, F.fr[k].fence); pthread_mutex_unlock(&V.qmu);
+    F.fr[k].held = im;
+    if (res) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("frame generation submission %d", res); *ng = 0; }
+    int d = vka_fg_fast_on() ? (fg_env_sync(), g_fg_env_cfg.dump_n) : VKA_ENV("DM_LSFG_DUMP", 0);
+    { static int last, left; if (d != last) { last = d; left = d > 0 ? d : 0; }
+      if (left > 0 && *ng) { left--; fg_dump(k, count, *ng); } }
+}
+static void fg_publish_status(double period, uint64_t rns, size_t ng, int capped, double interval) {
     int st2 = ng ? 1 : 2;
     static int was_capped;
     if (atomic_exchange(&g_state, st2) != st2 || (st2 == 2 && capped != was_capped)) {
@@ -357,6 +345,41 @@ int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence
     }
     was_capped = st2 == 2 && capped;
     vka_fps_fg(st2, (int)ng + 1);
+}
+int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence, int format, vka_img **gen, double *hold, double *out_period) {
+    settings_init(); *hold = 0; *out_period = 0;
+    int on = atomic_load(&g_on) > 0, mult = atomic_load(&g_mult), target = atomic_load(&g_target), flow = atomic_load(&g_flow);
+    if (!on) return fg_handle_off();
+    vka_fg_off_mark_active(&g_fg_off_trk);
+    if (!load()) { vka_fps_fg(-1, 1); return 0; }
+    int nxhost_fps_limit_get(void) __attribute__((weak)), nxhost_fps_decoupled(void) __attribute__((weak));
+    { int lim = &nxhost_fps_limit_get ? nxhost_fps_limit_get() : 0; if (lim > 0 && period < 1.0 / lim) period = 1.0 / lim; }
+    double tnow = mono_s();
+    *out_period = fg_calc_out_period(period, mult, target, tnow);
+    int r[4] = {0}; VkFormat wv = VK_FORMAT_UNDEFINED;
+    vka_img *im = fg_acquire_valid_input(serial, crop, format, flow, &r[0], &r[1], &r[2], &r[3], &wv);
+    if (!im) return 0;
+    if (vka_fg_fast_on()) fg_env_sync();
+    F.pacer.decoupled = &nxhost_fps_decoupled && nxhost_fps_decoupled();
+    F.pacer.min_base = (float)(vka_fg_fast_on() ? g_fg_env_cfg.min_fps : VKA_ENV("DM_LSFG_MIN_FPS", 30));
+    lsfg_plan plan = lsfg_pacer_plan(&F.pacer, LSFG_MAX_GENERATIONS, mult, target, tnow);
+    uint64_t count = F.count++; int warm = plan.warm && count + 1 >= 2;
+    F.warm_streak = warm ? F.warm_streak + 1 : 0;
+    size_t ng = warm && F.warm_streak >= 2 ? plan.generations : 0;
+    if (ng > LSFG_MAX_GENERATIONS) ng = LSFG_MAX_GENERATIONS;
+    uint64_t rns = (vka_fg_fast_on() ? g_fg_env_cfg.refresh_cap : VKA_ENV("DM_VK_FG_REFRESH_CAP", 1)) ? vka_refresh_ns() : 0;
+    int capped = 0;
+    if (ng && rns && period > 0) {
+        double gp = F.pacer.smoothed_interval > period ? F.pacer.smoothed_interval : period;
+        double n = gp * 1e9 / (double)rns; size_t fit = n < 1.9 ? 0 : (size_t)(n + 0.1) - 1;
+        if (ng > fit) { ng = fit; capped = 1; F.pacer.issued = ng; }
+    }
+    fg_submit_chain_work(im, r, wv, count, warm, &ng, fence);
+    for (size_t g = 0; g < ng; g++) gen[g] = F.out[g];
+    double interval = F.pacer.smoothed_interval > period ? F.pacer.smoothed_interval : period;
+    if (ng) *hold = interval / (double)(ng + 1);
+    if (ng && rns) { double rr = *hold * 1e9 / (double)rns, w = floor(rr + 0.5); if (w >= 1 && fabs(rr - w) <= 0.15) *hold = w * (double)rns / 1e9; }
+    fg_publish_status(period, rns, ng, capped, interval);
     return (int)ng;
 }
 #endif

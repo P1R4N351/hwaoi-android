@@ -7,6 +7,7 @@
 // replay's command buffer where the game's DLSS evaluation is. Every image stays in GENERAL. DM_VK_DLSS=4 picks it (the Upscaler row's FSR 3.1) (the caller then uses FSR 1 or the linear copy)
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_fg_fast.h"
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -75,6 +76,28 @@ static struct {
     struct timespec last;
 } F;
 
+static vka_fmt_feat_cache g_f3_fmt_cache;
+static vka_fsr3_pass_meta g_f3_meta[P_N];
+static vka_fsr3_fast_memo g_f3_memo;
+static VkFormatFeatureFlags f3_fmt_features(VkFormat fmt) {
+    uint32_t cached = 0;
+    if (vka_fg_fast_on() && vka_fmt_feat_get(&g_f3_fmt_cache, (uintptr_t)V.pd, (uint32_t)fmt, &cached))
+        return (VkFormatFeatureFlags)cached;
+    VkFormatProperties fp = {0};
+    vk.vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
+    if (vka_fg_fast_on()) vka_fmt_feat_put(&g_f3_fmt_cache, (uintptr_t)V.pd, (uint32_t)fmt, (uint32_t)fp.optimalTilingFeatures);
+    return fp.optimalTilingFeatures;
+}
+static void f3_memo_env_sync(void) {
+    uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+    if (g_f3_memo.env_valid && g_f3_memo.env_gen == g) return;
+    g_f3_memo.env_gen = g; g_f3_memo.env_valid = 1;
+    g_f3_memo.out_w = VKA_ENV("DM_VK_FSR3_OUT_W", 0); g_f3_memo.out_h = VKA_ENV("DM_VK_FSR3_OUT_H", 0);
+    g_f3_memo.fsr3_reset = VKA_ENV("DM_VK_FSR3_RESET", 0);
+    g_f3_memo.jx = (float)VKA_ENVF("DM_VK_FSR3_JX", 1); g_f3_memo.jy = (float)VKA_ENVF("DM_VK_FSR3_JY", 1);
+    g_f3_memo.mx = (float)VKA_ENVF("DM_VK_FSR3_MX", 1); g_f3_memo.my = (float)VKA_ENVF("DM_VK_FSR3_MY", 1);
+    g_f3_memo.sharp = (float)VKA_ENVF("DM_VK_FSR3_SHARP", 0.5);
+}
 static void tex_free(f3_tex *t) {
     for (uint32_t i = 0; i < t->levels && t->levels > 1; i++) if (t->lv[i]) vk.vkDestroyImageView(V.dev, t->lv[i], NULL);
     if (t->view) vk.vkDestroyImageView(V.dev, t->view, NULL);
@@ -195,6 +218,7 @@ static int f3_ready(void) {
     if (!r) r = vk.vkBindBufferMemory(V.dev, F.ubo, F.ubo_mem, 0);
     if (!r) r = vk.vkMapMemory(V.dev, F.ubo_mem, 0, VK_WHOLE_SIZE, 0, (void **)&F.ubo_map);
     if (r) { VRED("FSR 3.1: setup %d; the scene is scaled with FSR 1", r); f3_teardown(); return 0; }
+    for (int i = 0; i < P_N; i++) vka_fsr3_compile_kinds(&g_f3_meta[i], i == P_RCAS, g_kinds[i]);
     F.state = 1;
     VLOG("FSR 3.1 upscaler ready (DLSS replacement; pyramids %s; DM_VK_DLSS=4, DM_VK_FSR3_SHARP sharpness 0-1)", quads ? "with quad shuffles" : "wave-free");
     return 1;
@@ -225,17 +249,31 @@ static f3_res *res_make(uint32_t rw, uint32_t rh, uint32_t uw, uint32_t uh, VkFo
 }
 
 static void pass(VkCommandBuffer cb, int p, const VkImageView *views, uint32_t gx, uint32_t gy, uint32_t ubo_off) {
-    VkWriteDescriptorSet w[16]; VkDescriptorImageInfo ii[16]; VkDescriptorBufferInfo bi[4]; uint32_t n = 0, nb = 0, ni = 0;
-    for (const char *k = g_kinds[p]; *k; k++, n++) {
-        w[n] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = n, .descriptorCount = 1};
-        if (*k == 'U') {
-            // the pass's uniform blocks in order: cbFSR3Upscaler, then cbSPD (the pyramids) or cbRCAS
-            uint32_t which = nb == 0 ? 0 : (p == P_RCAS ? 2 : 1);
-            bi[nb] = (VkDescriptorBufferInfo){F.ubo, ubo_off + which * F3_SLOT, F3_SLOT};
-            w[n].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[n].pBufferInfo = &bi[nb++];
-        } else {
-            ii[ni] = (VkDescriptorImageInfo){VK_NULL_HANDLE, views[ni], VK_IMAGE_LAYOUT_GENERAL};
-            w[n].descriptorType = *k == 'T' ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[n].pImageInfo = &ii[ni++];
+    VkWriteDescriptorSet w[16]; VkDescriptorImageInfo ii[16]; VkDescriptorBufferInfo bi[4]; uint32_t n = 0;
+    if (vka_fg_fast_on()) {
+        const vka_fsr3_pass_meta *m = &g_f3_meta[p]; n = m->n_total;
+        for (uint32_t i = 0; i < m->n_ubo; i++) {
+            uint32_t s = m->ubo_slot[i];
+            bi[i] = (VkDescriptorBufferInfo){F.ubo, ubo_off + (uint32_t)m->ubo_which[i] * F3_SLOT, F3_SLOT};
+            w[s] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = s, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[i]};
+        }
+        for (uint32_t i = 0; i < m->n_img; i++) {
+            uint32_t s = m->img_slot[i], is_t = (m->img_is_tex_mask >> i) & 1u;
+            ii[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, views[i], VK_IMAGE_LAYOUT_GENERAL};
+            w[s] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = s, .descriptorCount = 1, .descriptorType = is_t ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[i]};
+        }
+    } else {
+        uint32_t nb = 0, ni = 0;
+        for (const char *k = g_kinds[p]; *k; k++, n++) {
+            w[n] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = n, .descriptorCount = 1};
+            if (*k == 'U') {
+                uint32_t which = nb == 0 ? 0 : (p == P_RCAS ? 2 : 1);
+                bi[nb] = (VkDescriptorBufferInfo){F.ubo, ubo_off + which * F3_SLOT, F3_SLOT};
+                w[n].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[n].pBufferInfo = &bi[nb++];
+            } else {
+                ii[ni] = (VkDescriptorImageInfo){VK_NULL_HANDLE, views[ni], VK_IMAGE_LAYOUT_GENERAL};
+                w[n].descriptorType = *k == 'T' ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[n].pImageInfo = &ii[ni++];
+            }
         }
     }
     vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, F.pipe[p]);
@@ -243,7 +281,7 @@ static void pass(VkCommandBuffer cb, int p, const VkImageView *views, uint32_t g
     vk.vkCmdDispatch(cb, gx, gy, 1);
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    if (vka_gp_active) vka_gp_mark(cb, "fsr3-pass", 1000 + p);   // DM_VK_GPUPROF: each pass a step (site fsr3-pass:1000 + pass)
+    if (vka_gp_active) vka_gp_mark(cb, "fsr3-pass", 1000 + p);
 }
 static uint32_t dc(uint32_t v, uint32_t t) { return (v + t - 1) / t; }
 static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
@@ -254,107 +292,48 @@ static void clear(VkCommandBuffer cb, VkImage img, float v0, float v1) {
     vk.vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &all);
 }
 
-int vka_dlss_fsr3(VkCommandBuffer cb, vka_img *src, VkFormat sfmt, vka_img *dst, int enc, vka_img *depth, vka_img *motion, const p_dlss_t2t *o) {
-    const p_copy_t2t *c = &o->c;
-    const NVNcopyRegion *s = &c->sr, *d = &c->dr;
-    if (!src || !dst || !depth || !motion || src == dst) { VRED_ONCE("FSR 3.1: the evaluation lacks %s", !depth ? "depth" : !motion ? "motion vectors" : "colour"); return 0; }
-    uint32_t rw = (uint32_t)s->width, rh = (uint32_t)s->height, uw = (uint32_t)d->width, uh = (uint32_t)d->height;
-    // The passes read the inputs from texel (0, 0) at the render size, through UVs over the render size: a larger input texture (a dynamic resolution) is not taken
-    if (s->xoffset || s->yoffset || rw != src->w || rh != src->h || depth->w != rw || depth->h != rh || motion->w != rw || motion->h != rh ||
-        src->aspect != VK_IMAGE_ASPECT_COLOR_BIT || dst->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ||
-        src->samples != 1 || dst->samples != 1 || depth->samples != 1 || src->base || dst->base || d->xoffset < 0 || d->yoffset < 0 ||
-        uw < rw || uh < rh || (uint32_t)d->xoffset + uw > dst->w || (uint32_t)d->yoffset + uh > dst->h) {
-        VRED_ONCE("FSR 3.1: unsupported evaluation (colour %ux%u+%d,%d of %ux%u, depth %ux%u, motion %ux%u, output %ux%u+%d,%d of %ux%u)", rw, rh, s->xoffset, s->yoffset,
-                  src->w, src->h, depth->w, depth->h, motion->w, motion->h, uw, uh, d->xoffset, d->yoffset, dst->w, dst->h);
-        return 0;
-    }
-    if (!f3_ready()) return 0;
-    // The output: dst itself when the whole of it is written and it can be a storage image, else an image of its format copied into the rectangle. An sRGB output (enc:
-    // stored as its UNORM twin, and a storage image cannot encode) takes FSR's linear result from an RGBA16F image through the stand-in's encoding copy (vka_dlss_scale)
-    VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, dst->f.vk, &fp);
-    if (enc ? !vka_dlss_ready() : !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { VRED_ONCE("FSR 3.1: output format %d is not a storage format (or no encoding copy for sRGB)", dst->f.vk); return 0; }
-    const VkFormat out_fmt = enc ? VK_FORMAT_R16G16B16A16_SFLOAT : dst->f.vk;
-    // DM_VK_FSR3_OUT_W / _H: FSR scales to that size, and a linear blit takes it to the game's output rectangle. With the native 4:3 pack the
-    // 1920x1080 frame is shown at 1280x960 on a 4:3 handheld's panel: 1280x960 saves 1.1 ms, but the blit and the present resize twice and the panel showed about half the
-    // sharpness (Laplacian variance 298 vs 584 on Dagsion's facade), so Fire Emblem's play setup leaves it unset (2026-11-09)
-    const uint32_t ow = uw, oh = uh;
-    {
-        int fw = VKA_ENV("DM_VK_FSR3_OUT_W", 0), fh = VKA_ENV("DM_VK_FSR3_OUT_H", 0);
-        const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        if (fw >= (int)rw && fh >= (int)rh && (uint32_t)fw <= ow && (uint32_t)fh <= oh && (enc || (fp.optimalTilingFeatures & blit) == blit)) { uw = (uint32_t)fw; uh = (uint32_t)fh; }
-    }
-    const int scaled = uw != ow || uh != oh;
-    int direct = !enc && !scaled && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !d->xoffset && !d->yoffset && uw == dst->w && uh == dst->h;
-    if (!direct && !(dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    // The colour through the texture's own view format: an sRGB input arrives linear, as on the console (its raw UNORM values read as linear were too bright)
-    VkImageView vcol = vka_view(src, sfmt ? sfmt : src->f.view ? src->f.view : src->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL);
-    VkImageView vdep = vka_view(depth, depth->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1, NULL);
-    VkImageView vmv = vka_view(motion, motion->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL);
-    VkImageView vout = direct ? vka_view(dst, dst->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL) : VK_NULL_HANDLE;
-    if (!vcol || !vdep || !vmv || (direct && !vout)) { VRED_ONCE("FSR 3.1: input views (%p %p %p %p)", (void *)vcol, (void *)vdep, (void *)vmv, (void *)vout); return 0; }
-
-    // Images by sizes; the old set goes once the GPU is past it
-    f3_res *R = F.res;
-    if (!R || R->rw != rw || R->rh != rh || R->uw != uw || R->uh != uh || (!direct && (!R->out.img || R->out_fmt != out_fmt))) {
-        f3_res *n = res_make(rw, rh, uw, uh, out_fmt, !direct);
-        if (!n) return 0;
-        if (R) vka_after(vka_fence_last(), res_free, R);
-        F.res = R = n; F.first = 1; F.parity = 0;
-    }
-    if (!direct) vout = R->out.view;
-
-    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-    float dt_ms = F.last.tv_sec ? (float)((now.tv_sec - F.last.tv_sec) * 1e3 + (now.tv_nsec - F.last.tv_nsec) / 1e6) : 1000.f / 30;
-    F.last = now;
-    const int first = F.first, reset = first || o->reset || dt_ms > 250.f || VKA_ENV("DM_VK_FSR3_RESET", 0);
-    F.first = 0;
-
-    // Constants as fsr3upscalerDispatch computes them. The jitter is the game's (input pixels), the motion vector scale the game's (DLSS's: to input pixels);
-    // DM_VK_FSR3_JX / _JY / _MX / _MY multiply them (sign checks)
-    f3_consts k = {0};
-    k.render_size[0] = (int32_t)rw; k.render_size[1] = (int32_t)rh; k.upscale_size[0] = (int32_t)uw; k.upscale_size[1] = (int32_t)uh;
+static int fsr3_fill_consts(uint32_t rw, uint32_t rh, uint32_t uw, uint32_t uh, float dt_ms, int first, int reset, const p_dlss_t2t *o, uint32_t *off_out, int *sharpen_out) {
+    f3_consts k = {0}; k.render_size[0] = (int32_t)rw; k.render_size[1] = (int32_t)rh; k.upscale_size[0] = (int32_t)uw; k.upscale_size[1] = (int32_t)uh;
     memcpy(k.previous_render_size, first ? k.render_size : F.prev_rs, 8); memcpy(k.previous_upscale_size, first ? k.upscale_size : F.prev_us, 8);
     memcpy(k.max_render_size, k.render_size, 8); memcpy(k.max_upscale_size, k.upscale_size, 8);
-    {   // reversed infinite depth with a typical camera: only FSR's disocclusion thresholds use it
+    int fast = vka_fg_fast_on();
+    if (fast) { vka_fsr3_geom_sync(&g_f3_memo, rw, rh); memcpy(k.device_to_view_depth, g_f3_memo.dev_to_view, 16); k.tan_half_fov = g_f3_memo.tan_half_fov; }
+    else {
         const float near_plane = 0.1f, fov = 60.f * 3.14159265f / 180.f, aspect = (float)rw / rh, cot = cosf(0.5f * fov) / sinf(0.5f * fov);
         k.device_to_view_depth[0] = -1.f * (0.f + FLT_EPSILON); k.device_to_view_depth[1] = near_plane;
-        k.device_to_view_depth[2] = 1.f / (cot / aspect); k.device_to_view_depth[3] = 1.f / cot;
-        k.tan_half_fov = tanf(atanf(tanf(fov * 0.5f) * aspect));
+        k.device_to_view_depth[2] = 1.f / (cot / aspect); k.device_to_view_depth[3] = 1.f / cot; k.tan_half_fov = tanf(atanf(tanf(fov * 0.5f) * aspect));
     }
-    k.jitter[0] = o->jitter[0] * VKA_ENVF("DM_VK_FSR3_JX", 1); k.jitter[1] = o->jitter[1] * VKA_ENVF("DM_VK_FSR3_JY", 1);
+    k.jitter[0] = o->jitter[0] * (fast ? g_f3_memo.jx : VKA_ENVF("DM_VK_FSR3_JX", 1));
+    k.jitter[1] = o->jitter[1] * (fast ? g_f3_memo.jy : VKA_ENVF("DM_VK_FSR3_JY", 1));
     memcpy(k.previous_jitter, first ? k.jitter : F.prev_jitter, 8);
-    k.motion_vector_scale[0] = o->mv[0] * VKA_ENVF("DM_VK_FSR3_MX", 1) / rw; k.motion_vector_scale[1] = o->mv[1] * VKA_ENVF("DM_VK_FSR3_MY", 1) / rh;
+    k.motion_vector_scale[0] = o->mv[0] * (fast ? g_f3_memo.mx : VKA_ENVF("DM_VK_FSR3_MX", 1)) / rw;
+    k.motion_vector_scale[1] = o->mv[1] * (fast ? g_f3_memo.my : VKA_ENVF("DM_VK_FSR3_MY", 1)) / rh;
     k.downscale_factor[0] = (float)rw / uw; k.downscale_factor[1] = (float)rh / uh;
     float ratio = (float)uw / rw, phases = (float)(int)(8.f * ratio * ratio);
-    if (reset || F.phase_count == 0) F.phase_count = phases;
-    else if (phases > F.phase_count) F.phase_count += 1;
-    else if (phases < F.phase_count) F.phase_count -= 1;
-    k.jitter_phase_count = F.phase_count;
-    k.delta_time = dt_ms / 1000.f > 1 ? 1 : dt_ms < 0 ? 0 : dt_ms / 1000.f;
-    k.delta_pre_exposure = 1; k.view_space_to_meters = 1;
-    F.frame_index = reset ? 0 : F.frame_index + 1; k.frame_index = F.frame_index;
+    if (reset || F.phase_count == 0) F.phase_count = phases; else if (phases > F.phase_count) F.phase_count += 1; else if (phases < F.phase_count) F.phase_count -= 1;
+    k.jitter_phase_count = F.phase_count; k.delta_time = dt_ms / 1000.f > 1 ? 1 : dt_ms < 0 ? 0 : dt_ms / 1000.f;
+    k.delta_pre_exposure = 1; k.view_space_to_meters = 1; F.frame_index = reset ? 0 : F.frame_index + 1; k.frame_index = F.frame_index;
     k.velocity_factor = 1; k.reactiveness_scale = 1; k.shading_change_scale = 1; k.accumulation_added_per_frame = 1.f / 3; k.min_disocclusion_accumulation = -1.f / 3;
     memcpy(F.prev_rs, k.render_size, 8); memcpy(F.prev_us, k.upscale_size, 8); memcpy(F.prev_jitter, k.jitter, 8);
-    static int logged;
-    if (logged < 3) { logged++; VLOG("FSR 3.1 evaluation: %ux%u -> %ux%u, jitter %.3f %.3f, motion scale %.1f %.1f, reset %u, depth format %d, motion format %d",
-                                     rw, rh, uw, uh, o->jitter[0], o->jitter[1], o->mv[0], o->mv[1], o->reset, depth->f.vk, motion->f.vk); }
-
-    uint32_t sgx = (rw - 1) / 64 + 1, sgy = (rh - 1) / 64 + 1, mx = rw > rh ? rw : rh, mips = 0;
-    while ((2u << mips) <= mx) mips++;   // floor(log2(max))
-    f3_spd spd = {mips > 12 ? 12 : mips, sgx * sgy, {0, 0}, {rw, rh}};
-    float sharp = VKA_ENVF("DM_VK_FSR3_SHARP", 0.5), stops = 2.f - 2.f * (sharp < 0 ? 0 : sharp > 1 ? 1 : sharp), sx = exp2f(-stops);
-    int sharpen = sharp > 0;
-    uint32_t rcas[4] = {fbits(sx), (uint32_t)f16(sx) | (uint32_t)f16(sx) << 16, 0, 0};
+    uint32_t sgx = fast ? g_f3_memo.sgx : ((rw - 1) / 64 + 1), sgy = fast ? g_f3_memo.sgy : ((rh - 1) / 64 + 1), mips = 0;
+    if (fast) mips = g_f3_memo.mips; else { uint32_t mx = rw > rh ? rw : rh; while ((2u << mips) <= mx) mips++; if (mips > 12) mips = 12; }
+    f3_spd spd = {mips, sgx * sgy, {0, 0}, {rw, rh}};
+    uint32_t rcas[4] = {0, 0, 0, 0};
+    if (fast) { vka_fsr3_rcas_sync(&g_f3_memo, g_f3_memo.sharp); rcas[0] = g_f3_memo.rcas0; rcas[1] = g_f3_memo.rcas1; *sharpen_out = g_f3_memo.sharpen; }
+    else {
+        float sharp = VKA_ENVF("DM_VK_FSR3_SHARP", 0.5), stops = 2.f - 2.f * (sharp < 0 ? 0 : sharp > 1 ? 1 : sharp), sx = exp2f(-stops);
+        *sharpen_out = sharp > 0; rcas[0] = fbits(sx); rcas[1] = (uint32_t)f16(sx) | (uint32_t)f16(sx) << 16;
+    }
     uint32_t off = (F.ring++ % F3_RING) * F3_FRAME;
     memcpy(F.ubo_map + off, &k, sizeof k); memcpy(F.ubo_map + off + F3_SLOT, &spd, sizeof spd); memcpy(F.ubo_map + off + 2 * F3_SLOT, rcas, sizeof rcas);
-
-    // The game's draws wrote the inputs; the previous evaluation our images
+    *off_out = off; return 1;
+}
+static void fsr3_prepare_images(VkCommandBuffer cb, f3_res *R, int first, int reset, int p) {
     vka_barrier(cb);
-    const int p = F.parity, q = p ^ 1;
     if (first) {
         f3_tex *all = (f3_tex *)R; size_t n = offsetof(f3_res, rw) / sizeof(f3_tex);
         for (size_t i = 0; i < n; i++) if (all[i].img) vka_img_barrier(cb, all[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        int16_t lut[128];   // FSR's Lanczos-2 table (fsr3upscalerCreate)
+        int16_t lut[128];
         for (int i = 0; i < 128; i++) {
             float x = 2.f * i / 127, px = 3.14159265f * x, y = fabsf(x) < FLT_EPSILON ? 1.f : (sinf(px) / px) * (sinf(0.5f * px) / (0.5f * px));
             lut[i] = (int16_t)lroundf(y * 32767.f);
@@ -367,32 +346,27 @@ int vka_dlss_fsr3(VkCommandBuffer cb, vka_img *src, VkFormat sfmt, vka_img *dst,
     clear(cb, R->prev_depth.img, 0, 0); clear(cb, R->spd_atomic.img, 0, 0); clear(cb, R->spd.img, 0, 0);
     if (reset) { clear(cb, R->acc[p].img, 0, 0); clear(cb, R->info.img, -1, 1); }
     vka_barrier(cb);
-
-    VkImageView exposure = R->info.view, cur_luma = R->luma[p].view;
+}
+static void fsr3_dispatch_passes(VkCommandBuffer cb, f3_res *R, VkImageView io[4], VkImageView vout, uint32_t sz[4], int p, uint32_t off, int sharpen) {
+    VkImageView exposure = R->info.view, cur_luma = R->luma[p].view; int q = p ^ 1;
+    uint32_t rw = sz[0], rh = sz[1], uw = sz[2], uh = sz[3], sgx = (rw - 1) / 64 + 1, sgy = (rh - 1) / 64 + 1;
 #define MIP(l) R->spd.lv[(l) < R->spd.levels ? (l) : R->spd.levels - 1]
-    { VkImageView v[] = {vmv, vdep, vcol, R->dmv.view, R->ddepth.view, R->prev_depth.view, R->farthest.view, cur_luma};
-      pass(cb, P_PREP, v, dc(rw, 8), dc(rh, 8), off); }
-    { VkImageView v[] = {cur_luma, R->farthest.view, R->spd_atomic.view, R->info.view, MIP(0), MIP(1), MIP(2), MIP(3), MIP(4), MIP(5), R->farthest_mip1.view};
-      pass(cb, P_LUMA, v, sgx, sgy, off); }
-    { VkImageView v[] = {cur_luma, R->luma[q].view, R->dmv.view, exposure, R->spd_atomic.view, MIP(0), MIP(1), MIP(2), MIP(3), MIP(4), MIP(5)};
-      pass(cb, P_SCP, v, sgx, sgy, off); }
+    { VkImageView v[] = {io[2], io[1], io[0], R->dmv.view, R->ddepth.view, R->prev_depth.view, R->farthest.view, cur_luma}; pass(cb, P_PREP, v, dc(rw, 8), dc(rh, 8), off); }
+    { VkImageView v[] = {cur_luma, R->farthest.view, R->spd_atomic.view, R->info.view, MIP(0), MIP(1), MIP(2), MIP(3), MIP(4), MIP(5), R->farthest_mip1.view}; pass(cb, P_LUMA, v, sgx, sgy, off); }
+    { VkImageView v[] = {cur_luma, R->luma[q].view, R->dmv.view, exposure, R->spd_atomic.view, MIP(0), MIP(1), MIP(2), MIP(3), MIP(4), MIP(5)}; pass(cb, P_SCP, v, sgx, sgy, off); }
     { VkImageView v[] = {R->spd.view, R->shading.view}; pass(cb, P_SC, v, dc(rw / 2, 8), dc(rh / 2, 8), off); }
-    { VkImageView v[] = {R->prev_depth.view, R->dmv.view, R->ddepth.view, R->def_react.view, R->def_react.view, R->acc[p].view, R->shading.view, cur_luma, exposure,
-                         R->dreact.view, R->locks.view, R->acc[q].view};
-      pass(cb, P_REACT, v, dc(rw, 8), dc(rh, 8), off); }
-    { VkImageView v[] = {exposure, R->dreact.view, R->dmv.view, R->info.view, R->luma_hist[p].view, R->farthest_mip1.view, cur_luma, R->luma_hist[q].view, R->farthest.view};
-      pass(cb, P_INSTAB, v, dc(rw, 8), dc(rh, 8), off); }
-    { VkImageView v[] = {exposure, R->dreact.view, R->dmv.view, R->up[p].view, R->lut.view, R->farthest_mip1.view, cur_luma, R->farthest.view, vcol, R->up[q].view,
-                         vout, R->locks.view};
-      pass(cb, sharpen ? P_ACCS : P_ACC, v, dc(uw, 8), dc(uh, 8), off); }
+    { VkImageView v[] = {R->prev_depth.view, R->dmv.view, R->ddepth.view, R->def_react.view, R->def_react.view, R->acc[p].view, R->shading.view, cur_luma, exposure, R->dreact.view, R->locks.view, R->acc[q].view}; pass(cb, P_REACT, v, dc(rw, 8), dc(rh, 8), off); }
+    { VkImageView v[] = {exposure, R->dreact.view, R->dmv.view, R->info.view, R->luma_hist[p].view, R->farthest_mip1.view, cur_luma, R->luma_hist[q].view, R->farthest.view}; pass(cb, P_INSTAB, v, dc(rw, 8), dc(rh, 8), off); }
+    { VkImageView v[] = {exposure, R->dreact.view, R->dmv.view, R->up[p].view, R->lut.view, R->farthest_mip1.view, cur_luma, R->farthest.view, io[0], R->up[q].view, vout, R->locks.view}; pass(cb, sharpen ? P_ACCS : P_ACC, v, dc(uw, 8), dc(uh, 8), off); }
     if (sharpen) { VkImageView v[] = {exposure, R->up[q].view, vout}; pass(cb, P_RCAS, v, dc(uw, 16), dc(uh, 16), off); }
 #undef MIP
+}
+static int fsr3_finish_output(VkCommandBuffer cb, f3_res *R, vka_img *dst, const NVNcopyRegion *d, uint32_t uw, uint32_t uh, uint32_t ow, uint32_t oh, int enc, int direct, int scaled) {
     if (enc) {
         vka_barrier(cb);
-        if (!vka_dlss_scale(cb, R->out.view, 0, 0, (int)uw, (int)uh, uw, uh, dst, 0, d->xoffset, d->yoffset, (int)ow, (int)oh, 1)) { F.parity = q; return 0; }
+        if (!vka_dlss_scale(cb, R->out.view, 0, 0, (int)uw, (int)uh, uw, uh, dst, 0, d->xoffset, d->yoffset, (int)ow, (int)oh, 1)) { F.parity ^= 1; return 0; }
     } else if (!direct) {
-        VkImageSubresourceLayers l = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        vka_barrier(cb);
+        VkImageSubresourceLayers l = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; vka_barrier(cb);
         if (scaled) {
             VkImageBlit b = {l, {{0, 0, 0}, {(int32_t)uw, (int32_t)uh, 1}}, l, {{d->xoffset, d->yoffset, 0}, {d->xoffset + (int32_t)ow, d->yoffset + (int32_t)oh, 1}}};
             vk.vkCmdBlitImage(cb, R->out.img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
@@ -401,9 +375,47 @@ int vka_dlss_fsr3(VkCommandBuffer cb, vka_img *src, VkFormat sfmt, vka_img *dst,
             vk.vkCmdCopyImage(cb, R->out.img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         }
     }
-    vka_barrier(cb);
-    F.parity = q;
-    static int noted; if (!noted++) VLOG("DLSS replaced by FSR 3.1: %ux%u -> %ux%u%s, sharpening %s", rw, rh, uw, uh, enc ? " (then sRGB-encoded into the output)" : scaled ? " (then a linear blit to the output)" : "", sharpen ? "on" : "off");
+    vka_barrier(cb); F.parity ^= 1; return 1;
+}
+int vka_dlss_fsr3(VkCommandBuffer cb, vka_img *src, VkFormat sfmt, vka_img *dst, int enc, vka_img *depth, vka_img *motion, const p_dlss_t2t *o) {
+    const NVNcopyRegion *s = &o->c.sr, *d = &o->c.dr;
+    if (!src || !dst || !depth || !motion || src == dst) { VRED_ONCE("FSR 3.1: the evaluation lacks %s", !depth ? "depth" : !motion ? "motion vectors" : "colour"); return 0; }
+    uint32_t rw = (uint32_t)s->width, rh = (uint32_t)s->height, uw = (uint32_t)d->width, uh = (uint32_t)d->height, ow = uw, oh = uh;
+    if (s->xoffset || s->yoffset || rw != src->w || rh != src->h || depth->w != rw || depth->h != rh || motion->w != rw || motion->h != rh ||
+        src->aspect != VK_IMAGE_ASPECT_COLOR_BIT || dst->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ||
+        src->samples != 1 || dst->samples != 1 || depth->samples != 1 || src->base || dst->base || d->xoffset < 0 || d->yoffset < 0 ||
+        uw < rw || uh < rh || (uint32_t)d->xoffset + uw > dst->w || (uint32_t)d->yoffset + uh > dst->h) return 0;
+    if (!f3_ready()) return 0;
+    if (vka_fg_fast_on()) f3_memo_env_sync();
+    VkFormatFeatureFlags feats = f3_fmt_features(dst->f.vk);
+    if (enc ? !vka_dlss_ready() : !(feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { VRED_ONCE("FSR 3.1: output format %d is not a storage format (or no encoding copy for sRGB)", dst->f.vk); return 0; }
+    const VkFormat out_fmt = enc ? VK_FORMAT_R16G16B16A16_SFLOAT : dst->f.vk;
+    int fw = vka_fg_fast_on() ? g_f3_memo.out_w : VKA_ENV("DM_VK_FSR3_OUT_W", 0), fh = vka_fg_fast_on() ? g_f3_memo.out_h : VKA_ENV("DM_VK_FSR3_OUT_H", 0);
+    const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    if (fw >= (int)rw && fh >= (int)rh && (uint32_t)fw <= ow && (uint32_t)fh <= oh && (enc || (feats & blit) == blit)) { uw = (uint32_t)fw; uh = (uint32_t)fh; }
+    const int scaled = uw != ow || uh != oh, direct = !enc && !scaled && (dst->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !d->xoffset && !d->yoffset && uw == dst->w && uh == dst->h;
+    if (!direct && !(dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
+    VkImageView io[4] = {vka_view(src, sfmt ? sfmt : src->f.view ? src->f.view : src->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL),
+        vka_view(depth, depth->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1, NULL),
+        vka_view(motion, motion->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL),
+        direct ? vka_view(dst, dst->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL) : VK_NULL_HANDLE};
+    if (!io[0] || !io[1] || !io[2] || (direct && !io[3])) return 0;
+    f3_res *R = F.res;
+    if (!R || R->rw != rw || R->rh != rh || R->uw != uw || R->uh != uh || (!direct && (!R->out.img || R->out_fmt != out_fmt))) {
+        f3_res *n = res_make(rw, rh, uw, uh, out_fmt, !direct); if (!n) return 0;
+        if (R) vka_after(vka_fence_last(), res_free, R);
+        F.res = R = n; F.first = 1; F.parity = 0;
+    }
+    VkImageView vout = direct ? io[3] : R->out.view;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    float dt_ms = F.last.tv_sec ? (float)((now.tv_sec - F.last.tv_sec) * 1e3 + (now.tv_nsec - F.last.tv_nsec) / 1e6) : 1000.f / 30; F.last = now;
+    int first = F.first, reset = first || o->reset || dt_ms > 250.f || (vka_fg_fast_on() ? g_f3_memo.fsr3_reset : VKA_ENV("DM_VK_FSR3_RESET", 0)); F.first = 0;
+    uint32_t off = 0, sz[4] = {rw, rh, uw, uh}; int sharpen = 0;
+    fsr3_fill_consts(rw, rh, uw, uh, dt_ms, first, reset, o, &off, &sharpen);
+    fsr3_prepare_images(cb, R, first, reset, F.parity);
+    fsr3_dispatch_passes(cb, R, io, vout, sz, F.parity, off, sharpen);
+    if (!fsr3_finish_output(cb, R, dst, d, uw, uh, ow, oh, enc, direct, scaled)) return 0;
+    static int noted; if (!noted++) VLOG("DLSS replaced by FSR 3.1: %ux%u -> %ux%u", rw, rh, uw, uh);
     return 1;
 }
 #endif

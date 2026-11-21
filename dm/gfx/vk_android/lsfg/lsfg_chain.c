@@ -12,6 +12,7 @@
 // outputs are the frame generation's own images (vka_framegen.c) instead of the swapchain frames, and their descriptor sets are written when the chain is made
 #if defined(__ANDROID__)
 #include "../vka.h"
+#include "../vka_fg_fast.h"
 #include "lsfg.h"
 #include <stdlib.h>
 #include <string.h>
@@ -144,7 +145,18 @@ static VkDescriptorSet set_new(lsfg_chain *c, const lpass *p) {
 }
 
 // The descriptor writer (Eden's LsfgDescriptorWriter): bindings 0, 1, 2, ... in the order they are added; a NULL image is a null descriptor
-typedef struct { lsfg_chain *c; VkDescriptorSet set; uint32_t n; VkWriteDescriptorSet w[32]; VkDescriptorImageInfo ii[32]; VkDescriptorBufferInfo bi[32]; } lwriter;
+typedef struct {
+    vka_lsfg_batch_ctl ctl;
+    VkWriteDescriptorSet w[VKA_LSFG_BATCH_MAX];
+    VkDescriptorImageInfo ii[VKA_LSFG_BATCH_MAX];
+    VkDescriptorBufferInfo bi[VKA_LSFG_BATCH_MAX];
+} lbatch;
+typedef struct { lsfg_chain *c; lbatch *b; VkDescriptorSet set; uint32_t n; VkWriteDescriptorSet w[32]; VkDescriptorImageInfo ii[32]; VkDescriptorBufferInfo bi[32]; } lwriter;
+static void w_flush_batch(lbatch *b, const lsfg_chain *c) {
+    if (!b || !b->ctl.used) return;
+    if (!c->bad) vk.vkUpdateDescriptorSets(V.dev, b->ctl.used, b->w, 0, NULL);
+    vka_lsfg_batch_finish(&b->ctl);
+}
 static void w_begin(lwriter *w, lsfg_chain *c, VkDescriptorSet s) { w->c = c; w->set = s; w->n = 0; }
 static void w_image(lwriter *w, VkDescriptorType t, VkSampler s, VkImageView v) {
     if (w->n >= 32) return;
@@ -164,8 +176,19 @@ static void w_ubo(lwriter *w, VkDeviceSize off) {
     w->w[w->n] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = w->set, .dstBinding = w->n, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &w->bi[w->n]};
     w->n++;
 }
-static void w_end(lwriter *w) { if (!w->c->bad && w->n) vk.vkUpdateDescriptorSets(V.dev, w->n, w->w, 0, NULL); }
-
+static void w_end(lwriter *w) {
+    if (w->c->bad || !w->n) return;
+    lbatch *b = w->b;
+    if (!b || !vka_fg_fast_on() || w->n > VKA_LSFG_BATCH_MAX) { vk.vkUpdateDescriptorSets(V.dev, w->n, w->w, 0, NULL); return; }
+    uint32_t base = b->ctl.used;
+    if (vka_lsfg_batch_step(&b->ctl, w->n)) { vk.vkUpdateDescriptorSets(V.dev, base, b->w, 0, NULL); base = 0; }
+    else base = b->ctl.used - w->n;
+    for (uint32_t i = 0; i < w->n; i++) {
+        uint32_t dst = base + i; b->w[dst] = w->w[i];
+        if (w->w[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) { b->bi[dst] = w->bi[i]; b->w[dst].pBufferInfo = &b->bi[dst]; }
+        else { b->ii[dst] = w->ii[i]; b->w[dst].pImageInfo = &b->ii[dst]; }
+    }
+}
 static void barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkAccessFlags sa, VkPipelineStageFlags dst, VkAccessFlags da) {
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = sa, .dstAccessMask = da};
     vk.vkCmdPipelineBarrier(cb, src, dst, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -189,12 +212,7 @@ static void run(VkCommandBuffer cb, const lpass *p, VkDescriptorSet s, uint32_t 
 static VkExtent2D halve(VkExtent2D e) { return (VkExtent2D){(e.width + 1) >> 1, (e.height + 1) >> 1}; }
 
 // ---------- The chain ----------
-lsfg_chain *lsfg_chain_new(const lsfg_modules *mods, VkExtent2D ext, float flow_scale, VkImage outs[LSFG_MAX_GENERATIONS], VkImageView out_views[LSFG_MAX_GENERATIONS]) {
-    if (!lk_load()) return NULL;
-    lsfg_chain *c = calloc(1, sizeof *c);
-    if (!c) return NULL;
-    lwriter w;
-    // Descriptor pool, samplers, uniform buffer
+static void chain_init_pool_ubo(lsfg_chain *c) {
     VkDescriptorPoolSize ps[4] = {{S_UBO, DESCRIPTORS_PER_TYPE}, {S_SMP, DESCRIPTORS_PER_TYPE}, {S_TEX, DESCRIPTORS_PER_TYPE}, {S_STO, DESCRIPTORS_PER_TYPE}};
     VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = FIXED_SETS + SETS_PER_SLOT * LSFG_GENERATION_SLOTS, .poolSizeCount = 4, .pPoolSizes = ps};
     if (vk.vkCreateDescriptorPool(V.dev, &pi, NULL, &c->pool)) { VRED("lsfg: descriptor pool"); c->bad = 1; }
@@ -205,92 +223,97 @@ lsfg_chain *lsfg_chain_new(const lsfg_modules *mods, VkExtent2D ext, float flow_
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = c->ustride * MAX_UBO, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
     VkResult r = vk.vkCreateBuffer(V.dev, &bi, NULL, &c->ubuf);
     VkMemoryRequirements mr = {0}; if (!r) vk.vkGetBufferMemoryRequirements(V.dev, c->ubuf, &mr);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
-        .memoryTypeIndex = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
     if (!r && ai.memoryTypeIndex == UINT32_MAX) r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (!r) r = vk.vkAllocateMemory(V.dev, &ai, NULL, &c->umem);
     if (!r) r = vk.vkBindBufferMemory(V.dev, c->ubuf, c->umem, 0);
     void *map = NULL; if (!r) r = vk.vkMapMemory(V.dev, c->umem, 0, VK_WHOLE_SIZE, 0, &map);
     if (r) { VRED("lsfg: uniform buffer: %d", r); c->bad = 1; } else c->umap = map;
-
-    // Inputs
+}
+static void chain_build_mip_alpha(lsfg_chain *c, lwriter *w, const lsfg_modules *mods, VkExtent2D ext, float flow_scale) {
     for (int i = 0; i < 2; i++) c->frames[i] = img_new(c, ext, LSFG_FORMAT);
-
-    // Mipmaps (LsfgMipmaps)
     PASS(&c->mip_pass, LSFG_SH_MIPMAPS, {1, S_UBO}, {1, S_SMP}, {1, S_TEX}, {MIPS, S_STO});
     c->flow_ext = (VkExtent2D){(uint32_t)(ext.width * flow_scale), (uint32_t)(ext.height * flow_scale)};
-    if (!c->flow_ext.width) c->flow_ext.width = 1;
-    if (!c->flow_ext.height) c->flow_ext.height = 1;
+    if (!c->flow_ext.width) c->flow_ext.width = 1; if (!c->flow_ext.height) c->flow_ext.height = 1;
     for (int i = 0; i < MIPS; i++) c->mip[i] = img_new(c, (VkExtent2D){c->flow_ext.width >> i, c->flow_ext.height >> i}, LSFG_FLOW_FORMAT);
-    for (int i = 0; i < 2; i++) {
-        c->mip_sets[i] = set_new(c, &c->mip_pass);
-        w_begin(&w, c, c->mip_sets[i]); w_ubo(&w, ubo_get(c, flow_scale, 0, 0, 0)); w_samp(&w, c->samp); w_tex(&w, c->frames[i]); w_stores(&w, c->mip, MIPS); w_end(&w);
-    }
-
-    // Alpha (LsfgAlphaPasses, LsfgAlpha per level)
-    PASS(&c->alpha_pass[0], 290, {1, S_SMP}, {1, S_TEX}, {1, S_STO});
-    PASS(&c->alpha_pass[1], 291, {1, S_SMP}, {1, S_TEX}, {1, S_STO});
-    PASS(&c->alpha_pass[2], 292, {1, S_SMP}, {1, S_TEX}, {2, S_STO});
-    PASS(&c->alpha_pass[3], 293, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
+    for (int i = 0; i < 2; i++) { c->mip_sets[i] = set_new(c, &c->mip_pass); w_begin(w, c, c->mip_sets[i]); w_ubo(w, ubo_get(c, flow_scale, 0, 0, 0)); w_samp(w, c->samp); w_tex(w, c->frames[i]); w_stores(w, c->mip, MIPS); w_end(w); }
+    PASS(&c->alpha_pass[0], 290, {1, S_SMP}, {1, S_TEX}, {1, S_STO}); PASS(&c->alpha_pass[1], 291, {1, S_SMP}, {1, S_TEX}, {1, S_STO});
+    PASS(&c->alpha_pass[2], 292, {1, S_SMP}, {1, S_TEX}, {2, S_STO}); PASS(&c->alpha_pass[3], 293, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
     for (int l = 0; l < MIPS && !c->bad; l++) {
-        __typeof__(c->alpha[0]) *a = &c->alpha[l];
-        a->input = c->mip[l];
-        VkExtent2D half = halve(a->input->ext), quarter = halve(half);
+        __typeof__(c->alpha[0]) *a = &c->alpha[l]; a->input = c->mip[l]; VkExtent2D half = halve(a->input->ext), quarter = halve(half);
         a->t1 = img_new(c, half, LSFG_FORMAT); a->t2 = img_new(c, half, LSFG_FORMAT);
         for (int i = 0; i < 2; i++) { a->t3[i] = img_new(c, quarter, LSFG_FORMAT); for (int j = 0; j < HIST; j++) a->out[j][i] = img_new(c, quarter, LSFG_FORMAT); }
         for (int s = 0; s < ALPHA_STAGES - 1; s++) a->sets[s] = set_new(c, &c->alpha_pass[s]);
         for (int h = 0; h < HIST; h++) a->last[h] = set_new(c, &c->alpha_pass[3]);
         if (c->bad) break;
-        w_begin(&w, c, a->sets[0]); w_samp(&w, c->samp); w_tex(&w, a->input); w_store(&w, a->t1); w_end(&w);
-        w_begin(&w, c, a->sets[1]); w_samp(&w, c->samp); w_tex(&w, a->t1); w_store(&w, a->t2); w_end(&w);
-        w_begin(&w, c, a->sets[2]); w_samp(&w, c->samp); w_tex(&w, a->t2); w_stores(&w, a->t3, 2); w_end(&w);
-        for (int h = 0; h < HIST; h++) { w_begin(&w, c, a->last[h]); w_samp(&w, c->samp); w_texs(&w, a->t3, 2); w_stores(&w, a->out[h], 2); w_end(&w); }
+        w_begin(w, c, a->sets[0]); w_samp(w, c->samp); w_tex(w, a->input); w_store(w, a->t1); w_end(w);
+        w_begin(w, c, a->sets[1]); w_samp(w, c->samp); w_tex(w, a->t1); w_store(w, a->t2); w_end(w);
+        w_begin(w, c, a->sets[2]); w_samp(w, c->samp); w_tex(w, a->t2); w_stores(w, a->t3, 2); w_end(w);
+        for (int h = 0; h < HIST; h++) { w_begin(w, c, a->last[h]); w_samp(w, c->samp); w_texs(w, a->t3, 2); w_stores(w, a->out[h], 2); w_end(w); }
     }
-
-    // Beta (LsfgBeta, on alpha level 0's outputs)
+}
+static void chain_build_beta_gamma(lsfg_chain *c, lwriter *w, const lsfg_modules *mods, float flow_scale) {
     PASS(&c->beta_pass[0], 298, {1, S_SMP}, {6, S_TEX}, {2, S_STO});
     for (int i = 1; i < BETA_STAGES - 1; i++) PASS(&c->beta_pass[i], 298 + (uint32_t)i, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
     PASS(&c->beta_pass[4], 302, {1, S_UBO}, {1, S_SMP}, {2, S_TEX}, {6, S_STO});
     if (!c->bad) {
-        limg *(*in)[2] = c->alpha[0].out;
-        VkExtent2D e = in[0][0]->ext;
+        limg *(*in)[2] = c->alpha[0].out; VkExtent2D e = in[0][0]->ext;
         for (int i = 0; i < 2; i++) { c->beta_t1[i] = img_new(c, e, LSFG_FORMAT); c->beta_t2[i] = img_new(c, e, LSFG_FORMAT); }
         for (int i = 0; i < BETA_OUTPUTS; i++) c->beta_out[i] = img_new(c, (VkExtent2D){e.width >> i, e.height >> i}, LSFG_FLOW_FORMAT);
         for (int h = 0; h < HIST; h++) c->beta_first[h] = set_new(c, &c->beta_pass[0]);
         for (int s = 0; s < BETA_STAGES - 1; s++) c->beta_sets[s] = set_new(c, &c->beta_pass[s + 1]);
-        for (int h = 0; h < HIST && !c->bad; h++) {
-            w_begin(&w, c, c->beta_first[h]); w_samp(&w, c->samp_border);
-            w_texs(&w, in[(h + 1) % HIST], 2); w_texs(&w, in[(h + 2) % HIST], 2); w_texs(&w, in[h % HIST], 2); w_stores(&w, c->beta_t1, 2); w_end(&w);
-        }
+        for (int h = 0; h < HIST && !c->bad; h++) { w_begin(w, c, c->beta_first[h]); w_samp(w, c->samp_border); w_texs(w, in[(h + 1) % HIST], 2); w_texs(w, in[(h + 2) % HIST], 2); w_texs(w, in[h % HIST], 2); w_stores(w, c->beta_t1, 2); w_end(w); }
         if (!c->bad) {
-            w_begin(&w, c, c->beta_sets[0]); w_samp(&w, c->samp); w_texs(&w, c->beta_t1, 2); w_stores(&w, c->beta_t2, 2); w_end(&w);
-            w_begin(&w, c, c->beta_sets[1]); w_samp(&w, c->samp); w_texs(&w, c->beta_t2, 2); w_stores(&w, c->beta_t1, 2); w_end(&w);
-            w_begin(&w, c, c->beta_sets[2]); w_samp(&w, c->samp); w_texs(&w, c->beta_t1, 2); w_stores(&w, c->beta_t2, 2); w_end(&w);
-            w_begin(&w, c, c->beta_sets[3]); w_ubo(&w, ubo_get(c, flow_scale, 0.5f, 0, 0)); w_samp(&w, c->samp); w_texs(&w, c->beta_t2, 2); w_stores(&w, c->beta_out, BETA_OUTPUTS); w_end(&w);
+            w_begin(w, c, c->beta_sets[0]); w_samp(w, c->samp); w_texs(w, c->beta_t1, 2); w_stores(w, c->beta_t2, 2); w_end(w);
+            w_begin(w, c, c->beta_sets[1]); w_samp(w, c->samp); w_texs(w, c->beta_t2, 2); w_stores(w, c->beta_t1, 2); w_end(w);
+            w_begin(w, c, c->beta_sets[2]); w_samp(w, c->samp); w_texs(w, c->beta_t1, 2); w_stores(w, c->beta_t2, 2); w_end(w);
+            w_begin(w, c, c->beta_sets[3]); w_ubo(w, ubo_get(c, flow_scale, 0.5f, 0, 0)); w_samp(w, c->samp); w_texs(w, c->beta_t2, 2); w_stores(w, c->beta_out, BETA_OUTPUTS); w_end(w);
         }
     }
-
-    // Gamma (LsfgGamma, coarsest level first) and delta (LsfgDelta, the three finest)
-    PASS(&c->gamma_pass[0], 280, {1, S_UBO}, {2, S_SMP}, {5, S_TEX}, {3, S_STO});
-    PASS(&c->gamma_pass[1], 282, {1, S_SMP}, {3, S_TEX}, {2, S_STO});
-    PASS(&c->gamma_pass[2], 283, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
-    PASS(&c->gamma_pass[3], 284, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
-    PASS(&c->gamma_pass[4], 285, {1, S_UBO}, {2, S_SMP}, {4, S_TEX}, {1, S_STO});
-    PASS(&c->delta_pass[0], 280, {1, S_UBO}, {2, S_SMP}, {5, S_TEX}, {3, S_STO});
-    PASS(&c->delta_pass[1], 286, {1, S_SMP}, {3, S_TEX}, {2, S_STO});
-    PASS(&c->delta_pass[2], 287, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
-    PASS(&c->delta_pass[3], 288, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
-    PASS(&c->delta_pass[4], 289, {1, S_UBO}, {2, S_SMP}, {4, S_TEX}, {1, S_STO});
+    PASS(&c->gamma_pass[0], 280, {1, S_UBO}, {2, S_SMP}, {5, S_TEX}, {3, S_STO}); PASS(&c->gamma_pass[1], 282, {1, S_SMP}, {3, S_TEX}, {2, S_STO});
+    PASS(&c->gamma_pass[2], 283, {1, S_SMP}, {2, S_TEX}, {2, S_STO}); PASS(&c->gamma_pass[3], 284, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
+    PASS(&c->gamma_pass[4], 285, {1, S_UBO}, {2, S_SMP}, {4, S_TEX}, {1, S_STO}); PASS(&c->delta_pass[0], 280, {1, S_UBO}, {2, S_SMP}, {5, S_TEX}, {3, S_STO});
+    PASS(&c->delta_pass[1], 286, {1, S_SMP}, {3, S_TEX}, {2, S_STO}); PASS(&c->delta_pass[2], 287, {1, S_SMP}, {2, S_TEX}, {2, S_STO});
+    PASS(&c->delta_pass[3], 288, {1, S_SMP}, {2, S_TEX}, {2, S_STO}); PASS(&c->delta_pass[4], 289, {1, S_UBO}, {2, S_SMP}, {4, S_TEX}, {1, S_STO});
     PASS(&c->delta_pass[5], 281, {1, S_UBO}, {2, S_SMP}, {6, S_TEX}, {1, S_STO});
     for (int i = 6; i < DELTA_STAGES - 1; i++) PASS(&c->delta_pass[i], 294 + (uint32_t)(i - 6), {1, S_SMP}, {1, S_TEX}, {1, S_STO});
     PASS(&c->delta_pass[9], 297, {1, S_UBO}, {2, S_SMP}, {2, S_TEX}, {1, S_STO});
+}
+static void chain_fill_delta(lsfg_chain *c, lwriter *w, int i, float flow_scale) {
+    int di = i - FIRST_DELTA_LEVEL, level = MIPS - 1 - i;
+    limg *(*in)[2] = c->alpha[level].out, *dflow = c->beta_out[level];
+    __typeof__(c->delta[0]) *d = &c->delta[di];
+    limg *pg = i == FIRST_DELTA_LEVEL ? NULL : c->gamma[i - 1].out;
+    limg *p1 = i == FIRST_DELTA_LEVEL ? NULL : c->delta[di - 1].out1, *p2 = i == FIRST_DELTA_LEVEL ? NULL : c->delta[di - 1].out2;
+    VkExtent2D e = in[0][0]->ext;
+    for (int k = 0; k < 3; k++) d->t1[k] = img_new(c, e, LSFG_FORMAT);
+    for (int k = 0; k < 2; k++) d->t2[k] = img_new(c, e, LSFG_FORMAT);
+    d->out1 = img_new(c, e, LSFG_MOTION_FORMAT); d->out2 = img_new(c, e, LSFG_MOTION_FORMAT);
+    for (int s = 0; s < LSFG_GENERATION_SLOTS && !c->bad; s++) {
+        VkDeviceSize ub = ubo_get(c, flow_scale, slot_timestamp((size_t)s), 0, pg == NULL);
+        for (int h = 0; h < HIST; h++) { d->g[s].first[h] = set_new(c, &c->delta_pass[0]); d->g[s].sixth[h] = set_new(c, &c->delta_pass[5]); }
+        for (int k = 0; k < 4; k++) d->g[s].sets[k] = set_new(c, &c->delta_pass[k + 1]);
+        for (int k = 4; k < DELTA_STAGES - 2; k++) d->g[s].sets[k] = set_new(c, &c->delta_pass[k + 2]);
+        if (c->bad) break;
+        for (int h = 0; h < HIST; h++) {
+            w_begin(w, c, d->g[s].first[h]); w_ubo(w, ub); w_samp(w, c->samp_border); w_samp(w, c->samp_edge); w_texs(w, in[(h + 2) % HIST], 2); w_texs(w, in[h % HIST], 2); w_tex(w, pg); w_stores(w, d->t1, 3); w_end(w);
+            w_begin(w, c, d->g[s].sixth[h]); w_ubo(w, ub); w_samp(w, c->samp_border); w_samp(w, c->samp_edge); w_texs(w, in[(h + 2) % HIST], 2); w_texs(w, in[h % HIST], 2); w_tex(w, pg); w_tex(w, p1); w_store(w, d->t2[0]); w_end(w);
+        }
+        w_begin(w, c, d->g[s].sets[0]); w_samp(w, c->samp); w_texs(w, d->t1, 3); w_stores(w, d->t2, 2); w_end(w);
+        w_begin(w, c, d->g[s].sets[1]); w_samp(w, c->samp); w_texs(w, d->t2, 2); w_store(w, d->t1[0]); w_store(w, d->t1[1]); w_end(w);
+        w_begin(w, c, d->g[s].sets[2]); w_samp(w, c->samp); w_tex(w, d->t1[0]); w_tex(w, d->t1[1]); w_stores(w, d->t2, 2); w_end(w);
+        w_begin(w, c, d->g[s].sets[3]); w_ubo(w, ub); w_samp(w, c->samp); w_samp(w, c->samp_edge); w_texs(w, d->t2, 2); w_tex(w, pg); w_tex(w, dflow); w_store(w, d->out1); w_end(w);
+        w_begin(w, c, d->g[s].sets[4]); w_samp(w, c->samp); w_tex(w, d->t2[0]); w_store(w, d->t1[0]); w_end(w);
+        w_begin(w, c, d->g[s].sets[5]); w_samp(w, c->samp); w_tex(w, d->t1[0]); w_store(w, d->t2[0]); w_end(w);
+        w_begin(w, c, d->g[s].sets[6]); w_samp(w, c->samp); w_tex(w, d->t2[0]); w_store(w, d->t1[0]); w_end(w);
+        w_begin(w, c, d->g[s].sets[7]); w_ubo(w, ub); w_samp(w, c->samp); w_samp(w, c->samp_edge); w_tex(w, d->t1[0]); w_tex(w, p2); w_store(w, d->out2); w_end(w);
+    }
+}
+static void chain_build_delta_gen(lsfg_chain *c, lwriter *w, const lsfg_modules *mods, VkExtent2D ext, float flow_scale, VkImageView outs[LSFG_MAX_GENERATIONS]) {
     for (int i = 0; i < MIPS && !c->bad; i++) {
-        int level = MIPS - 1 - i;
-        limg *(*in)[2] = c->alpha[level].out;
-        limg *flow = c->beta_out[level < BETA_OUTPUTS - 1 ? level : BETA_OUTPUTS - 1];
-        limg *prev = i == 0 ? NULL : c->gamma[i - 1].out;
-        __typeof__(c->gamma[0]) *g = &c->gamma[i];
-        VkExtent2D e = in[0][0]->ext;
+        int level = MIPS - 1 - i; limg *(*in)[2] = c->alpha[level].out;
+        limg *flow = c->beta_out[level < BETA_OUTPUTS - 1 ? level : BETA_OUTPUTS - 1], *prev = i == 0 ? NULL : c->gamma[i - 1].out;
+        __typeof__(c->gamma[0]) *g = &c->gamma[i]; VkExtent2D e = in[0][0]->ext;
         for (int k = 0; k < 3; k++) g->t1[k] = img_new(c, e, LSFG_FORMAT);
         for (int k = 0; k < 2; k++) g->t2[k] = img_new(c, e, LSFG_FORMAT);
         g->out = img_new(c, e, LSFG_MOTION_FORMAT);
@@ -299,85 +322,52 @@ lsfg_chain *lsfg_chain_new(const lsfg_modules *mods, VkExtent2D ext, float flow_
             for (int h = 0; h < HIST; h++) g->g[s].first[h] = set_new(c, &c->gamma_pass[0]);
             for (int k = 0; k < GAMMA_STAGES - 1; k++) g->g[s].sets[k] = set_new(c, &c->gamma_pass[k + 1]);
             if (c->bad) break;
-            for (int h = 0; h < HIST; h++) {
-                w_begin(&w, c, g->g[s].first[h]); w_ubo(&w, ub); w_samp(&w, c->samp_border); w_samp(&w, c->samp_edge);
-                w_texs(&w, in[(h + 2) % HIST], 2); w_texs(&w, in[h % HIST], 2); w_tex(&w, prev); w_stores(&w, g->t1, 3); w_end(&w);
-            }
-            w_begin(&w, c, g->g[s].sets[0]); w_samp(&w, c->samp); w_texs(&w, g->t1, 3); w_stores(&w, g->t2, 2); w_end(&w);
-            w_begin(&w, c, g->g[s].sets[1]); w_samp(&w, c->samp); w_texs(&w, g->t2, 2); w_store(&w, g->t1[0]); w_store(&w, g->t1[1]); w_end(&w);
-            w_begin(&w, c, g->g[s].sets[2]); w_samp(&w, c->samp); w_tex(&w, g->t1[0]); w_tex(&w, g->t1[1]); w_stores(&w, g->t2, 2); w_end(&w);
-            w_begin(&w, c, g->g[s].sets[3]); w_ubo(&w, ub); w_samp(&w, c->samp); w_samp(&w, c->samp_edge); w_texs(&w, g->t2, 2); w_tex(&w, prev); w_tex(&w, flow); w_store(&w, g->out); w_end(&w);
+            for (int h = 0; h < HIST; h++) { w_begin(w, c, g->g[s].first[h]); w_ubo(w, ub); w_samp(w, c->samp_border); w_samp(w, c->samp_edge); w_texs(w, in[(h + 2) % HIST], 2); w_texs(w, in[h % HIST], 2); w_tex(w, prev); w_stores(w, g->t1, 3); w_end(w); }
+            w_begin(w, c, g->g[s].sets[0]); w_samp(w, c->samp); w_texs(w, g->t1, 3); w_stores(w, g->t2, 2); w_end(w);
+            w_begin(w, c, g->g[s].sets[1]); w_samp(w, c->samp); w_texs(w, g->t2, 2); w_store(w, g->t1[0]); w_store(w, g->t1[1]); w_end(w);
+            w_begin(w, c, g->g[s].sets[2]); w_samp(w, c->samp); w_tex(w, g->t1[0]); w_tex(w, g->t1[1]); w_stores(w, g->t2, 2); w_end(w);
+            w_begin(w, c, g->g[s].sets[3]); w_ubo(w, ub); w_samp(w, c->samp); w_samp(w, c->samp_edge); w_texs(w, g->t2, 2); w_tex(w, prev); w_tex(w, flow); w_store(w, g->out); w_end(w);
         }
-        if (i < FIRST_DELTA_LEVEL || c->bad) continue;
-        int di = i - FIRST_DELTA_LEVEL;
-        __typeof__(c->delta[0]) *d = &c->delta[di];
-        limg *pg = i == FIRST_DELTA_LEVEL ? NULL : c->gamma[i - 1].out;
-        limg *p1 = i == FIRST_DELTA_LEVEL ? NULL : c->delta[di - 1].out1, *p2 = i == FIRST_DELTA_LEVEL ? NULL : c->delta[di - 1].out2;
-        limg *dflow = c->beta_out[level];
-        for (int k = 0; k < 3; k++) d->t1[k] = img_new(c, e, LSFG_FORMAT);
-        for (int k = 0; k < 2; k++) d->t2[k] = img_new(c, e, LSFG_FORMAT);
-        d->out1 = img_new(c, e, LSFG_MOTION_FORMAT); d->out2 = img_new(c, e, LSFG_MOTION_FORMAT);
-        for (int s = 0; s < LSFG_GENERATION_SLOTS && !c->bad; s++) {
-            VkDeviceSize ub = ubo_get(c, flow_scale, slot_timestamp((size_t)s), 0, pg == NULL);
-            for (int h = 0; h < HIST; h++) { d->g[s].first[h] = set_new(c, &c->delta_pass[0]); d->g[s].sixth[h] = set_new(c, &c->delta_pass[5]); }
-            for (int k = 0; k < 4; k++) d->g[s].sets[k] = set_new(c, &c->delta_pass[k + 1]);
-            for (int k = 4; k < DELTA_STAGES - 2; k++) d->g[s].sets[k] = set_new(c, &c->delta_pass[k + 2]);
-            if (c->bad) break;
-            for (int h = 0; h < HIST; h++) {
-                w_begin(&w, c, d->g[s].first[h]); w_ubo(&w, ub); w_samp(&w, c->samp_border); w_samp(&w, c->samp_edge);
-                w_texs(&w, in[(h + 2) % HIST], 2); w_texs(&w, in[h % HIST], 2); w_tex(&w, pg); w_stores(&w, d->t1, 3); w_end(&w);
-                w_begin(&w, c, d->g[s].sixth[h]); w_ubo(&w, ub); w_samp(&w, c->samp_border); w_samp(&w, c->samp_edge);
-                w_texs(&w, in[(h + 2) % HIST], 2); w_texs(&w, in[h % HIST], 2); w_tex(&w, pg); w_tex(&w, p1); w_store(&w, d->t2[0]); w_end(&w);
-            }
-            w_begin(&w, c, d->g[s].sets[0]); w_samp(&w, c->samp); w_texs(&w, d->t1, 3); w_stores(&w, d->t2, 2); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[1]); w_samp(&w, c->samp); w_texs(&w, d->t2, 2); w_store(&w, d->t1[0]); w_store(&w, d->t1[1]); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[2]); w_samp(&w, c->samp); w_tex(&w, d->t1[0]); w_tex(&w, d->t1[1]); w_stores(&w, d->t2, 2); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[3]); w_ubo(&w, ub); w_samp(&w, c->samp); w_samp(&w, c->samp_edge); w_texs(&w, d->t2, 2); w_tex(&w, pg); w_tex(&w, dflow); w_store(&w, d->out1); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[4]); w_samp(&w, c->samp); w_tex(&w, d->t2[0]); w_store(&w, d->t1[0]); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[5]); w_samp(&w, c->samp); w_tex(&w, d->t1[0]); w_store(&w, d->t2[0]); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[6]); w_samp(&w, c->samp); w_tex(&w, d->t2[0]); w_store(&w, d->t1[0]); w_end(&w);
-            w_begin(&w, c, d->g[s].sets[7]); w_ubo(&w, ub); w_samp(&w, c->samp); w_samp(&w, c->samp_edge); w_tex(&w, d->t1[0]); w_tex(&w, p2); w_store(&w, d->out2); w_end(&w);
-        }
+        if (i >= FIRST_DELTA_LEVEL && !c->bad) chain_fill_delta(c, w, i, flow_scale);
     }
-
-    // Generate (LsfgGenerate): for each slot and output, two sets (which input is the previous frame)
-    PASS(&c->gen_pass, LSFG_SH_GENERATE, {1, S_UBO}, {2, S_SMP}, {5, S_TEX}, {1, S_STO});
-    c->out_ext = ext;
+    PASS(&c->gen_pass, LSFG_SH_GENERATE, {1, S_UBO}, {2, S_SMP}, {5, S_TEX}, {1, S_STO}); c->out_ext = ext;
     for (int s = 0; s < LSFG_GENERATION_SLOTS && !c->bad; s++) {
         VkDeviceSize ub = ubo_get(c, flow_scale, slot_timestamp((size_t)s), 0, 0);
         for (int t = 0; t < LSFG_MAX_GENERATIONS; t++) for (int k = 0; k < 2 && !c->bad; k++) {
-            c->gen_sets[s][t][k] = set_new(c, &c->gen_pass);
-            if (c->bad) break;
-            w_begin(&w, c, c->gen_sets[s][t][k]); w_ubo(&w, ub); w_samp(&w, c->samp); w_samp(&w, c->samp_edge);
-            w_tex(&w, c->frames[1 - k]); w_tex(&w, c->frames[k]); w_tex(&w, c->gamma[MIPS - 1].out); w_tex(&w, c->delta[DELTA_N - 1].out1); w_tex(&w, c->delta[DELTA_N - 1].out2);
-            w_view(&w, out_views[t]); w_end(&w);
+            c->gen_sets[s][t][k] = set_new(c, &c->gen_pass); if (c->bad) break;
+            w_begin(w, c, c->gen_sets[s][t][k]); w_ubo(w, ub); w_samp(w, c->samp); w_samp(w, c->samp_edge); w_tex(w, c->frames[1 - k]); w_tex(w, c->frames[k]); w_tex(w, c->gamma[MIPS - 1].out); w_tex(w, c->delta[DELTA_N - 1].out1); w_tex(w, c->delta[DELTA_N - 1].out2); w_view(w, outs[t]); w_end(w);
         }
     }
-
-    // Every image in GENERAL layout, once (the outputs too)
-    if (!c->bad) {
-        VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = V.qf};
-        VkCommandBuffer cb = VK_NULL_HANDLE;
-        VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-        r = vk.vkCreateCommandPool(V.dev, &cpi, NULL, &c->cpool);
-        cai.commandPool = c->cpool;
-        if (!r) r = vk.vkAllocateCommandBuffers(V.dev, &cai, &cb);
-        VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-        if (!r) r = vk.vkBeginCommandBuffer(cb, &cbi);
-        if (!r) {
-            for (int i = 0; i < c->nimg; i++) vka_img_barrier(cb, c->imgs[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-            for (int t = 0; t < LSFG_MAX_GENERATIONS; t++) vka_img_barrier(cb, outs[t], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-            r = vk.vkEndCommandBuffer(cb);
-        }
-        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
-        if (!r) { pthread_mutex_lock(&V.qmu); r = vk.vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&V.qmu); if (!r && !vka_queue_idle()) r = VK_TIMEOUT; }   // (vka_queue_idle: a CPU wait, so a gate holding the queue opens)
-        if (r) { VRED("lsfg: layout setup: %d", r); c->bad = 1; }
+}
+static void chain_init_layouts(lsfg_chain *c, VkImage outs[LSFG_MAX_GENERATIONS]) {
+    if (c->bad) return;
+    VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = V.qf};
+    VkCommandBuffer cb = VK_NULL_HANDLE; VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkResult r = vk.vkCreateCommandPool(V.dev, &cpi, NULL, &c->cpool);
+    cai.commandPool = c->cpool; if (!r) r = vk.vkAllocateCommandBuffers(V.dev, &cai, &cb);
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (!r) r = vk.vkBeginCommandBuffer(cb, &cbi);
+    if (!r) {
+        for (int i = 0; i < c->nimg; i++) vka_img_barrier(cb, c->imgs[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        for (int t = 0; t < LSFG_MAX_GENERATIONS; t++) vka_img_barrier(cb, outs[t], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        r = vk.vkEndCommandBuffer(cb);
     }
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    if (!r) { pthread_mutex_lock(&V.qmu); r = vk.vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&V.qmu); if (!r && !vka_queue_idle()) r = VK_TIMEOUT; }
+    if (r) { VRED("lsfg: layout setup: %d", r); c->bad = 1; }
+}
+lsfg_chain *lsfg_chain_new(const lsfg_modules *mods, VkExtent2D ext, float flow_scale, VkImage outs[LSFG_MAX_GENERATIONS], VkImageView out_views[LSFG_MAX_GENERATIONS]) {
+    if (!lk_load()) return NULL;
+    lsfg_chain *c = calloc(1, sizeof *c); lbatch *b = calloc(1, sizeof *b);
+    if (!c) { free(b); return NULL; }
+    lwriter w = {.b = b};
+    chain_init_pool_ubo(c); chain_build_mip_alpha(c, &w, mods, ext, flow_scale);
+    chain_build_beta_gamma(c, &w, mods, flow_scale); chain_build_delta_gen(c, &w, mods, ext, flow_scale, out_views);
+    w_flush_batch(b, c); free(b); chain_init_layouts(c, outs);
     if (c->bad) { lsfg_chain_free(c); return NULL; }
     VLOG("lsfg: chain %ux%u, flow %ux%u (scale %.2f): %d images, %d constant blocks", ext.width, ext.height, c->flow_ext.width, c->flow_ext.height, flow_scale, c->nimg, c->nubo);
     return c;
 }
-
 static void pass_free(lpass *p) {
     if (p->pipe) lk.vkDestroyPipeline(V.dev, p->pipe, NULL);
     if (p->pl) lk.vkDestroyPipelineLayout(V.dev, p->pl, NULL);
