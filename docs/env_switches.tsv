@@ -796,6 +796,7 @@ DM_VK_VIN_SKIP	switch	`0` (Android, live: the next submission, 1) the vertex inp
 DM_VK_WALK_FAST	switch	`1` (default) / `0` 64x4 multi-material stage binding walk front-memo, 256x4 shader trait cache & O(1) resource hazard summary flags (`vka_draw.c` / `vka_walk_fast.h`)
 DM_VK_WB_FOLLOW	switch	`0` stops uploading a GPU-written linear texture's storage after the CPU writes it (the copy-back case of vka_wbfollow.h: Mario Tennis Fever's glyph cache); default 1
 DM_VK_WORKER	switch	`0` (Android, restart, on) submissions and presents are replayed inline on the game's thread instead of on the replay worker thread
+DM_VK_WORKER_FAST	switch	`0` disables the inline command-handle/wait-snapshot buffers, `qs_sub` worker slab pool, single-mask sync scanner, and waiter-gated condition-variable wakes in `vka_worker.c` (default `1`)
 DM_VK_WORKER_FRAMES	switch	`=<n>` (Android, restart, default 1) the replay worker may be at most n presents behind the game
 DM_VK_XP_SCISSOR	diagnostic	`=<px>` (Android, live, 0 = off) an experiment with a wrong picture: every draw's scissor is cut to px x px pixels, to split a pass's GPU time into per-pixel and per-draw work
 DM_VK_XP_TS	diagnostic	`=<mask>` (Android, live, 0 = off) an experiment: a bottom-of-pipe timestamp (on Turnip a wait for idle) after a pass end's barrier (1), at an upload batch's end (2), before a depth pass begins (4), after every other full barrier (8) ([rendering.md](reference/rendering.md#turnip-hangs-in-the-first-3d-frame-of-a-cold-run))

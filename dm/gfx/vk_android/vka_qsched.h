@@ -73,6 +73,7 @@ typedef struct qs {
     void (*note)(void *ctx, int what, const qs_sub *s);   // optional (DM_VK_EVENT_LOG): 0 parked, 1 released by its wait, 2 gated
     // optional: a wait of s on a CPU event that does not hold: 1 when the GPU waits for it instead (the replay goes on), 0 to park
     int (*gate)(void *ctx, qs_sub *s, volatile uint32_t *w, uint32_t mode, uint32_t value);
+    void (*free_sub)(void *ctx, qs_sub *s);
     void *ctx;
     uint64_t park_ns;
     uint64_t n_park, n_whole, n_release, n_gate, n_force[QS_NWHY];
@@ -239,6 +240,7 @@ static inline qs_queue *qs_queue_of(qs *sc, uint64_t serial) {
     qs_queue *q = &sc->q[sc->nq++]; memset(q, 0, sizeof *q); q->serial = serial; return q;
 }
 static inline void qs_free(qs_sub *s) { free((void *)s->h); free(s->ws); free(s); }
+static inline void qs_free_sub(qs *sc, qs_sub *s) { if (sc && sc->free_sub) sc->free_sub(sc->ctx, s); else qs_free(s); }
 static inline void qs_force_all(qs *sc, int why);
 // Room for one more commit: QS_DEFER_MAX unsignalled commits release everything first (their completion effects wait for a covering signal: vka_exec.c carries at most
 // NCARRY). Asked before a submission is taken off its queue's list, so the release keeps each queue's order
@@ -253,7 +255,7 @@ static inline int qs_run_one(qs *sc, qs_queue *q, qs_sub *s) {
     else parked = sc->run(sc->ctx, s);
     sc->cur = NULL;
     if (parked) { s->next = q->head; q->head = s; if (!q->tail) q->tail = s; q->n++; sc->n_park++; if (sc->note) sc->note(sc->ctx, 0, s); return 1; }
-    qs_free(s); return 0;
+    qs_free_sub(sc, s); return 0;
 }
 // Replays q's parked head and the submissions behind it until one parks again or none is left
 static inline void qs_drain_queue(qs *sc, qs_queue *q) {

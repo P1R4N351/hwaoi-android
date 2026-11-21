@@ -20,6 +20,7 @@
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vka_qsched.h"
+#include "vka_worker_fast.h"
 #include "../nvn/nvn_mtl.h"
 #include <stdlib.h>
 #include <string.h>
@@ -39,9 +40,7 @@ enum { J_SUB = 1, J_PRESENT, J_FORGET, J_WAIT, J_PROG_FORGET };
 typedef struct {
     int kind;
     uint64_t serial, fence, frame; int origin_ll;   // J_SUB: the queue, its window origin, the fence reserved for it, the game's frame when it submitted; J_WAIT: the queue, the fence it waits for
-    const uint8_t **h; int nh;                   // J_SUB: the command handles, in order
-    qs_wsnap *ws; int nws;                       // J_SUB: what the syncs of its WAIT_SYNC records held when it was submitted
-    int w0done, w0kind; volatile uint32_t *w0word; uint32_t w0mode, w0value; uint64_t w0fence;   // J_SUB: its first wait, when no event signal comes before it (qs_sub.w0kind)
+    vka_job_buf jb;                              // J_SUB: command handles, WAIT_SYNC snapshots, and first wait (inline <=16/<=8)
     uint64_t ticket; tex_t t; double period; int has_crop, crop[4];   // J_PRESENT
 } job_t;
 enum { NJOB = 256 };
@@ -49,7 +48,8 @@ static job_t g_q[NJOB]; static uint64_t g_qin, g_qout, g_pres_in, g_pres_out;   
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static int g_on = -1, g_frames = 1, g_up;
 // The submission being gathered on the game's thread (the host submits under its own lock: one at a time)
-static job_t g_cur; static int g_cur_cap, g_in_sub; static uint64_t g_pend_serial; static int g_pend_origin;
+static const uint8_t **g_cur_h; static int g_cur_nh, g_cur_cap, g_in_sub; static uint64_t g_pend_serial; static int g_pend_origin;
+static vka_sub_pool g_sub_pool; static vka_worker_wait_state g_ws;
 
 int vka_worker_on(void) {
     if (g_on < 0) { const char *e = getenv("DM_VK_WORKER"); g_on = !e || atoi(e); e = getenv("DM_VK_WORKER_FRAMES"); g_frames = e && atoi(e) > 0 ? atoi(e) : 1; }
@@ -215,6 +215,7 @@ static int qs_on(void) {
         const char *e = getenv("DM_VK_EVENT_WAIT"); g_qs_on = e ? atoi(e) != 0 : DM_GAME_EVENT_WAIT; int by_prof = !e;
         e = getenv("DM_VK_EVENT_PARK_MS"); double ms = e ? atof(e) : 200; if (!(ms >= 0)) ms = 200;
         g_qs.run = qs_run_cb; g_qs.done = qs_done_cb; g_qs.now = qs_now_cb; g_qs.timeout = qs_timeout_cb; g_qs.park_ns = (uint64_t)(ms * 1e6);
+        if (vka_worker_fast_on()) { g_qs.ctx = &g_sub_pool; g_qs.free_sub = vka_sub_release; }
         e = getenv("DM_VK_EVENT_LOG"); g_evlog = e ? atoi(e) : 0; if (g_evlog > 0 || vka_qtrace_on()) g_qs.note = qs_note_cb;
         e = getenv("DM_VK_EVENT_GATE"); g_gate_on = !e || atoi(e); if (g_gate_on) g_qs.gate = qs_gate_cb;
         VLOG("GPU waits across NVN queues: %s%s", g_qs_on ? "a wait parks its queue until its producer is replayed (DM_VK_EVENT_WAIT=0: every wait passes)" : by_prof ? "every wait passes (profile event_wait off; DM_VK_EVENT_WAIT=1 honours them)" : "every wait passes (DM_VK_EVENT_WAIT=0)",
@@ -245,7 +246,7 @@ int vka_worker_cpu_wait(uint64_t fence) {
     vka_qtrace(QT_CPU_WAIT, 0, fence, 0, 1, 0, 0, 0, NULL);
     uint64_t w = atomic_load(&g_cpu_want); while (w < fence && !atomic_compare_exchange_weak(&g_cpu_want, &w, fence)) {}
     vka_gate_cpu_wait(fence);   // a gate before that fence opens if the GPU waits at it with nothing before it (vka_dev.c)
-    pthread_mutex_lock(&g_mu); g_kick = 1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu); g_kick = 1; vka_worker_wake_on_kick(&g_ws, &g_cv, vka_worker_fast_on()); pthread_mutex_unlock(&g_mu);
     return 1;
 }
 void vka_worker_cpu_wait_end(int was) {
@@ -286,66 +287,73 @@ static void qs_stats(uint64_t ticket) {
     p0 = g_qs.n_park; w0 = g_qs.n_whole; r0 = g_qs.n_release; memcpy(f0, g_qs.n_force, sizeof f0);
     pq0 = g_qs.n_pass_queued; po0 = g_qs.n_pass_old; pm0 = g_qs.n_pass_mem;
 }
+static qs_sub *worker_alloc_sub(int fast) {
+    qs_sub *q = fast ? vka_sub_alloc(&g_sub_pool) : (qs_sub *)calloc(1u, sizeof(*q));
+    assert(q != NULL);
+    return q;
+}
+static int worker_take_job(int qon, job_t *out) {
+    pthread_mutex_lock(&g_mu);
+    int have = 0;
+    for (;;) {
+        if (g_qout != g_qin) { *out = g_q[g_qout % NJOB]; have = 1; break; }
+        int parked = qon && qs_parked(&g_qs);
+        if (!parked) { g_ws.worker_idle_wait++; pthread_cond_wait(&g_cv, &g_mu); g_ws.worker_idle_wait--; continue; }
+        if (g_kick) break;
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 1000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        g_ws.worker_parked_wait++; pthread_cond_timedwait(&g_cv, &g_mu, &dl); g_ws.worker_parked_wait--;
+        break;
+    }
+    g_kick = 0;
+    pthread_mutex_unlock(&g_mu);
+    return have;
+}
+static void worker_run_job(job_t *j, int qon, int fast) {
+    if (j->kind == J_SUB && qon) {
+        qs_sub *q = worker_alloc_sub(fast);
+        q->serial = j->serial; q->fence = j->fence; q->frame = j->frame; q->origin_ll = j->origin_ll;
+        vka_sub_bind_job(q, &j->jb, fast);
+        vka_qtrace(QT_SUB, j->serial, j->fence, j->frame, (uint32_t)q->w0kind, q->w0mode, q->w0value, 0, q->w0word);
+        qs_submit(&g_qs, q); qs_poll(&g_qs); qs_publish();
+    } else if (j->kind == J_SUB) {
+        vka_rp_queue_activate(j->serial); vka_rp_set_queue_origin(j->origin_ll);
+        vka_gp_sub_frame(j->frame); vka_exec_sub_frame(j->frame); vka_rp_sub_begin();
+        for (int i = 0; i < j->jb.nh; i++) vka_rp_exec(vka_job_handle(&j->jb, i), j->fence);
+        vka_rp_sub_commit(j->fence);
+        vka_job_buf_free(&j->jb);
+    } else if (j->kind == J_WAIT && qon) {
+        qs_sub *q = worker_alloc_sub(fast);
+        q->serial = j->serial; q->wait_fence = j->fence; q->frame = j->frame;
+        vka_qtrace(QT_SUB, j->serial, 0, j->frame, 3, 0, 0, 0, NULL); qs_submit(&g_qs, q); qs_publish();
+    } else if (j->kind == J_PRESENT) {
+        if (qon) { qs_force_all(&g_qs, QS_WHY_PRESENT); qs_publish(); }
+        vka_qtrace(QT_PRESENT, 0, 0, j->ticket, 0, 0, 0, 0, NULL);
+        vka_present_fill(j->ticket, &j->t, j->period, j->has_crop ? j->crop : NULL);
+    } else if (j->kind == J_FORGET) {
+        if (qon) { qs_force_all(&g_qs, QS_WHY_FORGET); qs_publish(); }
+        vka_rp_queue_forget(j->serial);
+    } else if (j->kind == J_PROG_FORGET) {
+        if (qon) { qs_force_all(&g_qs, QS_WHY_PROG); qs_publish(); }
+        vka_rp_prog_forget((const prog_t *)(uintptr_t)j->serial);
+    }
+}
 static void *worker_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-replay"); vka_fp_host("vk-replay");
-    t_worker = 1; int qon = qs_on();
+    t_worker = 1; int qon = qs_on(), fast = vka_worker_fast_on();
     for (;;) {
-        uint64_t t0 = wns();
-        pthread_mutex_lock(&g_mu);
-        int have = 0; job_t j = {0};
-        for (;;) {
-            if (g_qout != g_qin) { j = g_q[g_qout % NJOB]; have = 1; break; }
-            int parked = qon && qs_parked(&g_qs);
-            if (!parked) { pthread_cond_wait(&g_cv, &g_mu); continue; }
-            if (g_kick) break;
-            // Parked with nothing to replay: a word may change through a plain store to mapped pool memory, and the park time runs: looked at every millisecond
-            struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 1000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-            pthread_cond_timedwait(&g_cv, &g_mu, &dl);
-            break;
-        }
-        g_kick = 0;
-        pthread_mutex_unlock(&g_mu);
+        uint64_t t0 = wns(); job_t j = {0}; int have = worker_take_job(qon, &j);
         uint64_t t1 = wns(), c1 = have && j.kind == J_SUB ? thread_cpu_ns() : 0; g_idle_ns += t1 - t0;
         if (qon) qs_step(have);
         if (!have) continue;
-        aff_check();
-        if (j.kind == J_SUB && qon) {
-            qs_sub *q = calloc(1, sizeof *q);
-            q->serial = j.serial; q->fence = j.fence; q->frame = j.frame; q->origin_ll = j.origin_ll; q->h = j.h; q->nh = j.nh; q->ws = j.ws; q->nws = j.nws;
-            q->w0kind = j.w0kind; q->w0word = j.w0word; q->w0mode = j.w0mode; q->w0value = j.w0value; q->w0fence = j.w0fence;
-            vka_qtrace(QT_SUB, j.serial, j.fence, j.frame, (uint32_t)j.w0kind, j.w0mode, j.w0value, 0, j.w0word);
-            qs_submit(&g_qs, q); qs_poll(&g_qs); qs_publish();
-        } else if (j.kind == J_SUB) {
-            vka_rp_queue_activate(j.serial); vka_rp_set_queue_origin(j.origin_ll);
-            vka_gp_sub_frame(j.frame); vka_exec_sub_frame(j.frame); vka_rp_sub_begin();
-            for (int i = 0; i < j.nh; i++) vka_rp_exec(j.h[i], j.fence);
-            vka_rp_sub_commit(j.fence);
-            free(j.h); free(j.ws);
-        } else if (j.kind == J_WAIT) {
-            if (qon) { qs_sub *q = calloc(1, sizeof *q); q->serial = j.serial; q->wait_fence = j.fence; q->frame = j.frame; vka_qtrace(QT_SUB, j.serial, 0, j.frame, 3, 0, 0, 0, NULL); qs_submit(&g_qs, q); qs_publish(); }
-        } else if (j.kind == J_PRESENT) {
-            // Presented after every submission before it was handed to the queue and signalled (vka_present_fill waits for the last value signalled): a park still open here
-            // is released first, so the frame holds the work the game submitted before the present
-            if (qon) { qs_force_all(&g_qs, QS_WHY_PRESENT); qs_publish(); }
-            vka_qtrace(QT_PRESENT, 0, 0, j.ticket, 0, 0, 0, 0, NULL);
-            vka_present_fill(j.ticket, &j.t, j.period, j.has_crop ? j.crop : NULL);
-        } else if (j.kind == J_FORGET) {
-            if (qon) { qs_force_all(&g_qs, QS_WHY_FORGET); qs_publish(); }
-            vka_rp_queue_forget(j.serial);
-        } else if (j.kind == J_PROG_FORGET) {   // the program's address (job_t.serial); a park still open is released first, as for a queue finalized
-            if (qon) { qs_force_all(&g_qs, QS_WHY_PROG); qs_publish(); }
-            vka_rp_prog_forget((const prog_t *)(uintptr_t)j.serial);
-        }
+        aff_check(); worker_run_job(&j, qon, fast);
         uint64_t t2 = wns(); g_busy_ns += t2 - t1; if (j.kind == J_SUB) { g_sub_ns += t2 - t1; atomic_fetch_add_explicit(&g_sub_all, t2 - t1, memory_order_relaxed); atomic_fetch_add_explicit(&g_sub_cpu_all, thread_cpu_ns() - c1, memory_order_relaxed); }
         if (j.kind == J_PRESENT && j.ticket % 300 == 0) {
             VLOG("replay worker up to present %llu: busy %.1f ms a frame (submissions %.1f), idle %.1f; the game waited %.1f ms a frame for the worker",
                  (unsigned long long)j.ticket, g_busy_ns / 300e6, g_sub_ns / 300e6, g_idle_ns / 300e6, g_room_ns / 300e6);
-            g_busy_ns = g_idle_ns = g_room_ns = g_sub_ns = 0;
-            if (qon) qs_stats(j.ticket); }
-        pthread_mutex_lock(&g_mu);
-        g_qout++; if (j.kind == J_PRESENT) g_pres_out++;
-        pthread_cond_broadcast(&g_cv);
-        pthread_mutex_unlock(&g_mu);
+            g_busy_ns = g_idle_ns = g_room_ns = g_sub_ns = 0; if (qon) qs_stats(j.ticket);
+        }
+        pthread_mutex_lock(&g_mu); g_qout++; if (j.kind == J_PRESENT) g_pres_out++;
+        vka_worker_wake_on_done(&g_ws, &g_cv, fast); pthread_mutex_unlock(&g_mu);
     }
     return NULL;
 }
@@ -359,37 +367,20 @@ static int up(void) {
     return 1;
 }
 static void push(const job_t *j) {
-    uint64_t t0 = wns();
+    uint64_t t0 = wns(); int fast = vka_worker_fast_on();
     pthread_mutex_lock(&g_mu);
-    while (g_qin - g_qout >= NJOB || (j->kind == J_PRESENT && g_pres_in - g_pres_out >= (uint64_t)g_frames)) pthread_cond_wait(&g_cv, &g_mu);
+    while (g_qin - g_qout >= NJOB || (j->kind == J_PRESENT && g_pres_in - g_pres_out >= (uint64_t)g_frames)) {
+        g_ws.prod_waiters++; pthread_cond_wait(&g_cv, &g_mu); g_ws.prod_waiters--;
+    }
     { uint64_t w = wns() - t0; g_room_ns += w; atomic_fetch_add_explicit(&g_room_all, w, memory_order_relaxed); }
     g_q[g_qin % NJOB] = *j; g_qin++; if (j->kind == J_PRESENT) g_pres_in++;
-    pthread_cond_broadcast(&g_cv);
+    vka_worker_wake_on_push(&g_ws, &g_cv, fast);
     pthread_mutex_unlock(&g_mu);
 }
 
 // Syncs fenced inside the submission's command lists (OP_FENCE_SYNC), given the submission's fence now: the lists are walked as exec walks them (jumps, calls). On the
 // way, each WAIT_SYNC record's sync as it stands at that point (a fence earlier in the same submission included): what the replay's wait looks at (vka_qsched.h qs_wait_sync)
-static void fence_syncs(const uint8_t *p, uint64_t fence, int depth, job_t *j, int *cap) {
-    for (;;) {
-        op_hdr h; memcpy(&h, p, sizeof h);
-        const void *a = p + 8;
-        if (h.op == OP_END) return;
-        if (h.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
-        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, a, 8); if (depth < 16) fence_syncs((const uint8_t *)(uintptr_t)t, fence, depth + 1, j, cap); }
-        if (h.op == OP_FENCE_SYNC) { sync_t *s; memcpy(&s, a, 8); s->fence = fence; s->fenced = 1; }
-        if (h.op == OP_WAIT_SYNC && j) {
-            const sync_t *s; memcpy(&s, a, 8);
-            if (j->nws == *cap) { *cap = *cap ? 2 * *cap : 8; j->ws = realloc(j->ws, (size_t)*cap * sizeof *j->ws); }
-            j->ws[j->nws++] = (qs_wsnap){p, s && s->fenced ? s->fence : 0};
-            if (!j->w0done) { j->w0done = 1; j->w0kind = 2; j->w0fence = j->ws[j->nws - 1].fence; }
-        }
-        if (h.op == OP_WAIT_EVENT && j && !j->w0done) { p_wait_event w; memcpy(&w, a, sizeof w); j->w0done = 1; if (w.val) { j->w0kind = 1; j->w0word = w.val; j->w0mode = w.mode; j->w0value = w.value; } }
-        if (h.op == OP_SIGNAL_EVENT && j) j->w0done = 1;   // a wait after a signal of its own: another queue may wait for that signal, so it is cut at the wait instead
-        if (h.size < 8) return;
-        p += h.size;
-    }
-}
+
 
 // ---------- The mtl_* calls of the host's submit (hle_nvn.c nvnQueueSubmitCommands) and present ----------
 // Replayed inline (DM_VK_WORKER=0, or no worker thread), on the game's thread: with the host's FPCR (vka_fpenv.h) for the recording and what the driver compiles
@@ -400,21 +391,26 @@ void mtl_queue_forget(uint64_t serial) { if (up()) { job_t j = {J_FORGET}; j.ser
 void mtl_prog_forget(const prog_t *p) { if (up()) { job_t j = {J_PROG_FORGET}; j.serial = (uint64_t)(uintptr_t)p; push(&j); } else { uint64_t f = vka_fp_host(NULL); vka_rp_prog_forget(p); vka_fp_back(f); } }
 void mtl_sub_begin(void) {
     if (!up()) { uint64_t f = vka_fp_host(NULL); vka_rp_sub_begin(); vka_fp_back(f); return; }
-    g_in_sub = 1; g_cur.nh = 0;
+    g_in_sub = 1; g_cur_nh = 0;
 }
 void mtl_exec(const uint8_t *handle) {
     if (!g_in_sub) { uint64_t f = vka_fp_host(NULL); vka_rp_exec(handle, 0); vka_fp_back(f); return; }
     if (!handle) return;
-    if (g_cur.nh == g_cur_cap) { g_cur_cap = g_cur_cap ? 2 * g_cur_cap : 64; g_cur.h = realloc(g_cur.h, (size_t)g_cur_cap * sizeof *g_cur.h); }
-    g_cur.h[g_cur.nh++] = handle;
+    if (g_cur_nh == g_cur_cap) {
+        int nc = g_cur_cap ? (2 * g_cur_cap) : 64;
+        const uint8_t **nb = (const uint8_t **)realloc((void *)g_cur_h, (size_t)nc * sizeof(*nb));
+        assert(nb != NULL); g_cur_cap = nc; g_cur_h = nb;
+    }
+    g_cur_h[g_cur_nh++] = handle;
 }
 uint64_t mtl_sub_commit(void) {
     if (!g_in_sub) { uint64_t f = vka_fp_host(NULL), r = vka_rp_sub_commit(0); vka_fp_back(f); return r; }
     g_in_sub = 0;
-    job_t j = {J_SUB}; j.serial = g_pend_serial; j.origin_ll = g_pend_origin; j.nh = g_cur.nh;
-    j.h = malloc((size_t)(j.nh ? j.nh : 1) * sizeof *j.h); if (j.nh) memcpy(j.h, g_cur.h, (size_t)j.nh * sizeof *j.h);
+    int fast = vka_worker_fast_on(); job_t j = {J_SUB};
+    j.serial = g_pend_serial; j.origin_ll = g_pend_origin;
+    assert(vka_job_set_handles(&j.jb, g_cur_h, g_cur_nh, fast) == 0);
     j.fence = vka_fence_next(); j.frame = vka_frame();
-    int cap = 0; for (int i = 0; i < j.nh; i++) fence_syncs(j.h[i], j.fence, 0, &j, &cap);
+    int cap = 0; for (int i = 0; i < j.jb.nh; i++) vka_worker_fence_syncs(vka_job_handle(&j.jb, i), j.fence, &j.jb, &cap, fast);
     push(&j);
     return j.fence;
 }
@@ -425,7 +421,7 @@ void mtl_queue_wait_fence(uint64_t serial, uint64_t fence) {
 }
 // nvnEventSignal wrote an event word on the CPU: a queue parked on it looks again
 // (a gate on the word opens now, from this thread)
-void mtl_event_cpu_signal(void) { if (g_up <= 0) return; vka_gate_poll(); pthread_mutex_lock(&g_mu); g_kick = 1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); }
+void mtl_event_cpu_signal(void) { if (g_up <= 0) return; vka_gate_poll(); pthread_mutex_lock(&g_mu); g_kick = 1; vka_worker_wake_on_kick(&g_ws, &g_cv, vka_worker_fast_on()); pthread_mutex_unlock(&g_mu); }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (!up()) { uint64_t f = vka_fp_host(NULL), r = vka_present_inline(t, period_s, crop); vka_fp_back(f); return r; }
     job_t j = {J_PRESENT}; j.ticket = vka_present_reserve(); j.t = *t; j.period = period_s; j.has_crop = crop != NULL; if (crop) memcpy(j.crop, crop, sizeof j.crop);
