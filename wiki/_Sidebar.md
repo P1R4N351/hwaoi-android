@@ -1,4 +1,4 @@
-**Banana Native**
+**AoI Native** · [Support](https://github.com/P1R4N351/hwaoi-android#support)
 
 [Home](Home)
 

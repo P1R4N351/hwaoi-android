@@ -36,5 +36,5 @@ A new version of the app may come with new shaders. What happens depends on what
   row at the top has an **Update shaders** button and **Not now** (or its button reads **Prepare shaders**, or **Storage › Prepare again**). The update is optional. A pack made on a
   computer can be made again there and imported instead.
 
-The app's in-app updates (Settings › **Check for updates**) download new versions from the project's
-releases only: [git.eden-emu.dev](https://git.eden-emu.dev/moceure/BananaNative/releases).
+The app's in-app updates (Settings › **Check for updates**) download new versions from this repository's
+releases only: [Releases](https://github.com/P1R4N351/hwaoi-android/releases).
