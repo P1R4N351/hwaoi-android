@@ -28,6 +28,7 @@
 #include "vka_view_ub_fast.h"
 #include "vka_treg_ub_fast.h"
 #include "vka_wk_prep_fast.h"
+#include "vka_wset_vin_fast.h"
 _Static_assert(sizeof(((vka_dstate *)0)->ubo_dirty) == 32 && VKA_NSTAGE == 8 && sizeof(p_scissor) == 16, "inst_fast sizes");
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
@@ -1509,7 +1510,7 @@ VkImageView placeholder(uint8_t dim, int storage) {
 static uint64_t g_pt_last, g_pt[9], g_ps[6], g_pt_n, g_pt_tot; static int g_pt_ph;
 static inline uint64_t cntvct(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
 // ---------- Set 0 from the walk ----------
-typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint64_t ad[512]; uint8_t dim[512]; uint32_t n; } writes_t;   // ad: a guest buffer's address (0 = other); dim: the shape the shader declares (set_no_nulls)
+typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint64_t ad[512]; uint8_t dim[512]; uint32_t n; vka_wset_fast_t wf; } writes_t;   // ad: a guest buffer's address (0 = other); dim: the shape the shader declares (set_no_nulls)
 static writes_t g_w;
 // A texture or image read by a shader that declares it in another numeric class (float / uint / sint) than the view the game binds: logged once per shader, stage and binding
 // (the first 64), with the texture. Such a binding is read through a view of the shader's class of the same texel size (vka_tex.c class_twin) unless its module is retyped
@@ -1549,75 +1550,71 @@ static int support_desc(const vka_dstate *d, int st, const vka_shader *sh, VkDes
 }
 static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
+VkImageView placeholder(uint8_t dim, int storage);
+static int stage_write_buf(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *ri, uint32_t k, int pool, c0_at *c0) {
+    VkDescriptorBufferInfo *bi = &g_w.bi[k]; int storage = ri->desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ok = 1;
+    switch (ri->what) {
+    case VKA_R_BUF: ok = storage ? ssbo_desc(ri->addr, ri->size, bi) : ubo_desc(ri->addr, ri->size, bi);
+        if (ok && storage && (ri->flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(ri->addr, bi->range);
+        if (ok && storage) sb_peek_note(sh->key, st, ri); else if (ok) ub_peek_note(sh->key, st, ri);
+        if (ok) sb_watch_use(sh->key, st, ri, storage, bi); break;
+    case VKA_R_C1: if (sh->c1_len) *bi = (VkDescriptorBufferInfo){sh->c1.buf, sh->c1.off, (sh->c1_len + 15) & ~(VkDeviceSize)15}; else ok = 0; break;
+    case VKA_R_SUPPORT: if (!support_desc(d, st, sh, bi)) return 0; break;
+    case VKA_R_DRV: { uint64_t td_ = g_prof ? cntvct() : 0; if (!drv_seg(d, st, ri->bank, pool, bi, c0)) return 0; if (g_prof) g_ps[3] += cntvct() - td_; break; }
+    case VKA_R_GMEM_MAP: ok = gmem_map(bi); break;
+    case VKA_R_GMEM_LOG: ok = gmem_log(bi); break;
+    case VKA_R_SHARED_SPILL: ok = st == 5 && g_spill_range && g_spill.buf; if (ok) *bi = (VkDescriptorBufferInfo){g_spill.buf, g_spill.off, g_spill_range}; break;
+    default: ok = 0; break;
+    }
+    if (!ok) { if (V.null_desc) *bi = (VkDescriptorBufferInfo){VK_NULL_HANDLE, 0, VK_WHOLE_SIZE}; else *bi = (VkDescriptorBufferInfo){storage ? g_sink.buf : g_zero.buf, storage ? g_sink.off : g_zero.off, 65536}; }
+    g_w.w[k].pBufferInfo = bi;
+    if (g_w.wf.ready) vka_wset_put_buf(&g_w.wf, k, ri->binding, ri->elem, ri->desc, (uint64_t)(uintptr_t)bi->buffer, (uint64_t)bi->offset, (uint64_t)bi->range);
+    return 1;
+}
+static int stage_write_img(int st, const vka_shader *sh, const vka_res *ri, uint32_t k) {
+    int storage = ri->desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; uint64_t ti_ = g_prof ? cntvct() : 0;
+    VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
+    if (ri->desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
+        int tid = ri->what == VKA_R_TEX || ri->what == VKA_R_IMG ? ri->tid : 0;
+        if (tid && vka_tex_id_is_buffer(tid)) {
+            if (!storage) v = vka_tbuf_image_view(tid, ri->dim);
+            else { static _Atomic int kk; if (atomic_fetch_add(&kk, 1) < 8) VRED("shader %016llx binding %u: buffer texture ID %d bound as a storage image: not done, it reads and writes nothing", (unsigned long long)sh->key, ri->binding, tid); }
+            tid = 0;
+        } else if (tid) v = vka_tex_id_view_rec(tid, g_cb, ri->dim, wbf_view_of_binding(storage, ri->flags, DMSH_VK_BF_RW), &lay);
+        if (tid && v) class_note(sh, st, ri, tid, storage);
+        if (tid) tex_peek(sh->key, st, ri, v, storage);
+        int dd = ri->dim & DMSH_VK_DIM_MASK, tt = tid && !v ? vka_tex_id_target(tid) : -1;
+        if (tid && !v && (dd == 2 || dd == 3) && (tt == NVN_TEXTURE_TARGET_2D || tt == NVN_TEXTURE_TARGET_2D_ARRAY)) {
+            static _Atomic int noted; if (!atomic_exchange(&noted, 1)) { char why[320]; vka_tex_id_desc(tid, why, sizeof why); VLOG("%s binding fallback: shader %016llx binding %u, texture ID %d is a 2D texture (%s): it reads as zeros (the shader may leave it unused)", dd == 2 ? "3D" : "cube", (unsigned long long)sh->key, ri->binding, tid, why); }
+        } else if (tid && !v) { static _Atomic int nm; if (atomic_fetch_add(&nm, 1) < 8) { char why[320]; vka_tex_id_desc(tid, why, sizeof why); VRED("shader %016llx binding %u: texture ID %d has no view of shape %#x%s: it reads as unbound (%s)", (unsigned long long)sh->key, ri->binding, tid, ri->dim, storage ? " (storage)" : "", why); } }
+        if (!v && !V.null_desc) v = placeholder(ri->dim, storage);
+        if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", ri->dim); g_skip_dev[VKS_FEATURE]++; return 0; }
+    }
+    if (ri->desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || ri->desc == VK_DESCRIPTOR_TYPE_SAMPLER) { s = ri->sid ? vka_samp_id_rec(ri->sid) : VK_NULL_HANDLE; if (!s) s = vka_samp_default(); }
+    g_w.ii[k] = (VkDescriptorImageInfo){s, v, lay}; g_w.w[k].pImageInfo = &g_w.ii[k];
+    if (g_w.wf.ready) vka_wset_put_img(&g_w.wf, k, ri->binding, ri->elem, ri->desc, (uint64_t)(uintptr_t)s, (uint64_t)(uintptr_t)v, (uint64_t)lay, ri->desc == VK_DESCRIPTOR_TYPE_SAMPLER);
+    if (g_prof) { g_ps[4] += cntvct() - ti_; g_ps[5]++; }
+    return 1;
+}
 static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
     for (int i = 0; i < n; i++) {
         if (g_w.n == 512) { VRED_ONCE("more than 512 descriptors in one draw"); return 0; }
         uint32_t k = g_w.n;
-        VkWriteDescriptorSet *w = &g_w.w[k]; VkDescriptorBufferInfo *bi = &g_w.bi[k]; VkDescriptorImageInfo *ii = &g_w.ii[k];
         g_w.ad[k] = r[i].what == VKA_R_BUF ? r[i].addr : 0; g_w.dim[k] = r[i].dim;
-        *w = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = r[i].binding, .dstArrayElement = r[i].elem, .descriptorCount = 1, .descriptorType = (VkDescriptorType)r[i].desc};
-        int ok = 1;
+        g_w.w[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = r[i].binding, .dstArrayElement = r[i].elem, .descriptorCount = 1, .descriptorType = (VkDescriptorType)r[i].desc};
         switch (r[i].desc) {
-        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
-            int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            switch (r[i].what) {
-            case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
-                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
-                if (ok && storage) sb_peek_note(sh->key, st, &r[i]);
-                if (ok && !storage) ub_peek_note(sh->key, st, &r[i]);
-                if (ok) sb_watch_use(sh->key, st, &r[i], storage, bi);
-                break;
-            case VKA_R_C1: if (sh->c1_len) *bi = (VkDescriptorBufferInfo){sh->c1.buf, sh->c1.off, (sh->c1_len + 15) & ~(VkDeviceSize)15}; else ok = 0; break;
-            case VKA_R_SUPPORT: if (!support_desc(d, st, sh, bi)) return 0; break;
-            case VKA_R_DRV: { uint64_t td_ = g_prof ? cntvct() : 0;
-                if (!drv_seg(d, st, r[i].bank, pool, bi, c0)) return 0;
-                if (g_prof) g_ps[3] += cntvct() - td_;
-                break; }
-            case VKA_R_GMEM_MAP: ok = gmem_map(bi); break;
-            case VKA_R_GMEM_LOG: ok = gmem_log(bi); break;
-            case VKA_R_SHARED_SPILL: ok = st == 5 && g_spill_range && g_spill.buf; if (ok) *bi = (VkDescriptorBufferInfo){g_spill.buf, g_spill.off, g_spill_range}; break;
-            default: ok = 0; break;
-            }
-            if (!ok) { if (V.null_desc) *bi = (VkDescriptorBufferInfo){VK_NULL_HANDLE, 0, VK_WHOLE_SIZE}; else *bi = (VkDescriptorBufferInfo){storage ? g_sink.buf : g_zero.buf, storage ? g_sink.off : g_zero.off, 65536}; }
-            w->pBufferInfo = bi;
-            break; }
-        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
-            int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; uint64_t ti_ = g_prof ? cntvct() : 0;
-            VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
-            if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
-                int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
-                if (tid && vka_tex_id_is_buffer(tid)) {   // a buffer texture read as an image: its copy (vka_tbuf.c, made in make_images); as a storage image, not done
-                    if (!storage) v = vka_tbuf_image_view(tid, r[i].dim);
-                    else { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 8) VRED("shader %016llx binding %u: buffer texture ID %d bound as a storage image: not done, it reads and writes nothing", (unsigned long long)sh->key, r[i].binding, tid); }
-                    if (!v && !V.null_desc) v = placeholder(r[i].dim, storage);
-                    if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", r[i].dim); g_skip_dev[VKS_FEATURE]++; return 0; }
-                    tid = 0;
-                } else if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, wbf_view_of_binding(storage, r[i].flags, DMSH_VK_BF_RW), &lay);   // (a shader image only read: not a GPU write)
-                if (tid && v) class_note(sh, st, &r[i], tid, storage);
-                if (tid) tex_peek(sh->key, st, &r[i], v, storage);
-                // A 2D texture in a 3D or cube slot: what the game leaves bound where a shader's branch does not sample (DKB's materials keep a 1x1 2D texture in their volume slot 12).
-                // It reads as unbound, zeros, as nvn_mtl.m's zero 3D / zero cube fallback does; noted once. Other mismatches are reported
-                int dd = r[i].dim & DMSH_VK_DIM_MASK, tt = tid && !v ? vka_tex_id_target(tid) : -1;
-                if (tid && !v && (dd == 2 || dd == 3) && (tt == NVN_TEXTURE_TARGET_2D || tt == NVN_TEXTURE_TARGET_2D_ARRAY)) {
-                    static _Atomic int noted; if (!atomic_exchange(&noted, 1)) { char why[320]; vka_tex_id_desc(tid, why, sizeof why);
-                        VLOG("%s binding fallback: shader %016llx binding %u, texture ID %d is a 2D texture (%s): it reads as zeros (the shader may leave it unused)", dd == 2 ? "3D" : "cube", (unsigned long long)sh->key, r[i].binding, tid, why); }
-                } else if (tid && !v) { static _Atomic int nm; if (atomic_fetch_add(&nm, 1) < 8) { char why[320]; vka_tex_id_desc(tid, why, sizeof why);
-                    VRED("shader %016llx binding %u: texture ID %d has no view of shape %#x%s: it reads as unbound (%s)", (unsigned long long)sh->key, r[i].binding, tid, r[i].dim, storage ? " (storage)" : "", why); } }
-                if (!v && !V.null_desc) v = placeholder(r[i].dim, storage);
-                if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", r[i].dim); g_skip_dev[VKS_FEATURE]++; return 0; }
-            }
-            if (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLER) {
-                s = r[i].sid ? vka_samp_id_rec(r[i].sid) : VK_NULL_HANDLE;
-                if (!s) s = vka_samp_default();
-            }
-            *ii = (VkDescriptorImageInfo){s, v, lay};
-            w->pImageInfo = ii; if (g_prof) { g_ps[4] += cntvct() - ti_; g_ps[5]++; }
-            break; }
-        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {   // a buffer texture over guest memory (vka_tbuf.c)
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            if (!stage_write_buf(d, st, sh, &r[i], k, pool, c0)) return 0;
+            break;
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            if (!stage_write_img(st, sh, &r[i], k)) return 0;
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
             VkBufferView bv = (r[i].what == VKA_R_TBUF || r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].tid ? vka_tbuf_view(r[i].tid, storage) : VK_NULL_HANDLE;
             if (!bv && !V.null_desc) { VRED_ONCE("an unbound texel buffer and no null descriptors: the draw is skipped"); g_skip_dev[VKS_FEATURE]++; return 0; }
-            g_w.bv[k] = bv; w->pTexelBufferView = &g_w.bv[k];
+            g_w.bv[k] = bv; g_w.w[k].pTexelBufferView = &g_w.bv[k];
+            if (g_w.wf.ready) vka_wset_put_tbuf(&g_w.wf, k, r[i].binding, r[i].elem, r[i].desc, (uint64_t)(uintptr_t)bv);
             break; }
         default: VRED_ONCE("descriptor type %u in a binding record", r[i].desc); return 0;
         }
@@ -1743,6 +1740,12 @@ static int push_fill_from(int c, uint32_t from) {
 static int push_same_fast(int c, VkPipelineLayout layout) {
     size_t need = 2 + 4 * (size_t)g_w.n;
     if (!vka_pd_grow(&g_pd[c].w, &g_pd[c].cap, need)) return (pd_clear(c), 0);
+    if (vka_wset_vin_fast_on() && g_w.wf.ready) {
+        if (vka_wset_pd_match_or_copy(&g_w.wf, g_w.n, (uint64_t)(uintptr_t)layout, g_pd[c].w, &g_pd[c].n)) {
+            g_pd_skip++; g_pd_skip_all++; return 1;
+        }
+        g_pd_push++; g_pd_push_all++; return 0;
+    }
     if (g_pd[c].n == need && g_pd[c].w[0] == (uint64_t)layout && g_pd[c].w[1] == g_w.n) {
         for (uint32_t i = 0; i < g_w.n; i++) {
             const VkWriteDescriptorSet *w = &g_w.w[i];
@@ -1803,7 +1806,28 @@ static int g_sets_dry, g_dry_pool;   // DM_VK_INSTANCE: bind_sets only builds th
 static void set_no_nulls(void) {
     static int on = -1; if (on < 0) on = !VKA_ENV("DM_VK_SET_NULLS", 0);
     if (!on || !V.null_desc) return;   // (without null descriptors stage_writes already wrote placeholders)
-    VkImageView placeholder(uint8_t dim, int storage);
+    if (vka_wset_vin_fast_on() && g_w.wf.ready) {
+        if (!g_w.wf.any_null) return;
+        uint32_t words = g_w.n ? ((g_w.n + 63u) >> 6) : 0u;
+        for (uint32_t wi = 0u; wi < words; wi++) {
+            for (uint64_t m = g_w.wf.null_img_m[wi]; m; m &= m - 1u) {
+                uint32_t k = (wi << 6) + (uint32_t)__builtin_ctzll(m);
+                if (k >= g_w.n) continue;
+                VkImageView v = placeholder(g_w.dim[k], g_w.w[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+                if (v) { g_w.ii[k].imageView = v; g_w.ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL; g_w.w[k].pImageInfo = &g_w.ii[k]; vka_wset_patch_img(&g_w.wf, k, (uint64_t)(uintptr_t)v, VK_IMAGE_LAYOUT_GENERAL); }
+            }
+            for (uint64_t m = g_w.wf.null_buf_m[wi]; m; m &= m - 1u) {
+                uint32_t k = (wi << 6) + (uint32_t)__builtin_ctzll(m);
+                if (k >= g_w.n) continue;
+                int st = g_w.w[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                VkBuffer nb = st ? g_sink.buf : g_zero.buf; VkDeviceSize no = st ? g_sink.off : g_zero.off;
+                g_w.bi[k] = (VkDescriptorBufferInfo){nb, no, 65536}; g_w.w[k].pBufferInfo = &g_w.bi[k];
+                vka_wset_patch_buf(&g_w.wf, k, (uint64_t)(uintptr_t)nb, (uint64_t)no, 65536u);
+            }
+            g_w.wf.null_img_m[wi] = 0u; g_w.wf.null_buf_m[wi] = 0u;
+        }
+        g_w.wf.any_null = 0u; return;
+    }
     for (uint32_t k = 0; k < g_w.n; k++) {
         VkWriteDescriptorSet *w = &g_w.w[k];
         if (w->pImageInfo && w->descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER && !w->pImageInfo->imageView) {
@@ -1819,6 +1843,7 @@ static int dset_writes_hash(VkDescriptorSetLayout set0, uint64_t h[2]) {
     uint64_t hdr[2] = {(uint64_t)(uintptr_t)set0, g_w.n};
     h[0] = 0xcbf29ce484222325ull; h[1] = 0x6a09e667f3bcc909ull;
     vka_hash_mix64(h, hdr, 2);
+    if (vka_wset_vin_fast_on() && g_w.wf.ready) { if (g_w.n) vka_hash_mix64(h, g_w.wf.pk, 4u * (size_t)g_w.n); return 1; }
     for (uint32_t i = 0; i < g_w.n; i++) {
         const VkWriteDescriptorSet *w = &g_w.w[i];
         if (w->descriptorCount != 1) return 0;
@@ -1873,7 +1898,8 @@ static int sets_push(const vka_layout *lay, VkPipelineBindPoint bp, int any_pool
 }
 static void memu_bind_arena(void);
 static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, VkPipelineBindPoint bp, c0_at *c0) {
-    g_w.n = 0;
+    uint32_t prev_wn = g_w.n; g_w.n = 0;
+    if (vka_wset_vin_fast_on()) vka_wset_reset(&g_w.wf, prev_wn); else g_w.wf.ready = 0;
     int any_pool = 0;
     uint64_t t1_ = g_prof ? cntvct() : 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
@@ -1893,6 +1919,7 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
         uint32_t k = g_w.n++;
         g_w.bi[k] = (VkDescriptorBufferInfo){cs.buf, cs.off, n};
         g_w.w[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = VKA_GS_CLAIM_BINDING, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &g_w.bi[k]};
+        if (g_w.wf.ready) vka_wset_put_buf(&g_w.wf, k, VKA_GS_CLAIM_BINDING, 0u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint64_t)(uintptr_t)cs.buf, (uint64_t)cs.off, (uint64_t)n);
     }
     if (sh[0] && sh[0]->memu == 2 && bp == VK_PIPELINE_BIND_POINT_GRAPHICS) memu_bind_arena();   // a mesh draw through compute: the arena it draws (vka_memu_draw.inc)
     if (g_sets_dry) { g_dry_pool = any_pool; return 1; }   // DM_VK_INSTANCE: the writes only (sets_push binds them)
@@ -2039,32 +2066,37 @@ static int resolve(const prog_t *p, int st, vka_shader **out, unsigned *bad) {
 // With VK_EXT_vertex_input_dynamic_state the descriptions are set per draw, else they go into the pipeline key
 static struct { VkVertexInputBindingDescription2EXT b[33]; VkVertexInputAttributeDescription2EXT a[32]; uint32_t nb, na, used, zb; int zero; } VI;
 static uint32_t g_vi_ser;   // raised at each vin_build: VI may have changed
+static void vin_add_loc(const vka_dstate *d, const vka_shader *vs, uint32_t loc, vka_gkey *k) {
+    int want = (int)(vs->e->vin_types >> (2 * loc) & 3), changed = 0, retype = 0;
+    const va_st *a = loc < 16 && (int)loc < d->nattr ? &d->attr[loc] : NULL;
+    VkFormat f = a && a->fmt ? vin_format(a->fmt, want, &changed, &retype) : VK_FORMAT_UNDEFINED;
+    if (retype == DMSH_VK_TYPE_UINT) k->vin_u |= 1u << loc; else if (retype == DMSH_VK_TYPE_SINT) k->vin_s |= 1u << loc;
+    if (a && a->fmt && !f) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("vertex attribute format %#x is not mapped: the input reads zeros", a->fmt); }
+    if (changed) { static uint64_t seen[4]; unsigned b = a->fmt & 255; if (!(seen[b >> 6] >> (b & 63) & 1)) { seen[b >> 6] |= 1ull << (b & 63);
+        VRED("vertex attribute format %#x feeds a %s input: bound as VkFormat %d of that class (values may differ from Maxwell's fetch)", a->fmt, want == 0 ? "float" : want == 1 ? "sint" : "uint", f); } }
+    if (!f) {
+        f = want == DMSH_VK_TYPE_UINT ? VK_FORMAT_R32G32B32A32_UINT : want == DMSH_VK_TYPE_SINT ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        VI.a[VI.na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, loc, VI.zb, f, 0}; VI.zero = 1; return;
+    }
+    uint32_t st = a->stream & 15;
+    VI.a[VI.na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, loc, st, f, a->offset};
+    VI.used |= 1u << st;
+}
+static void vin_add_stream(const vka_dstate *d, uint32_t st) {
+    uint32_t div = d->stream[st].divisor;
+    if (div > 1 && !V.divisor) { VRED_ONCE("instance divisor %u and no vertexAttributeInstanceRateDivisor: drawn with divisor 1", div); div = 1; }
+    VI.b[VI.nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, st, d->stream[st].stride,
+                                                           div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, div ? div : 1};
+}
 static void vin_build(const vka_dstate *d, const vka_shader *vs, vka_gkey *k) {
     VI.nb = VI.na = VI.used = 0; VI.zero = 0; g_vi_ser++;
-    VI.zb = V.max_vin_bindings > 32 ? 31 : V.max_vin_bindings > 16 ? V.max_vin_bindings - 1 : 15;   // the zero buffer's binding: past the 16 streams when the device has room
-    for (uint32_t loc = 0; loc < 32; loc++) {
-        if (!(vs->e->vin_mask >> loc & 1)) continue;
-        int want = (int)(vs->e->vin_types >> (2 * loc) & 3), changed = 0, retype = 0;
-        const va_st *a = loc < 16 && (int)loc < d->nattr ? &d->attr[loc] : NULL;
-        VkFormat f = a && a->fmt ? vin_format(a->fmt, want, &changed, &retype) : VK_FORMAT_UNDEFINED;
-        if (retype == DMSH_VK_TYPE_UINT) k->vin_u |= 1u << loc; else if (retype == DMSH_VK_TYPE_SINT) k->vin_s |= 1u << loc;
-        if (a && a->fmt && !f) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("vertex attribute format %#x is not mapped: the input reads zeros", a->fmt); }
-        if (changed) { static uint64_t seen[4]; unsigned b = a->fmt & 255; if (!(seen[b >> 6] >> (b & 63) & 1)) { seen[b >> 6] |= 1ull << (b & 63);
-            VRED("vertex attribute format %#x feeds a %s input: bound as VkFormat %d of that class (values may differ from Maxwell's fetch)", a->fmt, want == 0 ? "float" : want == 1 ? "sint" : "uint", f); } }
-        if (!f) {
-            f = want == DMSH_VK_TYPE_UINT ? VK_FORMAT_R32G32B32A32_UINT : want == DMSH_VK_TYPE_SINT ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT;
-            VI.a[VI.na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, loc, VI.zb, f, 0};
-            VI.zero = 1; continue;
-        }
-        uint32_t st = a->stream & 15;
-        VI.a[VI.na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, loc, st, f, a->offset};
-        VI.used |= 1u << st;
-    }
-    for (uint32_t st = 0; st < 16; st++) if (VI.used >> st & 1) {
-        uint32_t div = d->stream[st].divisor;
-        if (div > 1 && !V.divisor) { VRED_ONCE("instance divisor %u and no vertexAttributeInstanceRateDivisor: drawn with divisor 1", div); div = 1; }
-        VI.b[VI.nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, st, d->stream[st].stride,
-                                                               div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, div ? div : 1};
+    VI.zb = V.max_vin_bindings > 32 ? 31 : V.max_vin_bindings > 16 ? V.max_vin_bindings - 1 : 15;
+    if (vka_wset_vin_fast_on()) {
+        for (uint32_t m = vs->e->vin_mask; m; m &= m - 1u) vin_add_loc(d, vs, (uint32_t)__builtin_ctz(m), k);
+        for (uint32_t m = VI.used & 0xffffu; m; m &= m - 1u) vin_add_stream(d, (uint32_t)__builtin_ctz(m));
+    } else {
+        for (uint32_t loc = 0; loc < 32; loc++) if (vs->e->vin_mask >> loc & 1) vin_add_loc(d, vs, loc, k);
+        for (uint32_t st = 0; st < 16; st++) if (VI.used >> st & 1) vin_add_stream(d, st);
     }
     if (VI.zero) VI.b[VI.nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, VI.zb, 0, VK_VERTEX_INPUT_RATE_VERTEX, 1};
     if (!V.vin_dyn) {
@@ -2118,7 +2150,14 @@ static void vin_bind(const vka_dstate *d) {
     uint32_t need_u = VI.used; int need_z = VI.zero;
     if (fast && !vka_vinfast_need_streams(&g_vbc_fast, VB.valid, d->s_vbuf, mg, VI.used, VI.zero, VI.zb, &need_u, &need_z)) { VB.valid = 1; return; }
     VkBuffer rb[33]; VkDeviceSize ro[33], rs[33]; uint32_t n0 = 0, nn = 0;
-    for (uint32_t st = 0; st < 16; st++) if (need_u >> st & 1) {
+    if (vka_wset_vin_fast_on()) {
+        for (uint32_t m = need_u & 0xffffu; m; m &= m - 1u) {
+            uint32_t st = (uint32_t)__builtin_ctz(m); VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
+            uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
+            if (addr) { VkBuffer cb; VkDeviceSize co; uint64_t run = addr_run_fast(addr, size ? size : 1ull << 30, &cb, &co); if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
+            vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
+        }
+    } else for (uint32_t st = 0; st < 16; st++) if (need_u >> st & 1) {
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
         if (addr) { VkBuffer cb; VkDeviceSize co; uint64_t run = addr_run_fast(addr, size ? size : 1ull << 30, &cb, &co);
@@ -2232,16 +2271,26 @@ static uint64_t g_inst_runs, g_inst_joined, g_inst_falls, g_inst_fast;
 static int inst_snap(isnap *s, VkPipeline p, VkBuffer ib, VkDeviceSize io, VkIndexType it, const p_draw_idx *di, const vka_dstate *d) {
     if (g_w.n > 64) return s->valid = 0;
     s->p = p; s->ib = ib; s->io = io; s->it = it; s->cnt = (uint32_t)di->count; s->bv = di->base_vertex; s->nw = g_w.n;
-    for (uint32_t i = 0; i < g_w.n; i++) {
-        const VkWriteDescriptorSet *w = &g_w.w[i]; ikw *k = &s->w[i]; k->binding = w->dstBinding | w->dstArrayElement << 16; k->type = w->descriptorType;
-        if (w->pBufferInfo) { k->a = (uint64_t)w->pBufferInfo->buffer; k->b = w->pBufferInfo->offset; k->c = w->pBufferInfo->range; }
-        else if (w->pImageInfo) { k->a = (uint64_t)w->pImageInfo->sampler; k->b = (uint64_t)w->pImageInfo->imageView; k->c = w->pImageInfo->imageLayout; }
-        else { k->a = w->pTexelBufferView ? (uint64_t)*w->pTexelBufferView : 0; k->b = k->c = 0; }
-        s->ad[i] = g_w.ad[i];
+    if (vka_wset_vin_fast_on() && g_w.wf.ready) {
+        for (uint32_t i = 0; i < g_w.n; i++) {
+            const uint64_t *pk = &g_w.wf.pk[(size_t)i * 4u]; ikw *k = &s->w[i];
+            k->binding = (uint32_t)pk[0]; k->type = (uint32_t)(pk[0] >> 32) & 0xffffu;
+            k->a = pk[1]; k->b = pk[2]; k->c = pk[3]; s->ad[i] = g_w.ad[i];
+        }
+        memset(s->va, 0, sizeof s->va); memset(s->vs, 0, sizeof s->vs);
+        for (uint32_t m = VI.used & 0xffffu; m; m &= m - 1u) { int st = __builtin_ctz(m); s->va[st] = d->vbuf[st].address; s->vs[st] = d->vbuf[st].size; }
+    } else {
+        for (uint32_t i = 0; i < g_w.n; i++) {
+            const VkWriteDescriptorSet *w = &g_w.w[i]; ikw *k = &s->w[i]; k->binding = w->dstBinding | w->dstArrayElement << 16; k->type = w->descriptorType;
+            if (w->pBufferInfo) { k->a = (uint64_t)w->pBufferInfo->buffer; k->b = w->pBufferInfo->offset; k->c = w->pBufferInfo->range; }
+            else if (w->pImageInfo) { k->a = (uint64_t)w->pImageInfo->sampler; k->b = (uint64_t)w->pImageInfo->imageView; k->c = w->pImageInfo->imageLayout; }
+            else { k->a = w->pTexelBufferView ? (uint64_t)*w->pTexelBufferView : 0; k->b = k->c = 0; }
+            s->ad[i] = g_w.ad[i];
+        }
+        for (int st = 0; st < 16; st++) { s->va[st] = VI.used >> st & 1 ? d->vbuf[st].address : 0; s->vs[st] = VI.used >> st & 1 ? d->vbuf[st].size : 0; }
     }
     s->nb = VI.nb; s->na = VI.na; s->used = VI.used; s->zb = VI.zb; s->zero = VI.zero;
     memcpy(s->b, VI.b, VI.nb * sizeof *VI.b); memcpy(s->a, VI.a, VI.na * sizeof *VI.a);
-    for (int st = 0; st < 16; st++) { s->va[st] = VI.used >> st & 1 ? d->vbuf[st].address : 0; s->vs[st] = VI.used >> st & 1 ? d->vbuf[st].size : 0; }
     return s->valid = 1;
 }
 // The same draw as snapshot s apart from its descriptors: index range, base vertex, vertex input and streams
@@ -2259,7 +2308,15 @@ static int inst_same_draw(const isnap *s, VkBuffer ib, VkDeviceSize io, VkIndexT
 static int inst_cmp(const isnap *s, uint32_t *wv, uint32_t *wp, int64_t *delta, int fixed) {
     if (g_w.n != s->nw) return 0;
     int nd = 0; uint32_t m[2] = {0, 0};
-    for (uint32_t i = 0; i < g_w.n; i++) {
+    if (vka_wset_vin_fast_on() && g_w.wf.ready) {
+        for (uint32_t i = 0; i < g_w.n; i++) {
+            const uint64_t *pk = &g_w.wf.pk[(size_t)i * 4u]; const ikw *k = &s->w[i]; uint32_t dt = (uint32_t)(pk[0] >> 32) & 0xffffu;
+            if ((uint32_t)pk[0] != k->binding || dt != k->type) return 0;
+            if (pk[1] == k->a && pk[2] == k->b && pk[3] == k->c) continue;
+            if (dt != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || pk[1] != k->a || pk[3] != k->c || nd == 2) return 0;
+            m[nd++] = i;
+        }
+    } else for (uint32_t i = 0; i < g_w.n; i++) {
         const VkWriteDescriptorSet *w = &g_w.w[i]; const ikw *k = &s->w[i];
         if ((w->dstBinding | w->dstArrayElement << 16) != k->binding || w->descriptorType != k->type) return 0;
         uint64_t a, b, c;
@@ -2466,15 +2523,22 @@ static int vegetation_cut(const vka_dstate *d, vka_shader *const *sh) {
     unsigned i = 0;
     while (i < DM_GAME_NMESH_VEGETATION_CUT && keys[i] != sh[7]->key) i++;
     if (i == DM_GAME_NMESH_VEGETATION_CUT) return 0;
+    int fast_if = vka_wset_vin_fast_on();
     for (int stage = 0; stage < VKA_NSTAGE; stage++) {
-        const vka_shader *shader = sh[stage];
+        vka_shader *shader = sh[stage];
         if (!shader) continue;
+        if (fast_if) {
+            uint8_t fl = __atomic_load_n(&shader->iface_flags, __ATOMIC_RELAXED);
+            if (fl & VKA_SH_IF_VEG_DONE) { if (!(fl & VKA_SH_IF_VEG_OK)) return 0; continue; }
+        }
+        int ok = 1;
         for (unsigned j = 0; j < shader->e->bind_count; j++) {
             const dmsh_vk_bind *binding = &shader->b[j];
             if ((binding->flags & (DMSH_VK_BF_RW | DMSH_VK_BF_ATOMIC | DMSH_VK_BF_NOSLOT)) ||
-                binding->kind == DMSH_VK_KIND_GMEM_LOG || binding->kind == DMSH_VK_KIND_UNKNOWN)
-                return 0;
+                binding->kind == DMSH_VK_KIND_GMEM_LOG || binding->kind == DMSH_VK_KIND_UNKNOWN) { ok = 0; break; }
         }
+        __atomic_fetch_or(&shader->iface_flags, (uint8_t)(VKA_SH_IF_VEG_DONE | (ok ? VKA_SH_IF_VEG_OK : 0u)), __ATOMIC_RELAXED);
+        if (!ok) return 0;
     }
     static uint64_t omitted;
     if (++omitted == 1 || omitted % 4096 == 0)
@@ -2973,6 +3037,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
             if (istart) {
                 vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ip); DY.pipe = ip; VB.valid = 0;
                 g_w.bi[i_wv].range = wv; g_w.bi[i_wp].range = wp;
+                if (g_w.wf.ready) { g_w.wf.pk[(size_t)i_wv * 4u + 3u] = (uint64_t)wv; g_w.wf.pk[(size_t)i_wp * 4u + 3u] = (uint64_t)wp; }
                 vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.layout, 0, g_w.n, g_w.w); pd_clear(0);
                 RUN.open = 1; RUN.ipipe = ip; RUN.wv = i_wv; RUN.wp = i_wp; RUN.win_v = wv; RUN.win_p = wp; RUN.n = 1;
                 RUN.table = (uint32_t *)i_ta.ptr; RUN.args = (uint32_t *)i_aa.ptr; RUN.table[0] = 0;
@@ -3358,22 +3423,28 @@ static int ndsr_fsr(int tin, int tout, vka_img *a, vka_img *b, VkFormat fb, int 
 // Upscaler rows only then (Native.ndsrStatus, nxlaunch.c). 0 = not yet
 static _Atomic int g_ndsr_fits;
 __attribute__((visibility("default"))) int nxhost_ndsr_status(void) { return atomic_load_explicit(&g_ndsr_fits, memory_order_relaxed); }
-static int ndsr_iface(const vka_shader *s) {
+static int ndsr_iface(vka_shader *s) {
     const dmsh_vk_entry *e = s->e;
     if (!e || !s->b || e->stage != DMSH_VK_STAGE_CS || !(e->flags & DMSH_VK_F_HMMA)) return 0;
-    int nt = 0, ni = 0, ns = 0, nb = 0;
-    for (unsigned i = 0; i < e->bind_count; i++) {
+    if (vka_wset_vin_fast_on()) {
+        uint8_t fl = __atomic_load_n(&s->iface_flags, __ATOMIC_RELAXED);
+        if (fl & VKA_SH_IF_NDSR_DONE) return (fl & VKA_SH_IF_NDSR_OK) != 0;
+    }
+    int nt = 0, ni = 0, ns = 0, nb = 0, ok = 1;
+    for (unsigned i = 0; i < e->bind_count && ok; i++) {
         const dmsh_vk_bind *x = &s->b[i];
         switch (x->kind) {
-        case DMSH_VK_KIND_TEX: if (x->desc != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !x->skind || x->dim != 1 || x->count > 1) return 0; nt++; break;
-        case DMSH_VK_KIND_IMG: if (x->desc != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !(x->flags & DMSH_VK_BF_RW) || (x->flags & DMSH_VK_BF_ATOMIC) || x->dim != 1 || x->count > 1) return 0; ni++; break;
-        case DMSH_VK_KIND_SBUF: if (x->flags & DMSH_VK_BF_RW) return 0; ns++; break;
+        case DMSH_VK_KIND_TEX: if (x->desc != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !x->skind || x->dim != 1 || x->count > 1) ok = 0; else nt++; break;
+        case DMSH_VK_KIND_IMG: if (x->desc != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !(x->flags & DMSH_VK_BF_RW) || (x->flags & DMSH_VK_BF_ATOMIC) || x->dim != 1 || x->count > 1) ok = 0; else ni++; break;
+        case DMSH_VK_KIND_SBUF: if (x->flags & DMSH_VK_BF_RW) ok = 0; else ns++; break;
         case DMSH_VK_KIND_DRVCB: if (x->reg == DMSH_PUSH_BANK) nb++; break;
         case DMSH_VK_KIND_SUPPORT: break;
-        default: return 0;
+        default: ok = 0; break;
         }
     }
-    return nt == 1 && ni == 1 && ns == 1 && nb == 1;
+    ok = ok && nt == 1 && ni == 1 && ns == 1 && nb == 1;
+    __atomic_fetch_or(&s->iface_flags, (uint8_t)(VKA_SH_IF_NDSR_DONE | (ok ? VKA_SH_IF_NDSR_OK : 0u)), __ATOMIC_RELAXED);
+    return ok;
 }
 // ---------- SGSR 1 in place of a game's neural upscaler (DM_VK_NDSR=4) ----------
 // Qualcomm's Snapdragon Game Super Resolution 1 (vka_ndsr_sgsr.h, dm/gfx/vk_android/sgsr/ndsr_sgsr.comp, BSD-3-Clause): a 12-tap Lanczos-like scale with edge-adaptive

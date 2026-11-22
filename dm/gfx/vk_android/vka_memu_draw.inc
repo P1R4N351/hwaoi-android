@@ -51,6 +51,7 @@ static void memu_write(uint32_t binding, VkBuffer b, VkDeviceSize off, VkDeviceS
     uint32_t k = g_w.n++;
     g_w.bi[k] = (VkDescriptorBufferInfo){b, off, range};
     g_w.w[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = binding, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &g_w.bi[k]};
+    if (g_w.wf.ready) vka_wset_put_buf(&g_w.wf, k, binding, 0u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint64_t)(uintptr_t)b, (uint64_t)off, (uint64_t)range);
 }
 static void memu_bind_arena(void) { memu_write(VKA_MEMU_ARENA_BINDING, MB.arena, 0, VK_WHOLE_SIZE); }
 // A compute form's dispatch: its stage's bindings walked with the replay state of its draw, the arena and the records, its record's index, its indirect arguments
@@ -60,7 +61,7 @@ static void memu_dispatch(const vka_dstate *d, int st, vka_shader *cs, const vka
     if (n < 0) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 8) VRED("%s shader through compute %016llx: %s; skipped", st == 6 ? "task" : "mesh", (unsigned long long)cs->key, why); return; }
     for (int i = 0; i < n; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].tid && (vka_tex_id_pending_rec(r[i].tid, r[i].dim) || (r[i].what == VKA_R_IMG && vka_tex_id_storage_pending(r[i].tid))))
         vka_tex_id_view(r[i].tid, g_cb, r[i].dim, wbf_view_of_binding(r[i].what == VKA_R_IMG, r[i].flags, DMSH_VK_BF_RW), NULL);   // (images first used: made now, outside the pass)
-    g_w.n = 0;
+    { uint32_t pn = g_w.n; g_w.n = 0; if (vka_wset_vin_fast_on()) vka_wset_reset(&g_w.wf, pn); else g_w.wf.ready = 0; }
     if (!stage_writes(d, st, cs, r, n, pool, NULL)) return;
     memu_write(VKA_MEMU_ARENA_BINDING, MB.arena, 0, VK_WHOLE_SIZE);
     memu_write(VKA_MEMU_REC_BINDING, MB.rec.buf, MB.rec.off, (VkDeviceSize)MEMU_MAX * VKA_MEMU_REC_WORDS * 4);

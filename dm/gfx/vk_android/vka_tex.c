@@ -36,6 +36,7 @@
 #include "vka_mem_sparse_fast.h"
 #include "vka_treg_ub_fast.h"
 #include "vka_wk_prep_fast.h"
+#include "vka_wset_vin_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -2737,6 +2738,7 @@ static _Atomic int g_pfb = -1;   // -1 not decided; 0 off; 1 on (the bitmap and 
 static vka_span g_pfb_map, g_pfb_ring;
 static VkDescriptorSetLayout g_pfb_dsl; static VkDescriptorPool g_pfb_dpool; static VkDescriptorSet g_pfb_set;   // the bitmap's set (made in bindless_init)
 static struct { uint64_t fence; uint32_t n; int busy; } g_pfb_r[PFB_RING];   // (under g_tmu)
+static uint32_t g_pfb_busy_mask;
 static _Atomic int g_pfb_any;   // the submission being recorded has a draw or dispatch that reads the pool
 static uint8_t *g_pfb_st;   // (under g_tmu) per texture ID: PFB_WANT, PFB_NULL (its slot was last written with the null view)
 static uint64_t g_pfb_nrb, g_pfb_skip, g_pfb_hits, g_pfb_wants, g_pfb_made, g_pfb_made_b, g_pfb_again, g_pfb_logged;   // (under g_tmu)
@@ -2793,9 +2795,10 @@ void vka_tex_pfb_commit(VkCommandBuffer cb, uint64_t fence) {
     if (!cb || atomic_load(&g_pfb) <= 0 || !atomic_exchange(&g_pfb_any, 0)) return;
     pthread_mutex_lock(&g_tmu);
     uint32_t n = (uint32_t)(((uint64_t)g_ntreg + 31) / 32 * 4), k = PFB_RING; if (n > PFB_BYTES) n = PFB_BYTES;
-    for (uint32_t i = 0; i < PFB_RING && k == PFB_RING; i++) if (!g_pfb_r[i].busy) k = i;
-    if (!n || k == PFB_RING) { g_pfb_skip++; atomic_store(&g_pfb_any, 1); pthread_mutex_unlock(&g_tmu); return; }   // (every slot waiting: the bits stay for the next submission's copy)
-    g_pfb_r[k].fence = fence; g_pfb_r[k].n = n; g_pfb_r[k].busy = 1;
+    if (vka_wset_vin_fast_on()) k = vka_pfb_free_slot(g_pfb_busy_mask, PFB_RING);
+    else for (uint32_t i = 0; i < PFB_RING && k == PFB_RING; i++) if (!g_pfb_r[i].busy) k = i;
+    if (!n || k == PFB_RING) { g_pfb_skip++; atomic_store(&g_pfb_any, 1); pthread_mutex_unlock(&g_tmu); return; }
+    g_pfb_r[k].fence = fence; g_pfb_r[k].n = n; g_pfb_r[k].busy = 1; g_pfb_busy_mask |= 1u << k;
     pthread_mutex_unlock(&g_tmu);
     VkMemoryBarrier b0 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b0, 0, NULL, 0, NULL);
@@ -2828,19 +2831,27 @@ static void pfb_hit(int id, uint64_t frame, uint64_t fence) {
 // (after nx2android's Vulkan backend)
 static void pfb_consume_locked(void) {
     if (atomic_load(&g_pfb) <= 0) return;
-    if (VKA_ENV("DM_VK_POOL_EAGER", 0)) {
-        uint64_t oldest = UINT64_MAX;
-        for (int k = 0; k < PFB_RING; k++) if (g_pfb_r[k].busy && g_pfb_r[k].fence < oldest) oldest = g_pfb_r[k].fence;
-        if (oldest != UINT64_MAX && oldest > vka_done() && oldest <= vka_fence_queued()) {   // (only a submission already queued)
-            pthread_mutex_unlock(&g_tmu); vka_wait_done(oldest, vka_hang_ns()); pthread_mutex_lock(&g_tmu); }
-    }
-    uint64_t done = vka_done(), frame = vka_frame(), fence = vka_fence_last();
-    for (int k = 0; k < PFB_RING; k++) {
-        if (!g_pfb_r[k].busy || g_pfb_r[k].fence > done) continue;
-        const uint32_t *wd = (const uint32_t *)(g_pfb_ring.ptr + (size_t)k * PFB_BYTES);
-        for (uint32_t i = 0, nw = g_pfb_r[k].n / 4; i < nw; i++)
-            for (uint32_t x = wd[i]; x; x &= x - 1) pfb_hit((int)(i * 32 + (uint32_t)__builtin_ctz(x)), frame, fence);
-        g_pfb_r[k].busy = 0; g_pfb_nrb++;
+    int pfast = vka_wset_vin_fast_on();
+    if (!pfast || g_pfb_busy_mask) {
+        if (VKA_ENV("DM_VK_POOL_EAGER", 0)) {
+            uint64_t oldest = UINT64_MAX;
+            uint32_t bm = pfast ? g_pfb_busy_mask : ((1u << PFB_RING) - 1u);
+            for (; bm; bm &= bm - 1u) { int k = __builtin_ctz(bm); if (g_pfb_r[k].busy && g_pfb_r[k].fence < oldest) oldest = g_pfb_r[k].fence; }
+            if (oldest != UINT64_MAX && oldest > vka_done() && oldest <= vka_fence_queued()) { pthread_mutex_unlock(&g_tmu); vka_wait_done(oldest, vka_hang_ns()); pthread_mutex_lock(&g_tmu); }
+        }
+        uint64_t done = vka_done(), frame = vka_frame(), fence = vka_fence_last();
+        uint32_t bm = pfast ? g_pfb_busy_mask : ((1u << PFB_RING) - 1u);
+        for (; bm; bm &= bm - 1u) {
+            int k = __builtin_ctz(bm);
+            if (!g_pfb_r[k].busy || g_pfb_r[k].fence > done) continue;
+            const uint32_t *wd = (const uint32_t *)(g_pfb_ring.ptr + (size_t)k * PFB_BYTES);
+            uint32_t nw = g_pfb_r[k].n / 4u;
+            if (pfast) {
+                for (uint32_t i = vka_pfb_next_nonzero_word(wd, nw, 0u); i < nw; i = vka_pfb_next_nonzero_word(wd, nw, i + 1u))
+                    for (uint32_t x = wd[i]; x; x &= x - 1u) pfb_hit((int)(i * 32u + (uint32_t)__builtin_ctz(x)), frame, fence);
+            } else for (uint32_t i = 0; i < nw; i++) for (uint32_t x = wd[i]; x; x &= x - 1u) pfb_hit((int)(i * 32u + (uint32_t)__builtin_ctz(x)), frame, fence);
+            g_pfb_r[k].busy = 0; g_pfb_busy_mask &= ~(1u << k); g_pfb_nrb++;
+        }
     }
     if (g_pfb_nrb >= g_pfb_logged + 1800 || (g_pfb_nrb && !g_pfb_logged)) {
         g_pfb_logged = g_pfb_nrb;
@@ -3740,116 +3751,89 @@ static int tex_reg_writes_flush_locked(VkCommandBuffer cb) {
     g_nreg_writes = 0;
     return any_rw;
 }
-void vka_tex_prepare(VkCommandBuffer cb) {
-    bindless_init();
-    nvn_pool_use(1);   // the re-uploads below read guest storage: no pool is finalized (and unmapped) under them. Taken before g_tmu, as write_tex does
-    pthread_mutex_lock(&g_tmu);
-    pfb_consume_locked();   // the texture IDs read through the pool in submissions done: their images stamped used, null slots written again with their images ("Texture pool reads")
-    vka_tex_prune_locked();   // (the limit measured again every 60 frames; nothing to do under it)
-    int n_up = 0;
-    for (int i = 0; i < g_nredo; i++) {   // CPU writes to textures that already have an image (WriteTexels): from now on they follow their storage
-        smap_ent *e = map_get(g_redo[i]); vka_img *im = e ? e->im : NULL;
-        if (!im || !im->cpu_dirty) continue;
-        im->cpu_dirty = 0;
-        if (im->gpu_owned || img_pool_dead(im)) continue;
-        tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
-        nvn_tex_layout(&t.d, &t.L);
-        if (im->vtrack) { sparse_refresh(im, cb); g_reup++; n_up++; continue; }
-        if (!im->wt && !im->track && (im->span = nvn_dirty_span(t.mem, t.L.size))) im->track = 1;
-        if (im->track) upload_tracked(im, &t, cb); else upload_fill(im, &t, cb);
-        g_reup++; n_up++;
+static inline int gw_takes_img(vka_img *im) { return im->from_mem && !im->gpu_owned && im->mem && !im->vpool && !img_pool_dead(im); }
+static void tex_gw_hit_locked(vka_img *im, const gw_t *w, VkCommandBuffer cb) {
+    tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
+    if (im->track) upload_tracked(im, &t, cb); else upload_fill(im, &t, cb);
+    g_gw_late++; if (g_gw_late <= 8 || !(g_gw_late & (g_gw_late - 1))) VLOG("textures re-uploaded after a GPU write into their storage: %llu (uploads that applied pending GPU writes: %llu; pages raw global memory stores wrote: %llu)", (unsigned long long)g_gw_late, (unsigned long long)g_gw_over, (unsigned long long)g_gml_pages);
+    if (g_gw_late <= 8) VLOG("texture serial %llu %ux%u format %#x: a GPU write into its storage (%s %#llx+%#llx) is done, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format, w->kind == GW_COPY ? "copy" : w->kind == GW_FILL ? "fill" : w->kind == GW_UPDATE ? "inline update" : "store", (unsigned long long)w->lo, (unsigned long long)(w->hi - w->lo));
+}
+static void tex_gw_reupload_locked(VkCommandBuffer cb) {
+    static vka_img **by; static uint64_t *by_addr, *by_sz, *by_mend; static int bycap, nall; static uint64_t by_gen = ~0ull;
+    int nby = 0, k = 0, any = 0, keep = VKA_ENV("DM_VK_GW_SORT_KEEP", 1) != 0, fast = vka_wset_vin_fast_on();
+    uint64_t maxsz = 0, done = vka_done();
+    for (int i = 0; i < g_ngw && !any; i++) any = g_gw[i].fence && g_gw[i].fence <= done;
+    if (any) {
+        if (bycap < g_nlive) { bycap = g_nlive + 256; by = realloc(by, (size_t)bycap * sizeof *by); by_addr = realloc(by_addr, (size_t)bycap * sizeof *by_addr); by_sz = realloc(by_sz, (size_t)bycap * sizeof *by_sz); by_mend = realloc(by_mend, (size_t)bycap * sizeof *by_mend); by_gen = ~0ull; }
+        if (keep) {
+            if (by_gen != g_live_gen) { nall = 0; for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) by[nall++] = g_live[j]; qsort(by, (size_t)nall, sizeof *by, img_by_mem);
+                for (int j = 0; j < nall; j++) { by_addr[j] = (uint64_t)(uintptr_t)by[j]->mem; by_sz[j] = by[j]->L.size; } vka_gw_build_max_end(by_mend, by_addr, by_sz, nall); by_gen = g_live_gen; }
+            nby = nall; if (!fast) for (int j = 0; j < nby; j++) if (gw_takes_img(by[j]) && by[j]->L.size > maxsz) maxsz = by[j]->L.size;
+        } else { by_gen = ~0ull; for (int j = 0; j < g_nlive; j++) if (gw_takes_img(g_live[j])) { by[nby++] = g_live[j]; if (g_live[j]->L.size > maxsz) maxsz = g_live[j]->L.size; } qsort(by, (size_t)nby, sizeof *by, img_by_mem); }
     }
-    g_nredo = 0;
-    if (n_up && g_nreg_writes) vka_barrier(cb);   // the whole-image uploads above before the region copies below, which may write the same texels
-    if (tex_reg_writes_flush_locked(cb)) vka_barrier(cb);
-    // GPU writes whose submission is done: the images over them that did not get their bytes are uploaded again (see gw_t above)
-    gml_poll();
-    if (vka_nan_on()) watch_scan(cb);
-    static uint64_t nprep, kinds[4], ntake; nprep++;
-    if (vka_nan_on()) { for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence && g_gw[i].fence <= vka_done()) kinds[g_gw[i].kind]++;
-        if (nprep % 600 == 0) VLOG("NaN scan: GPU writes into guest memory done so far: %llu copies, %llu fills, %llu inline updates, %llu stores / texture → buffer copies (%llu pages from raw global memory logs, %llu logs full, %llu without a log); textures re-uploaded after them %llu", (unsigned long long)kinds[0], (unsigned long long)kinds[1], (unsigned long long)kinds[2], (unsigned long long)kinds[3], (unsigned long long)g_gml_pages, (unsigned long long)g_gml_full, (unsigned long long)g_gml_none, (unsigned long long)g_gw_late); }
-    (void)ntake;
-    if (g_ngw) {
-        // The images whose content comes from their storage, by start address, searched for each done write (hundreds a frame, thousands of images). The live images with
-        // storage are kept sorted by address while none joins or leaves (g_live_gen; an image's storage address never changes): each submission with a done write sorted
-        // all of them again (DM_VK_GW_SORT_KEEP, live, default 1; 0: filtered and sorted at each, as before). Which of them take part (from_mem, gpu_owned, vpool, a dead
-        // pool can change) is checked at each use, and the scan's reach (maxsz) is the largest of those that take part, as before; images at one address keep an order qsort
-        // does not promise either way
-        static vka_img **by; static int bycap, nall; static uint64_t by_gen = ~0ull; int nby = 0; uint64_t maxsz = 0, done = vka_done(); int k = 0, any = 0;
-        int keep = VKA_ENV("DM_VK_GW_SORT_KEEP", 1) != 0;
-        #define GW_TAKES(im) ((im)->from_mem && !(im)->gpu_owned && (im)->mem && !(im)->vpool && !img_pool_dead(im))
-        for (int i = 0; i < g_ngw && !any; i++) any = g_gw[i].fence && g_gw[i].fence <= done;
-        if (any) {
-            if (bycap < g_nlive) { bycap = g_nlive + 256; by = realloc(by, (size_t)bycap * sizeof *by); by_gen = ~0ull; }
-            if (keep) {
-                if (by_gen != g_live_gen) { nall = 0; for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) by[nall++] = g_live[j]; qsort(by, (size_t)nall, sizeof *by, img_by_mem); by_gen = g_live_gen; }
-                nby = nall; for (int j = 0; j < nby; j++) if (GW_TAKES(by[j]) && by[j]->L.size > maxsz) maxsz = by[j]->L.size;
-            } else {
-                by_gen = ~0ull;
-                for (int j = 0; j < g_nlive; j++) { vka_img *im = g_live[j]; if (GW_TAKES(im)) { by[nby++] = im; if (im->L.size > maxsz) maxsz = im->L.size; } }
-                qsort(by, (size_t)nby, sizeof *by, img_by_mem);
-            }
-        }
-        for (int i = 0; i < g_ngw; i++) {
-            gw_t *w = &g_gw[i];
-            if (!w->fence || w->fence > done) { g_gw[k++] = *w; continue; }
-            int lo = 0, hi = nby;   // the first image starting at or after the write's end
-            while (lo < hi) { int m = (lo + hi) / 2; if ((uint64_t)(uintptr_t)by[m]->mem < w->hi) lo = m + 1; else hi = m; }
+    for (int i = 0; i < g_ngw; i++) {
+        gw_t *w = &g_gw[i];
+        if (!w->fence || w->fence > done) { g_gw[k++] = *w; continue; }
+        if (fast && keep) {
+            int lo = vka_gw_upper_addr(by_addr, nby, w->hi);
+            for (int j = lo - 1; j >= 0 && by_mend[j] > w->lo; j--) if (w->lo < by_addr[j] + by_sz[j] && by[j]->gw_seen < w->seq && !by[j]->gpu_owned && gw_takes_img(by[j])) tex_gw_hit_locked(by[j], w, cb);
+        } else {
+            int lo = 0, hi = nby; while (lo < hi) { int m = (lo + hi) / 2; if ((uint64_t)(uintptr_t)by[m]->mem < w->hi) lo = m + 1; else hi = m; }
             for (int j = lo - 1; j >= 0 && (uint64_t)(uintptr_t)by[j]->mem + maxsz > w->lo; j--) {
                 vka_img *im = by[j]; uint64_t a = (uint64_t)(uintptr_t)im->mem;
-                if (w->lo >= a + im->L.size || im->gw_seen >= w->seq || im->gpu_owned) continue;
-                if (keep && !GW_TAKES(im)) continue;
-                tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
-                if (im->track) upload_tracked(im, &t, cb); else upload_fill(im, &t, cb);
-                g_gw_late++; if (g_gw_late <= 8 || !(g_gw_late & (g_gw_late - 1))) VLOG("textures re-uploaded after a GPU write into their storage: %llu (uploads that applied pending GPU writes: %llu; pages raw global memory stores wrote: %llu)", (unsigned long long)g_gw_late, (unsigned long long)g_gw_over, (unsigned long long)g_gml_pages);
-                if (g_gw_late <= 8) VLOG("texture serial %llu %ux%u format %#x: a GPU write into its storage (%s %#llx+%#llx) is done, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format,
-                                          w->kind == GW_COPY ? "copy" : w->kind == GW_FILL ? "fill" : w->kind == GW_UPDATE ? "inline update" : "store", (unsigned long long)w->lo, (unsigned long long)(w->hi - w->lo));
+                if (w->lo < a + im->L.size && im->gw_seen < w->seq && !im->gpu_owned && (!keep || gw_takes_img(im))) tex_gw_hit_locked(im, w, cb);
             }
-            free(w->data);
         }
-        #undef GW_TAKES
-        g_ngw = k;
-        gw_sum_rebuild_locked();
+        free(w->data);
     }
-    // Tracked images whose pages the CPU wrote since their last upload (a write to a protected page moves the dirty clock, so nothing is scanned while it stands still)
-    // Sparse pools' textures also when a mapping request came since (the page table's generation moved)
-    // Video pictures: the scan below runs when a picture was written into a video pool or a pool came or went since the last one (before 2026-11-10 every live image
-    // was asked dm_codec_is_video_mem, a lock and 64 slots, at every submission to find that out, and again in the scan: "Live images" above); an image is asked again
-    // only after a pool came or went (vka_img.vep). The counts are read before the scan, so a picture written during it moves them for the next submission
-    static uint64_t seen, vseen, vw_seen, ve_seen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen(), vw = dm_codec_video_writes(), ve = dm_codec_video_epoch();
-    int vid_new = vw != vw_seen || ve != ve_seen;
-    static int g_wbf_wait; static uint64_t g_wbf_up, g_wbf_waits; int g_wbf_on = VKA_ENV("DM_VK_WB_FOLLOW", 1) != 0; uint64_t done = vka_done();   // g_wbf_wait: a GPU-written linear texture waited for its copy-back in the last scan
-    int full_scan = now != seen || vnow != vseen || vid_new;   // (else the scan runs only for the images that waited for a copy-back: vka_wbfollow.h wbf_visit)
-    if (full_scan || g_wbf_wait) {
-        seen = now; vseen = vnow; vw_seen = vw; ve_seen = ve; g_wbf_wait = 0;
-        wbf_prepare_scan_locked(cb, ve, full_scan, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
-    } else if (g_nedge_hot) {
-        for (int i = g_nedge_hot - 1; i >= 0; i--)
-            prepare_one_unpinned(g_edge_hot[i], cb, 0, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
+    g_ngw = k; gw_sum_rebuild_locked();
+}
+static void tex_redo_flush_locked(VkCommandBuffer cb, int *n_up) {
+    for (int i = 0; i < g_nredo; i++) {
+        smap_ent *e = map_get(g_redo[i]); vka_img *im = e ? e->im : NULL; if (!im || !im->cpu_dirty) continue;
+        im->cpu_dirty = 0; if (im->gpu_owned || img_pool_dead(im)) continue;
+        tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem; nvn_tex_layout(&t.d, &t.L);
+        if (im->vtrack) { sparse_refresh(im, cb); g_reup++; (*n_up)++; continue; }
+        if (!im->wt && !im->track && (im->span = nvn_dirty_span(t.mem, t.L.size))) im->track = 1;
+        if (im->track) upload_tracked(im, &t, cb); else upload_fill(im, &t, cb); g_reup++; (*n_up)++;
     }
-    nvn_pool_use(0);   // (write_tex takes it again for each ID, after letting g_tmu go: never twice on one thread)
-    if (!g_set) { g_ntd = g_nsd = 0; if (g_tdflag) memset(g_tdflag, 0, 1 << 20); if (g_sdflag) memset(g_sdflag, 0, 4096 * 4); pthread_mutex_unlock(&g_tmu); return; }
+    g_nredo = 0;
+}
+static void tex_update_dirty_slots_locked(VkCommandBuffer cb) {
     enum { BATCH = 64 }; VkWriteDescriptorSet w[BATCH]; VkDescriptorImageInfo ii[BATCH]; int nw = 0;
-    for (int k = 0; k < g_ntd; k++) {
-        int id = g_tdirty[k]; g_tdflag[id] = 0;
+    for (int k = 0; k < g_ntd; k++) { int id = g_tdirty[k]; g_tdflag[id] = 0;
         if (id >= (int)(g_treg[id].img ? g_nimg_slots : g_ntex_slots)) { VRED_ONCE("texture ID %d beyond the table", id); continue; }
         uint64_t ser = 0; write_tex(id, cb, &w[nw], &ii[nw], &ser);
-        if (w[nw].pImageInfo->imageView && slot_put_locked((int)w[nw].dstBinding, id, w[nw].pImageInfo->imageView, ser, 2)) nw++;   // (a slot that holds that view already: not written again)
-        if (nw == BATCH) { vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL); nw = 0; }
-    }
+        if (w[nw].pImageInfo->imageView && slot_put_locked((int)w[nw].dstBinding, id, w[nw].pImageInfo->imageView, ser, 2)) nw++;
+        if (nw == BATCH) { vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL); nw = 0; } }
     g_ntd = 0;
-    for (int k = 0; k < g_nsd; k++) {
-        int id = g_sdirty[k]; g_sdflag[id] = 0;
+    for (int k = 0; k < g_nsd; k++) { int id = g_sdirty[k]; g_sdflag[id] = 0;
         if (id >= (int)g_nsamp_slots) { VRED_ONCE("sampler ID %d beyond the table (%u)", id, g_nsamp_slots); continue; }
-        VkSampler s = (id < g_nsres && g_sres[id]) ? g_sres[id] : sampler_of(&g_sreg[id]);
-        if (!s) continue;
-        if (id < g_nsres && !g_sres[id]) g_sres[id] = s;
+        VkSampler s = (id < g_nsres && g_sres[id]) ? g_sres[id] : sampler_of(&g_sreg[id]); if (!s) continue; if (id < g_nsres && !g_sres[id]) g_sres[id] = s;
         ii[nw] = (VkDescriptorImageInfo){s, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         w[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_set, .dstBinding = 1, .dstArrayElement = (uint32_t)id, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &ii[nw]};
-        if (++nw == BATCH) { vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL); nw = 0; }
-    }
-    g_nsd = 0;
-    if (nw) vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL);
+        if (++nw == BATCH) { vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL); nw = 0; } }
+    g_nsd = 0; if (nw) vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL);
+}
+void vka_tex_prepare(VkCommandBuffer cb) {
+    bindless_init(); nvn_pool_use(1); pthread_mutex_lock(&g_tmu);
+    pfb_consume_locked(); vka_tex_prune_locked();
+    int n_up = 0; tex_redo_flush_locked(cb, &n_up);
+    if (n_up && g_nreg_writes) vka_barrier(cb);
+    if (tex_reg_writes_flush_locked(cb)) vka_barrier(cb);
+    gml_poll(); if (vka_nan_on()) watch_scan(cb);
+    static uint64_t nprep, kinds[4]; nprep++;
+    if (vka_nan_on()) { for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence && g_gw[i].fence <= vka_done()) kinds[g_gw[i].kind]++;
+        if (nprep % 600 == 0) VLOG("NaN scan: GPU writes into guest memory done so far: %llu copies, %llu fills, %llu inline updates, %llu stores / texture → buffer copies (%llu pages from raw global memory logs, %llu logs full, %llu without a log); textures re-uploaded after them %llu", (unsigned long long)kinds[0], (unsigned long long)kinds[1], (unsigned long long)kinds[2], (unsigned long long)kinds[3], (unsigned long long)g_gml_pages, (unsigned long long)g_gml_full, (unsigned long long)g_gml_none, (unsigned long long)g_gw_late); }
+    if (g_ngw) tex_gw_reupload_locked(cb);
+    static uint64_t seen, vseen, vw_seen, ve_seen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen(), vw = dm_codec_video_writes(), ve = dm_codec_video_epoch();
+    static int g_wbf_wait; static uint64_t g_wbf_up, g_wbf_waits; int g_wbf_on = VKA_ENV("DM_VK_WB_FOLLOW", 1) != 0; uint64_t done = vka_done();
+    int full_scan = now != seen || vnow != vseen || vw != vw_seen || ve != ve_seen;
+    if (full_scan || g_wbf_wait) { seen = now; vseen = vnow; vw_seen = vw; ve_seen = ve; g_wbf_wait = 0; wbf_prepare_scan_locked(cb, ve, full_scan, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up); }
+    else if (g_nedge_hot) { for (int i = g_nedge_hot - 1; i >= 0; i--) prepare_one_unpinned(g_edge_hot[i], cb, 0, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up); }
+    nvn_pool_use(0);
+    if (!g_set) { g_ntd = g_nsd = 0; if (g_tdflag) memset(g_tdflag, 0, 1 << 20); if (g_sdflag) memset(g_sdflag, 0, 4096 * 4); pthread_mutex_unlock(&g_tmu); return; }
+    tex_update_dirty_slots_locked(cb);
     pthread_mutex_unlock(&g_tmu);
 }
 
