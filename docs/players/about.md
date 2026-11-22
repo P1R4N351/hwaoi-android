@@ -1,6 +1,6 @@
 # About the project
 
-Back to the [main page](../../.github/README.md).
+Back to the [main page](../../README.md).
 
 Unofficial and experimental, tested on one phone. Not affiliated with Nintendo, nxnative, Eden or
 [nx2android](https://github.com/shirai91/nx2android): please don't send them bug reports about this. Banana Native is

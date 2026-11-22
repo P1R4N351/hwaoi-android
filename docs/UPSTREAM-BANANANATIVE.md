@@ -1,3 +1,6 @@
+> Upstream Banana Native README, kept in this repository for reference. It does not describe this port;
+> AoI Native (Hyrule Warriors: Age of Imprisonment) has its own page: [README.md](../README.md).
+
 <p align="center"><img src="android/images/logo.svg" alt="Banana Native logo" width="128"></p>
 
 # Banana Native
