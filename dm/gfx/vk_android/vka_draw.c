@@ -25,6 +25,7 @@
 #include "vka_gw_fast.h"
 #include "vka_view_fast.h"
 #include "vka_rp_mod_fast.h"
+#include "vka_view_ub_fast.h"
 _Static_assert(sizeof(((vka_dstate *)0)->ubo_dirty) == 32 && VKA_NSTAGE == 8 && sizeof(p_scissor) == 16, "inst_fast sizes");
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
@@ -278,10 +279,16 @@ static void ub_flush(void) {
     if (!UB.n) return;
     int n = UB.n; UB.n = 0; UB.m_valid = 0; UB.bloom = 0; vka_ub_shadow_reset(&UB.sm);
     uint64_t last_d = 0, last_n = 0;
+    int vufast = vka_view_ub_fast_on();
+    vka_range_haz_t haz = {0};
     vka_rw_pre(g_cb);
     for (int i = 0; i < n; i++) {
-        uint64_t dst = UB.e[i].dst, sz = UB.e[i].n; const uint8_t *data = UB.e[i].data;
-        for (int j = 0; j < i; j++) if (UB.e[j].dst < dst + sz && dst < UB.e[j].dst + UB.e[j].n) { vka_barrier(g_cb); break; }
+        uint64_t dst = UB.e[i].dst, sz = UB.e[i].n, hi = dst + sz; const uint8_t *data = UB.e[i].data;
+        uint64_t hmask = vufast ? vka_range_haz_mask(dst, hi) : 0u;
+        if (!vufast || vka_range_haz_may_overlap(&haz, dst, hi, hmask)) {
+            for (int j = 0; j < i; j++) if (UB.e[j].dst < hi && dst < UB.e[j].dst + UB.e[j].n) { vka_barrier(g_cb); break; }
+        }
+        if (vufast) vka_range_haz_add(&haz, dst, hi, hmask);
         vka_span s; if (!sz || !vka_scratch(sz, 16, &s)) { VRED_ONCE("inline uniform update at %#llx (%llu bytes): no staging memory, the update is lost", (unsigned long long)dst, (unsigned long long)sz); continue; }
         memcpy(s.ptr, data, (size_t)sz);
         for (uint64_t done = 0; done < sz;) {
@@ -2194,8 +2201,10 @@ static pthread_mutex_t g_ivmu = PTHREAD_MUTEX_INITIALIZER;
 static vka_shader *inst_variant(vka_shader *s, uint32_t binding) { pthread_mutex_lock(&g_ivmu); vka_shader *v = inst_variant_make(s, binding); pthread_mutex_unlock(&g_ivmu); return v; }
 vka_shader *vka_inst_variant(vka_shader *s, uint32_t binding) { return VKA_ENV("DM_VK_INSTANCE", 0) && inst_device_ok() ? inst_variant(s, binding) : NULL; }
 static vka_shader *inst_variant_make(vka_shader *s, uint32_t binding) {
-    static struct { uint64_t key; uint32_t binding; vka_shader *v; } cache[128]; static int ncache;
-    for (int i = 0; i < ncache; i++) if (cache[i].key == s->key && cache[i].binding == binding) return cache[i].v;
+    static struct { uint64_t key; uint32_t binding; vka_shader *v; } cache[128]; static int ncache; static vka_inst_var_map_t ivmap;
+    int vufast = vka_view_ub_fast_on();
+    if (vufast) { int hit = vka_inst_var_map_find(&ivmap, s->key, binding); if (hit >= 0) return cache[hit].v; }
+    else { for (int i = 0; i < ncache; i++) if (cache[i].key == s->key && cache[i].binding == binding) return cache[i].v; }
     if (ncache == 128) return NULL;
     vka_shader *v = NULL;
     {   // made from the library's SPIR-V (vka_spv_instance)
@@ -2206,6 +2215,7 @@ static vka_shader *inst_variant_make(vka_shader *s, uint32_t binding) {
         } else if (m) vk.vkDestroyShaderModule(V.dev, m, NULL);
     }
     cache[ncache].key = s->key; cache[ncache].binding = binding; cache[ncache++].v = v;
+    vka_inst_var_map_put(&ivmap, s->key, binding, (uint16_t)ncache);
     return v;
 }
 static void inst_close(void) { RUN.open = 0; }
@@ -2408,14 +2418,17 @@ typedef struct {
     vka_range ubo[16], ssbo[16]; uint64_t tex[VKA_NTEX], samp[128], img[32], s_ssbo, s_tex;   // its pixel stage's bindings and their stamps
     ds_st ds; uint32_t st_vmask[2], st_wmask[2], st_ref[2]; poly_st poly; p_poly_offset po; int depth_clamp; color_st color; float alpha_ref; ms_st ms;
 } prepass_snap;
-static prepass_snap g_pps[32]; static uint64_t g_pps_seq;   // the prepass draws last seen, by pair and indirect record
+static prepass_snap g_pps[32]; static uint64_t g_pps_seq; static vka_pps_mask_t g_pps_mask;   // the prepass draws last seen, by pair and indirect record
 static vka_shader *g_fs_sub;   // set while prepass_draw draws: the pixel shader in place of the bound one, and no mesh_cut
 static int g_sub_drawn;        // prepass_draw's draw got as far as its draw command
 static int g_pp_side;          // set while prepass_side draws: no mesh_cut
 static void prepass_note(const vka_dstate *d, int i, uint64_t ind, vka_shader *fs) {
     uint64_t vka_frame(void);
-    prepass_snap *s = &g_pps[0];
-    for (int k = 0; k < 32; k++) { prepass_snap *t = &g_pps[k]; if (t->fs && t->pair == i && t->ind == ind) { s = t; break; } if (t->seq < s->seq) s = t; }   // its own slot, else the oldest
+    uint32_t mask = (vka_view_ub_fast_on() && i >= 0 && i < 64) ? vka_pps_cand_mask(&g_pps_mask, i) : ~UINT32_C(0);
+    prepass_snap *s = &g_pps[0]; int matched = 0;
+    for (uint32_t m = mask; m; m &= m - 1u) { unsigned k = (unsigned)__builtin_ctz(m); prepass_snap *t = &g_pps[k]; if (t->fs && t->pair == i && t->ind == ind) { s = t; matched = 1; break; } }
+    if (!matched) for (int k = 0; k < 32; k++) if (g_pps[k].seq < s->seq) s = &g_pps[k];
+    vka_pps_note_slot(&g_pps_mask, (unsigned)(s - g_pps), i);
     s->pair = i; s->ind = ind; s->frame = vka_frame(); s->seq = ++g_pps_seq; s->fs = fs;
     memcpy(s->ubo, d->b.ubo[1], sizeof s->ubo); memcpy(s->ssbo, d->b.ssbo[1], sizeof s->ssbo); memcpy(s->tex, d->b.tex[1], sizeof s->tex);
     memcpy(s->samp, d->b.samp[1], sizeof s->samp); memcpy(s->img, d->b.img[1], sizeof s->img); s->s_ssbo = d->s_ssbo[1]; s->s_tex = d->s_tex[1];
@@ -2427,8 +2440,9 @@ static void prepass_note(const vka_dstate *d, int i, uint64_t ind, vka_shader *f
 static const prepass_snap *prepass_find(int i, uint64_t ind) {
     uint64_t vka_frame(void), f = vka_frame();
     const prepass_snap *own = NULL, *any = NULL;
-    for (int k = 0; k < 32; k++) {
-        const prepass_snap *t = &g_pps[k];
+    uint32_t mask = (vka_view_ub_fast_on() && i >= 0 && i < 64) ? vka_pps_cand_mask(&g_pps_mask, i) : ~UINT32_C(0);
+    for (uint32_t m = mask; m; m &= m - 1u) {
+        const prepass_snap *t = &g_pps[(unsigned)__builtin_ctz(m)];
         if (!t->fs || t->pair != i || f - t->frame > 1) continue;
         if (t->ind == ind && (!own || t->seq > own->seq)) own = t;
         if (!any || t->seq > any->seq) any = t;

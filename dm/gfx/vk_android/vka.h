@@ -296,6 +296,7 @@ typedef struct vka_img {
     // may start at (levels left out to fit the address space, vka_tex.c img_create), a hint kept while vks_va_free() is less than bneed (the address space the next finer start asked for when it did not fit)
     struct vks_img *rs; uint32_t rs_tw, rs_th, bfloor; uint64_t va, bneed;
     void *views;             // the image views made of it (vka_view)
+    uint64_t view_ep; uint32_t view_map_tgen;
     vkfl fl;                 // its format list (vka_fmtlist.h, vka_tex.c img_create): the formats its views may take besides its own; taken whole when the image is remade in place
     uint8_t mode;            // its content at first use (vka_tex.c ST_ZERO / ST_FILL / ST_TRACK)
     uint8_t pool_fit;        // its memory requirements fit its storage in the pool (vka_tex_alias_stats): type, size and alignment
