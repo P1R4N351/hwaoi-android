@@ -707,6 +707,7 @@ DM_VK_PSO_ORDER	developer	Performance			text			both
 DM_VK_PSO_SLOTS	developer	Performance			text		1 with Turnip, 4 with other drivers	both							
 DM_VK_PUSH_DEDUP	developer	Graphics			text			both							
 DM_VK_PUSH_DELTA	developer	Diagnostics			text			both							
+DM_VK_QSCHED_FAST	developer	Performance			text			both							
 DM_VK_QS_TRACE	developer	Diagnostics			text			both							
 DM_VK_QUAD_IND	developer	Graphics			text			both							
 DM_VK_RAM_SAVER	developer	Memory			text			both							

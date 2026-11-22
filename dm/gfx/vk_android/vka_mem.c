@@ -21,6 +21,7 @@
 #include "../nvn/nvn_mtl.h"
 #include "../nvn/nvn_dirty.h"
 #include "vka_place.h"
+#include "vka_qsched_fast.h"
 #include "vka_gmem.h"
 #include "vka_lowram.h"
 #include "../../host/dm.h"
@@ -647,7 +648,8 @@ static void unplace(const seg_t *sp) {
         for (int k = 0; k < npr; k++) {
             if (pr[k].prot < 0 || !(pr[k].prot & PROT_READ)) continue;
             for (uintptr_t a = pr[k].lo; a < pr[k].hi; a += 4096) {   // zero pages stay untouched (uncommitted)
-                const uint64_t *w = (const uint64_t *)a; uint64_t o = 0; for (int j = 0; j < 512 && !o; j++) o |= w[j];
+                uint64_t o = 0; if (vka_qsched_fast_on()) o = (uint64_t)vka_page_nonzero_4k((const void *)a);
+                else { const uint64_t *w = (const uint64_t *)a; for (int j = 0; j < 512 && !o; j++) o |= w[j]; }
                 if (o) memcpy(t + (a - s.lo), (const void *)a, 4096);
             }
         }
@@ -953,17 +955,24 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 // 64 KiB block): the asks that keep missing one placed segment (a buffer past its pool's end, one across two segments, a buffer of a sparse virtual pool) skip the scan of every pool
 enum { NNEG = 64, NDONE = 8 };
 // [a, e) of pool p (placed by parts) lies in granules all placed already: nothing to place, and no wait for a placement of another part (caller holds g_pmu)
+static int part_gran_shift(uint64_t g) { return (g && !(g & (g - 1u))) ? __builtin_ctzll(g) : -1; }
 static int parts_placed(const pool_ent *p, uintptr_t a, uintptr_t e) {
     if (!p->gmap) return 0;
     uint64_t g = part_gran(), s = a > p->mem ? a - p->mem : 0, t = (e < p->mem + p->size ? e : p->mem + p->size) - p->mem;
     if (t <= s) return 1;
-    for (uint64_t k = s / g; k <= (t - 1) / g; k++) if (!(p->gmap[k >> 6] >> (k & 63) & 1)) return 0;
+    int sh = part_gran_shift(g);
+    uint64_t k0 = sh >= 0 ? (s >> sh) : (s / g), k1 = sh >= 0 ? ((t - 1) >> sh) : ((t - 1) / g);
+    if (vka_qsched_fast_on()) return vka_gmap_all_set(p->gmap, k0, k1);
+    for (uint64_t k = k0; k <= k1; k++) if (!(p->gmap[k >> 6] >> (k & 63) & 1)) return 0;
     return 1;
 }
 static void parts_mark(pool_ent *p, uintptr_t lo, uintptr_t hi) {   // caller holds g_pmu
     if (!p->gmap || hi <= lo) return;
-    uint64_t g = part_gran();
-    for (uint64_t k = (lo - p->mem) / g; k <= (hi - 1 - p->mem) / g; k++) p->gmap[k >> 6] |= 1ull << (k & 63);
+    uint64_t g = part_gran(); int sh = part_gran_shift(g);
+    uint64_t s = lo - p->mem, e = hi - 1u - p->mem;
+    uint64_t k0 = sh >= 0 ? (s >> sh) : (s / g), k1 = sh >= 0 ? (e >> sh) : (e / g);
+    if (vka_qsched_fast_on()) { vka_gmap_set_range(p->gmap, k0, k1); return; }
+    for (uint64_t k = k0; k <= k1; k++) p->gmap[k >> 6] |= 1ull << (k & 63);
 }
 // Joining parts. A range the GPU is given across a part placed earlier and one placed now lies in two segments (two VkDeviceMemory, two VkBuffers, device addresses
 // that do not follow on), and lookups that need it in one piece fail: an index buffer or indirect arguments skip the draw, a storage buffer is cut at the first
