@@ -16,7 +16,7 @@ GAME_H = ../gen/$(GAME)/game_profile.h
 # reference to an undefined symbol only when it is named as allowed to stay undefined
 WEAK_HOST = -Wl,-U,_vka_swap_rb
 
-run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_time_fast_w25 $(B)/t_gate_fast_w26 $(B)/t_fs_lookup_fast_w27 $(B)/t_oe_fast_w28 $(B)/t_audren_fast_w29 $(B)/t_worker_fast_w30 $(B)/t_movie_fast_w31 $(B)/t_imgmem_fast_w32 $(B)/t_shlib_fast_w33 $(B)/t_pcache_fast_w34 $(B)/t_exec_fast_w35 $(B)/t_present_fast_w36 $(B)/t_perf_fast_w37 $(B)/t_fg_fast_w38 $(B)/t_spvpatch_fast_w39 $(B)/t_ovl_fast_w40 $(B)/t_fps_fast_w41 $(B)/t_tex_layout_fast_w42 $(B)/t_qsched_fast_w43 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
+run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_nup_fast $(B)/t_audio_fast $(B)/t_opus_fast $(B)/t_sync_fast $(B)/t_hid_fast_w23 $(B)/t_svc_fast_w24 $(B)/t_time_fast_w25 $(B)/t_gate_fast_w26 $(B)/t_fs_lookup_fast_w27 $(B)/t_oe_fast_w28 $(B)/t_audren_fast_w29 $(B)/t_worker_fast_w30 $(B)/t_movie_fast_w31 $(B)/t_imgmem_fast_w32 $(B)/t_shlib_fast_w33 $(B)/t_pcache_fast_w34 $(B)/t_exec_fast_w35 $(B)/t_present_fast_w36 $(B)/t_perf_fast_w37 $(B)/t_fg_fast_w38 $(B)/t_spvpatch_fast_w39 $(B)/t_ovl_fast_w40 $(B)/t_fps_fast_w41 $(B)/t_tex_layout_fast_w42 $(B)/t_qsched_fast_w43 $(B)/t_dev_fast_w44 $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_opus_hw $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid
 	$(B)/t_language
 	$(B)/t_heap_size
 	$(B)/t_touch
@@ -54,6 +54,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_fps_fast_w41
 	$(B)/t_tex_layout_fast_w42
 	$(B)/t_qsched_fast_w43
+	$(B)/t_dev_fast_w44
 	$(B)/t_output_stream
 	$(B)/t_opus_hw
 	$(B)/t_audio_spsc
@@ -312,6 +313,8 @@ $(B)/t_ovl_fast_w40: t_ovl_fast_w40.c ../../gfx/vk_android/vka_ovl_fast.h | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W40_TEST_HOOKS -I.. -o $@ t_ovl_fast_w40.c -lpthread
 $(B)/t_fps_fast_w41: t_fps_fast_w41.c ../fps_fast.h ../drs_steps.h | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W41_TEST_HOOKS -I.. -o $@ t_fps_fast_w41.c -lm -lpthread
+$(B)/t_dev_fast_w44: t_dev_fast_w44.c ../../gfx/vk_android/vka_dev_fast.h | $(B)
+	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W44_TEST_HOOKS -I../.. -I../../gfx/vk_android -o $@ t_dev_fast_w44.c -lpthread
 $(B)/t_qsched_fast_w43: t_qsched_fast_w43.c ../../gfx/vk_android/vka_qsched.h ../../gfx/vk_android/vka_qsched_fast.h | $(B)
 	$(CLANG) -O2 -g -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Wno-missing-field-initializers -Wno-unused-parameter -DT_W43_TEST_HOOKS -I../.. -I../../gfx/vk_android -o $@ t_qsched_fast_w43.c -lpthread
 $(B)/t_tex_layout_fast_w42: t_tex_layout_fast_w42.c ../../gfx/nvn/nvn_tex.c ../../gfx/nvn/nvn_tex.h ../../gfx/nvn/nvn_tex_layout_fast.h ../../gfx/tex/nvn_fmt_mtl.c ../../gfx/tex/nvn_fmt_mtl.h | $(B)

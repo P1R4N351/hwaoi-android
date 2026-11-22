@@ -13,6 +13,7 @@
 #include "vka_auto.h"
 #include "vka_scr_fast.h"
 #include "vka_imgmem_fast.h"
+#include "vka_dev_fast.h"
 _Static_assert(VKA_DRV_QCOM == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && VKA_DRV_TURNIP == VK_DRIVER_ID_MESA_TURNIP, "vka_auto.h driver IDs");
 
 // One "[auto] KEY=value because driver_id=N (name)" line for each automatic default by driver this device takes (vka_auto.h), once per run at device creation; a switch
@@ -571,26 +572,26 @@ uint64_t vka_fence_queued(void) { return __atomic_load_n(&V.tl_queued, __ATOMIC_
 enum { POST_RING = 4096 };
 typedef struct { uint64_t fence; void *ops; int n; void (*run)(void *, int); } post_rec;
 static post_rec g_post[POST_RING];
-typedef struct after_rec { struct after_rec *next; uint64_t fence; void (*fn)(void *); void *arg; } after_rec;
+typedef vka_after_node_t after_rec;
 static after_rec *g_after;
-static uint64_t g_fence, g_submitted, g_done;
+static _Atomic uint64_t g_fence;
+static uint64_t g_submitted, g_done;
+static _Atomic uint32_t g_fcv_waiters, g_scv_waiters, g_gidle_waiters;
+static vka_after_pool_t g_after_pool;
 static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER, g_scv = PTHREAD_COND_INITIALIZER;
 
 uint64_t vka_fence_last(void) {
-    if (VKA_ENV("DM_VK_IMG_FAST", 1)) return __atomic_load_n(&g_fence, __ATOMIC_ACQUIRE);
-    pthread_mutex_lock(&g_fmu); uint64_t f = __atomic_load_n(&g_fence, __ATOMIC_ACQUIRE); pthread_mutex_unlock(&g_fmu); return f;
+    if (VKA_ENV("DM_VK_IMG_FAST", 1) || vka_dev_fast_on()) return atomic_load_explicit(&g_fence, memory_order_acquire);
+    pthread_mutex_lock(&g_fmu); uint64_t f = atomic_load_explicit(&g_fence, memory_order_acquire); pthread_mutex_unlock(&g_fmu); return f;
 }
 uint64_t vka_fence_next(void) {
-    pthread_mutex_lock(&g_fmu);
-    uint64_t f = __atomic_load_n(&g_fence, __ATOMIC_RELAXED) + 1;
-    __atomic_store_n(&g_fence, f, __ATOMIC_RELEASE);
-    pthread_mutex_unlock(&g_fmu);
-    return f;
+    if (vka_dev_fast_on()) return atomic_fetch_add_explicit(&g_fence, 1u, memory_order_acq_rel) + 1u;
+    pthread_mutex_lock(&g_fmu); uint64_t f = atomic_fetch_add_explicit(&g_fence, 1u, memory_order_acq_rel) + 1u; pthread_mutex_unlock(&g_fmu); return f;
 }
 void vka_fence_post(uint64_t fence, void *ops, int n, void (*run)(void *, int)) {
     pthread_mutex_lock(&g_fmu);
-    while (g_post[fence % POST_RING].fence && g_post[fence % POST_RING].fence != fence) pthread_cond_wait(&g_fcv, &g_fmu);   // that slot's earlier fence has not completed yet
+    vka_waiter_enter(&g_fcv_waiters); while (g_post[fence % POST_RING].fence && g_post[fence % POST_RING].fence != fence) pthread_cond_wait(&g_fcv, &g_fmu); vka_waiter_leave(&g_fcv_waiters);   // that slot's earlier fence has not completed yet
     {   // (diagnostic) a second record for one fence replaces the first; a record for a fence already done never runs
         static _Atomic int k; post_rec *o = &g_post[fence % POST_RING];
         if (o->fence == fence && atomic_fetch_add(&k, 1) < 8) VRED("fence %llu: a second set of completion effects (%d ops) replaces the first (%d ops, %p)", (unsigned long long)fence, n, o->n, o->ops);
@@ -598,7 +599,7 @@ void vka_fence_post(uint64_t fence, void *ops, int n, void (*run)(void *, int)) 
     }
     g_post[fence % POST_RING] = (post_rec){fence, ops, n, run};
     if (fence > g_submitted) g_submitted = fence;
-    pthread_cond_broadcast(&g_scv); pthread_mutex_unlock(&g_fmu);
+    vka_cond_broadcast_gated(&g_scv, &g_scv_waiters, vka_dev_fast_on()); pthread_mutex_unlock(&g_fmu);
 }
 void vka_fence_cpu(uint64_t fence, void *ops, int n, void (*run)(void *, int)) {
     if (run) run(ops, n); else free(ops);
@@ -610,7 +611,7 @@ void vka_fence_cpu(uint64_t fence, void *ops, int n, void (*run)(void *, int)) {
     }
     if (fence > g_submitted) g_submitted = fence;
     if (fence > g_done) __atomic_store_n(&g_done, fence, __ATOMIC_RELEASE);
-    pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu);
+    vka_cond_broadcast_gated(&g_fcv, &g_fcv_waiters, vka_dev_fast_on()); pthread_mutex_unlock(&g_fmu);
 }
 uint64_t vka_done(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
 int vka_wait_done(uint64_t fence, uint64_t timeout_ns) {
@@ -621,15 +622,17 @@ int vka_wait_done(uint64_t fence, uint64_t timeout_ns) {
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
     dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
     pthread_mutex_lock(&g_fmu);
-    while (g_done < fence) if (pthread_cond_timedwait(&g_fcv, &g_fmu, &dl)) break;
+    vka_waiter_enter(&g_fcv_waiters); while (g_done < fence) if (pthread_cond_timedwait(&g_fcv, &g_fmu, &dl)) break; vka_waiter_leave(&g_fcv_waiters);
     int ok = g_done >= fence; pthread_mutex_unlock(&g_fmu);
     vka_worker_cpu_wait_end(cw);
     return ok;
 }
 void vka_after(uint64_t fence, void (*fn)(void *), void *arg) {
+    if (vka_dev_fast_on() && vka_done() >= fence) { fn(arg); return; }
     pthread_mutex_lock(&g_fmu);
     if (g_done >= fence) { pthread_mutex_unlock(&g_fmu); fn(arg); return; }
-    after_rec *a = malloc(sizeof *a); *a = (after_rec){g_after, fence, fn, arg}; g_after = a;
+    after_rec *a = vka_dev_fast_on() ? vka_after_pool_alloc(&g_after_pool) : (after_rec *)malloc(sizeof *a);
+    *a = (after_rec){g_after, fence, fn, arg}; g_after = a;
     pthread_mutex_unlock(&g_fmu);
 }
 // ---------- Gates ----------
@@ -651,6 +654,7 @@ typedef struct { volatile uint32_t *w; uint32_t mode, value; uint64_t g, fence, 
 static gate_t g_gate[NGATE]; static uint64_t g_gate_in, g_gate_out, g_gate_val;
 static VkSemaphore g_gate_sem; static int g_gate_up;   // (g_gate_up: -1 no semaphore)
 static const volatile uint32_t *g_gban[NGBAN]; static int g_ngban;
+static vka_gban_fast_t g_gban_fast;
 static pthread_mutex_t g_gmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gcv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_gidle = PTHREAD_COND_INITIALIZER; static _Atomic int g_gate_pend;   // signaled at each opening; gates added and not yet opened (vka_gate_drain)
 static _Atomic uint64_t g_gate_nw, g_gate_nc, g_gate_nt, g_gate_ns;
@@ -658,10 +662,12 @@ static _Atomic int g_gate_hold;   // the host's own stalls of the present path u
 static int gate_pred(uint32_t cur, uint32_t mode, uint32_t target) { return mode == 0 ? cur == target : (uint32_t)(cur - target) < 0x80000000u; }
 VkSemaphore vka_gate_sem(void) { return g_gate_up > 0 ? g_gate_sem : VK_NULL_HANDLE; }
 static void gate_ban_locked(const volatile uint32_t *w) {
+    vka_gban_fast_add(&g_gban_fast, w);
     for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) return;
     if (g_ngban < NGBAN) g_gban[g_ngban++] = w;
 }
 int vka_gate_banned(const volatile uint32_t *w) {
+    if (vka_dev_fast_on()) return vka_gban_fast_has(&g_gban_fast, w);
     pthread_mutex_lock(&g_gmu); int b = 0; for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) b = 1; pthread_mutex_unlock(&g_gmu); return b;
 }
 static void gate_open_locked(int why) {   // the oldest gate opens (why: 0 its word, 1 a CPU wait, 2 its time)
@@ -674,7 +680,7 @@ static void gate_open_locked(int why) {   // the oldest gate opens (why: 0 its w
     if (why == 0) g_gate_nw++; else if (why == 1) g_gate_nc++; else g_gate_nt++;
     if (why == 2) gate_ban_locked(x->w);   // (a CPU wait opens it for that frame only)
     g_gate_out++;
-    atomic_fetch_sub(&g_gate_pend, 1); pthread_cond_broadcast(&g_gidle);   // (after the signal: the driver has taken what the gate held back)
+    atomic_fetch_sub(&g_gate_pend, 1); vka_cond_broadcast_gated(&g_gidle, &g_gidle_waiters, vka_dev_fast_on());   // (after the signal: the driver has taken what the gate held back)
 }
 static void gate_poll_locked(void) {
     while (g_gate_out < g_gate_in) {
@@ -731,8 +737,9 @@ uint64_t vka_gate_add(volatile uint32_t *w, uint32_t mode, uint32_t value, uint6
         else { pthread_detach(th); g_gate_up = 1; }
     }
     uint64_t g = 0;
-    for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) goto out;
-    if (g_gate_up > 0 && g_gate_in - g_gate_out < NGATE) {
+    int banned = vka_dev_fast_on() ? vka_gban_fast_has(&g_gban_fast, w) : 0;
+    if (!vka_dev_fast_on()) { for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) { banned = 1; break; } }
+    if (!banned && g_gate_up > 0 && g_gate_in - g_gate_out < NGATE) {
         g = ++g_gate_val;
         VkEvent e = VK_NULL_HANDLE;
         if (ev_on && ev && fence > vka_done()) {   // (a fence already done would destroy it at once)
@@ -744,7 +751,6 @@ uint64_t vka_gate_add(volatile uint32_t *w, uint32_t mode, uint32_t value, uint6
         atomic_fetch_add(&g_gate_pend, 1);
         pthread_cond_broadcast(&g_gcv);
     }
-out:
     pthread_mutex_unlock(&g_gmu);
     return g;
 }
@@ -768,10 +774,12 @@ int vka_gate_drain(uint64_t timeout_ns) {
     if (g_gate_up <= 0) return 0;
     uint64_t t0 = now_ns();
     pthread_mutex_lock(&g_gmu);
-    while (g_gate_out < g_gate_in && now_ns() - t0 < timeout_ns) {   // (the gate thread looks every millisecond, nvnEventSignal at once)
+    vka_waiter_enter(&g_gidle_waiters);
+    while (g_gate_out < g_gate_in && now_ns() - t0 < timeout_ns) {
         struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 500000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
         pthread_cond_timedwait(&g_gidle, &g_gmu, &dl);
     }
+    vka_waiter_leave(&g_gidle_waiters);
     int left = (int)(g_gate_in - g_gate_out);
     pthread_mutex_unlock(&g_gmu);
     return left;
@@ -856,7 +864,7 @@ static void *completion_main(void *arg) {
     uint64_t stall_t0 = 0, stall_at = 0; int stall_logged = 0;
     for (;;) {
         pthread_mutex_lock(&g_fmu);
-        while (g_done >= g_submitted) pthread_cond_wait(&g_scv, &g_fmu);
+        vka_waiter_enter(&g_scv_waiters); while (g_done >= g_submitted) pthread_cond_wait(&g_scv, &g_fmu); vka_waiter_leave(&g_scv_waiters);
         // Wait for the next fence, not the last one handed to the queue: each fence is published (and its waiters woken) when the GPU reaches it. Waiting for the last one
         // held every earlier fence back until all work queued at that moment had run: Donkey Kong Bananza waits for its previous frame's last fence after queueing two
         // submissions of the next frame, so its wait ended only when those were done too. DM_VK_DONE_LAST=1 (live) waits for the last one, as before, for A/B runs
@@ -896,8 +904,8 @@ static void *completion_main(void *arg) {
         if (v > g_done) __atomic_store_n(&g_done, v, __ATOMIC_RELEASE);
         after_rec *run = NULL, **pp = &g_after;
         while (*pp) { after_rec *a = *pp; if (a->fence <= g_done) { *pp = a->next; a->next = run; run = a; } else pp = &a->next; }
-        pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu);
-        while (run) { after_rec *a = run; run = a->next; a->fn(a->arg); free(a); }
+        vka_cond_broadcast_gated(&g_fcv, &g_fcv_waiters, vka_dev_fast_on()); pthread_mutex_unlock(&g_fmu);
+        while (run) { after_rec *a = run; run = a->next; a->fn(a->arg); vka_after_pool_free(&g_after_pool, a); }
     }
     return NULL;
 }
@@ -1022,7 +1030,8 @@ void vka_scratch_retire(uint64_t fence) { retire(0, fence); }
 // records first contents into the submission, as before
 enum { NUP = 16 };
 static struct { VkCommandBuffer cb; uint64_t val; } g_ub[NUP];
-static VkCommandPool g_upool; static uint64_t g_uval; static int g_ui = -1; static unsigned g_unext;   // g_ui: the open batch's slot (-1: none); replay thread only
+static VkCommandPool g_upool; static uint64_t g_uval; static int g_ui = -1; static unsigned g_unext;
+static vka_ub_fast_t g_ub_fast;   // g_ui: the open batch's slot (-1: none); replay thread only
 static uint64_t g_n_ubatch, g_n_uwait, g_uwait_ns;
 static int up_wait(uint64_t v) {   // 1 = the upload timeline reached v
     if (up_done() >= v) return 1;
@@ -1046,7 +1055,9 @@ VkCommandBuffer vka_up_begin(void) {
             VkCommandBuffer cbs[NUP]; VkCommandPool p = VK_NULL_HANDLE;
             if (vk.vkCreateCommandPool(V.dev, &pi, NULL, &p) || ((ai.commandPool = p), vk.vkAllocateCommandBuffers(V.dev, &ai, cbs)) || vk.vkCreateSemaphore(V.dev, &sci, NULL, &g_utl)) {
                 VRED_ONCE("upload batches not set up: first contents are recorded into the submission"); g_utl = VK_NULL_HANDLE; failed = 1; return VK_NULL_HANDLE; }
-            for (int i = 0; i < NUP; i++) g_ub[i].cb = cbs[i];
+            uint64_t ub_h[NUP];
+            for (int i = 0; i < NUP; i++) { g_ub[i].cb = cbs[i]; ub_h[i] = (uint64_t)(uintptr_t)cbs[i]; }
+            vka_ub_fast_init(&g_ub_fast, ub_h, NUP);
             g_upool = p;
         }
         if (vka_hung()) return VK_NULL_HANDLE;
@@ -1062,7 +1073,10 @@ VkCommandBuffer vka_up_begin(void) {
     return g_ub[g_ui].cb;
 }
 void vka_up_end(void) { vka_scr_up = 0; }
-static int is_batch(VkCommandBuffer cb) { for (int i = 0; i < NUP; i++) if (cb && g_ub[i].cb == cb) return 1; return 0; }
+static int is_batch(VkCommandBuffer cb) {
+    if (vka_dev_fast_on() && g_ub_fast.ready) return vka_ub_fast_is_batch(&g_ub_fast, (uint64_t)(uintptr_t)cb);
+    for (int i = 0; i < NUP; i++) if (cb && g_ub[i].cb == cb) return 1; return 0;
+}
 // No batch can be begun (a slot's batch still runs after the hang time): the upload goes on in the submission being recorded, with its staging (the batch before it was sent,
 // so its image's first barrier and copies come before; an upload stopped half-way would leave a tracked image with part of its content for good)
 static VkCommandBuffer up_fallback(void) { vka_scr_up = 0; return vka_rp_cb(); }
@@ -1167,8 +1181,10 @@ static int floor_auto(int top, uint64_t f) {
     uint64_t v[30]; int n = 0;
     for (uint64_t g = f > 3 ? f - 3 : 0; g > 0 && g + 34 > f && n < 30; g--) { unsigned k = g % FSPAN; if (atomic_load(&g_fspan_f[k]) == g && atomic_load(&g_fspan[k])) v[n++] = atomic_load(&g_fspan[k]); }
     if (n < 20) return cur;
-    qsort(v, n, sizeof *v, cmp_u64);
-    double p90 = v[n * 9 / 10] / 1e6, per = vka_floor_period_ns() / 1e6;
+    uint64_t p90_ns;
+    if (vka_dev_fast_on()) p90_ns = vka_select_kth_u64(v, (size_t)n, (size_t)(n * 9 / 10));
+    else { qsort(v, (size_t)n, sizeof *v, cmp_u64); p90_ns = v[n * 9 / 10]; }
+    double p90 = (double)p90_ns / 1e6, per = (double)vka_floor_period_ns() / 1e6;
     int was = cur;
     g_p90_sum += p90; g_p90_n++;
     double hi = VKA_ENVF("DM_VK_GPU_FLOOR_HI", 2.0), lo = VKA_ENVF("DM_VK_GPU_FLOOR_LO", 5.0);   // ms below the period: raise above per - hi, lower below per - lo
