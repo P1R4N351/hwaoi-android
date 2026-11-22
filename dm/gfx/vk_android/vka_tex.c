@@ -28,6 +28,7 @@
 #include "vka_wbfollow.h"
 #include "vka_edge_unpin.h"
 #include "vka_tex_fast.h"
+#include "vka_fmt_fast.h"
 #include "vka_gw_fast.h"
 #include "vka_view_fast.h"
 #include "../nvn/nvn_reg_fast.h"
@@ -44,8 +45,30 @@ __attribute__((weak)) int dm_movie_playing(void) { return 0; }
 uint64_t vka_frame(void);
 
 // ---------- Formats ----------
+_Static_assert(
+    VKA_FMT_VK_UNDEFINED == VK_FORMAT_UNDEFINED &&
+    VKA_FMT_VK_R5G6B5_UNORM_PACK16 == VK_FORMAT_R5G6B5_UNORM_PACK16 &&
+    VKA_FMT_VK_B5G6R5_UNORM_PACK16 == VK_FORMAT_B5G6R5_UNORM_PACK16 &&
+    VKA_FMT_VK_R8G8B8A8_UNORM == VK_FORMAT_R8G8B8A8_UNORM &&
+    VKA_FMT_VK_R8G8B8A8_SRGB == VK_FORMAT_R8G8B8A8_SRGB &&
+    VKA_FMT_VK_B8G8R8A8_UNORM == VK_FORMAT_B8G8R8A8_UNORM &&
+    VKA_FMT_VK_B8G8R8A8_SRGB == VK_FORMAT_B8G8R8A8_SRGB &&
+    VKA_FMT_VK_A8B8G8R8_UNORM_PACK32 == VK_FORMAT_A8B8G8R8_UNORM_PACK32 &&
+    VKA_FMT_VK_A8B8G8R8_SRGB_PACK32 == VK_FORMAT_A8B8G8R8_SRGB_PACK32 &&
+    VKA_FMT_VK_D24_UNORM_S8_UINT == VK_FORMAT_D24_UNORM_S8_UINT &&
+    VKA_FMT_VK_BC1_RGB_UNORM_BLOCK == VK_FORMAT_BC1_RGB_UNORM_BLOCK &&
+    VKA_FMT_VK_BC7_SRGB_BLOCK == VK_FORMAT_BC7_SRGB_BLOCK &&
+    VKA_FMT_VK_ASTC_4x4_UNORM_BLOCK == VK_FORMAT_ASTC_4x4_UNORM_BLOCK &&
+    VKA_FMT_VK_ASTC_12x12_SRGB_BLOCK == VK_FORMAT_ASTC_12x12_SRGB_BLOCK &&
+    VKA_FMT_VK_A4B4G4R4_UNORM_PACK16 == VK_FORMAT_A4B4G4R4_UNORM_PACK16 &&
+    VKA_FMT_VK_A1B5G5R5_UNORM_PACK16 == VK_FORMAT_A1B5G5R5_UNORM_PACK16,
+    "vka_fmt_fast.h VkFormat numeric constants");
 typedef struct { VkFormat vk; uint8_t kind, srgb; } fmt_ent;
 static fmt_ent fmt_ent_of(int f) {
+    if (vka_fmt_fast_on()) {
+        vka_fmt_lut_ent_t e = vka_fmt_lut_lookup(f);
+        return (fmt_ent){(VkFormat)e.vk, e.kind, e.srgb};
+    }
 #define C(v) (fmt_ent){VK_FORMAT_##v, 0, 0}
 #define U(v) (fmt_ent){VK_FORMAT_##v, 1, 0}
 #define S(v) (fmt_ent){VK_FORMAT_##v, 2, 0}
@@ -90,6 +113,7 @@ static fmt_ent fmt_ent_of(int f) {
     return (fmt_ent){VK_FORMAT_UNDEFINED, 0, 0};
 }
 static VkFormat srgb_twin(VkFormat f) {
+    if (vka_fmt_fast_on()) return (VkFormat)vka_srgb_twin_fast((uint32_t)f);
     switch (f) {
     case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_BC1_RGB_SRGB_BLOCK; case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
@@ -98,6 +122,7 @@ static VkFormat srgb_twin(VkFormat f) {
     }
 }
 static VkFormat raw_unorm_twin(VkFormat f) {
+    if (vka_fmt_fast_on()) return (VkFormat)vka_raw_unorm_twin_fast((uint32_t)f);
     switch (f) {
     case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
     case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
@@ -105,7 +130,14 @@ static VkFormat raw_unorm_twin(VkFormat f) {
     default: return f;
     }
 }
+static vka_feats_cache_t g_vka_feats_fast = VKA_FEATS_CACHE_INIT;
+static uint32_t vka_feats_probe_vk(uint32_t fmt, void *ctx) {
+    (void)ctx;
+    VkFormatProperties p; vk.vkGetPhysicalDeviceFormatProperties(V.pd, (VkFormat)fmt, &p);
+    return (uint32_t)p.optimalTilingFeatures;
+}
 static VkFormatFeatureFlags feats(VkFormat f) {
+    if (vka_fmt_fast_on()) return (VkFormatFeatureFlags)vka_feats_fast_get(&g_vka_feats_fast, (uint32_t)f, vka_feats_probe_vk, NULL);
     static struct { VkFormat f; VkFormatFeatureFlags ff; } cache[128]; static int n; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
     for (int i = 0; i < n; i++) if (cache[i].f == f) { VkFormatFeatureFlags ff = cache[i].ff; pthread_mutex_unlock(&mu); return ff; }
@@ -2208,16 +2240,19 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
 typedef struct { const nvn_texdesc *d; const uint8_t *src; uint8_t *dst; size_t pitch; uint32_t lv, ly, y0, y1; _Atomic int *bad; } up_part;   // bad: its piece's flag
 // A part is claimed by compare-and-swap on next while next < n: a helper that wakes late, or comes back from the last batch, can only claim a part of the batch being set up
 // once it is complete (p, then next = 0, then n; n = 0 between batches)
-static struct { pthread_mutex_t mu; pthread_cond_t cv, done_cv; _Atomic(up_part *) p; _Atomic uint32_t n, next, done; _Atomic int fail; uint64_t gen; int nth; } UP = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+static struct { pthread_mutex_t mu; pthread_cond_t cv, done_cv; _Atomic(up_part *) p; _Atomic uint32_t n, next, done, waiting; _Atomic int fail; uint64_t gen; int nth; } UP = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
 static pthread_mutex_t g_up_one = PTHREAD_MUTEX_INITIALIZER;   // one parallel upload at a time (another thread's upload runs on its own thread)
 static void up_run(void) {   // take parts until none is left
+    uint32_t n = atomic_load(&UP.n);
+    int fast = vka_fmt_fast_on();
     for (;;) {
-        uint32_t i = atomic_load(&UP.next), n = atomic_load(&UP.n);
-        if (i >= n) return;
-        if (!atomic_compare_exchange_weak(&UP.next, &i, i + 1)) continue;
+        uint32_t i = fast ? vka_up_claim_fast(&UP.next, n) : atomic_load(&UP.next);
+        if (!fast) { n = atomic_load(&UP.n); if (i >= n) return; if (!atomic_compare_exchange_weak(&UP.next, &i, i + 1)) continue; }
+        else if (i >= n) return;
         up_part *q = &atomic_load(&UP.p)[i];
         if (nvn_deswizzle_rows(q->d, q->lv, q->ly, q->src, q->dst, q->pitch, q->y0, q->y1)) { atomic_store(&UP.fail, 1); atomic_store(q->bad, 1); }
-        if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
+        if (fast) vka_up_finish_part_fast(&UP.done, n, &UP.waiting, &UP.mu, &UP.done_cv);
+        else if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
     }
 }
 static void *up_main(void *a) {
@@ -2238,10 +2273,18 @@ static int up_parallel(up_part *p, uint32_t n, int *fail) {
     if (!UP.nth) { pthread_mutex_unlock(&g_up_one); return 0; }
     pthread_mutex_lock(&UP.mu);
     atomic_store(&UP.fail, 0); atomic_store(&UP.done, 0); atomic_store(&UP.p, p); atomic_store(&UP.next, 0); atomic_store(&UP.n, n); UP.gen++;
-    pthread_cond_broadcast(&UP.cv);
+    int fast = vka_fmt_fast_on();
+    if (fast && UP.nth == 1) pthread_cond_signal(&UP.cv); else pthread_cond_broadcast(&UP.cv);
     pthread_mutex_unlock(&UP.mu);
     up_run();   // this thread takes parts too
-    pthread_mutex_lock(&UP.mu); while (atomic_load(&UP.done) < n) pthread_cond_wait(&UP.done_cv, &UP.mu); atomic_store(&UP.n, 0); pthread_mutex_unlock(&UP.mu);
+    if (fast && atomic_load_explicit(&UP.done, memory_order_acquire) >= n) { atomic_store_explicit(&UP.n, 0, memory_order_release); }
+    else {
+        pthread_mutex_lock(&UP.mu);
+        atomic_store_explicit(&UP.waiting, 1u, memory_order_seq_cst);
+        while (atomic_load(&UP.done) < n) pthread_cond_wait(&UP.done_cv, &UP.mu);
+        atomic_store_explicit(&UP.waiting, 0u, memory_order_seq_cst);
+        atomic_store(&UP.n, 0); pthread_mutex_unlock(&UP.mu);
+    }
     *fail = atomic_load(&UP.fail);
     pthread_mutex_unlock(&g_up_one);
     return 1;
@@ -2259,21 +2302,26 @@ static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *
     int minb = VKA_ENV("DM_VK_UPLOAD_MT_MIN", 256 << 10);
     if (total < (uint64_t)(minb > 0 ? minb : 1) || npieces > 4096 || VKA_ENV("DM_VK_UPLOAD_MT", 3) <= 0) return 0;
     typedef struct { vka_span s; uint32_t lv, ly, w, h, z, bx, by; size_t pitch; _Atomic int bad; } piece_t;
-    piece_t *pc = malloc(npieces * sizeof *pc); up_part *parts = NULL; uint32_t np = 0, cap = 0;
+    piece_t stack_pc[16]; up_part stack_parts[64]; int fast = vka_fmt_fast_on();
+    piece_t *pc = (fast && npieces <= 16u) ? stack_pc : malloc(npieces * sizeof *pc);
+    up_part *parts = fast ? stack_parts : NULL; uint32_t np = 0, cap = fast ? 64u : 0u;
     if (!pc) return 0;
     uint32_t k = 0;
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
         uint32_t bx = (w + f->bw - 1) / f->bw, by = (h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, piece = pitch * by * z;
-        int rows = nvn_deswizzle_block_rows(d, lv + im->base);   // (the texture's level: image level lv is texture level lv + base, a soft texture's)
-        if (rows < 0 || (uint32_t)rows != by) { free(pc); free(parts); return 0; }   // (a shape the serial path reports)
+        int rows = nvn_deswizzle_block_rows(d, lv + im->base);
+        if (rows < 0 || (uint32_t)rows != by) { if (pc != stack_pc) free(pc); if (parts != stack_parts) free(parts); return 0; }
         for (uint32_t ly = 0; ly < im->layers; ly++, k++) {
             piece_t *q = &pc[k]; *q = (piece_t){{0}, lv, ly, w, h, z, bx, by, pitch, 0};
-            if (!vka_scratch(piece, 16, &q->s)) goto cut;   // (no scratch: as the serial path, the pieces before it are uploaded)
-            // Runs of block rows of at least ~64 KB (all slices of a 3D level in each)
+            if (!vka_scratch(piece, 16, &q->s)) goto cut;
             uint32_t per = (uint32_t)((65536 + pitch * z - 1) / (pitch * z)); if (!per) per = 1;
             for (uint32_t y = 0; y < by; y += per) {
-                if (np == cap) { cap = cap ? cap * 2 : 64; up_part *n2 = realloc(parts, cap * sizeof *parts); if (!n2) { free(pc); free(parts); return 0; } parts = n2; }
+                if (np == cap) {
+                    uint32_t ncap = cap ? cap * 2u : 64u; up_part *n2 = (parts == stack_parts) ? malloc(ncap * sizeof *parts) : realloc(parts, ncap * sizeof *parts);
+                    if (!n2) { if (pc != stack_pc) free(pc); if (parts != stack_parts) free(parts); return 0; }
+                    if (parts == stack_parts) memcpy(n2, stack_parts, cap * sizeof *parts); parts = n2; cap = ncap;
+                }
                 parts[np++] = (up_part){d, t->mem, q->s.ptr, pitch, lv + im->base, ly, y, y + per < by ? y + per : by, &q->bad};
             }
         }
@@ -2281,8 +2329,7 @@ static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *
 cut:;
     int fail = 0;
     if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) if (nvn_deswizzle_rows(parts[i].d, parts[i].lv, parts[i].ly, parts[i].src, parts[i].dst, parts[i].pitch, parts[i].y0, parts[i].y1)) { fail = 1; *parts[i].bad = 1; } }
-    free(parts);
-    // A piece that could not be deswizzled ends the upload there, as on the serial path: the pieces before it are copied, it and those after it are not
+    if (parts != stack_parts) free(parts);
     if (fail) VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target);
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < k; i++) {
@@ -2292,7 +2339,7 @@ cut:;
         vk.vkCmdCopyBufferToImage(cb, q->s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         bytes += q->pitch * q->by * q->z;
     }
-    free(pc);
+    if (pc != stack_pc) free(pc);
     *nbytes = bytes;
     return 1;
 }
