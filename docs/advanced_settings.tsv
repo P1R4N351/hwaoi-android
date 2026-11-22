@@ -488,6 +488,7 @@ DM_VK_BAR_KEEP	developer	Diagnostics			text			both
 DM_VK_BAR_NARROW	developer	Graphics			text			both							
 DM_VK_BC_RT	developer	Graphics			text			both							
 DM_VK_BIGIMG_MB	developer	Diagnostics			text			both							
+DM_VK_BIND_FAST	developer	Performance			text			both							
 DM_VK_BIND_LOG	developer	Diagnostics			text			both							
 DM_VK_BISECT	developer	Diagnostics			text			both							
 DM_VK_CAPTURE	internal	Diagnostics			text			both						Mac or iOS only	

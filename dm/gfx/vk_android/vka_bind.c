@@ -1,5 +1,6 @@
 // The binding walker (vka_bind.h): nvn_mtl.m encode_args' sources for each binding kind, written once for the Vulkan replay and its Mac test
 #include "vka_bind.h"
+#include "vka_bind_fast.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +12,7 @@ uint64_t vka_tex_slot(const vka_bstate *s, int st, unsigned reg) {
     return reg >= 32 && reg - 32 < DMSH_C2_IMG_SLOTS && s->img[st][reg - 32] ? s->img[st][reg - 32] : reg < VKA_NTEX ? s->tex[st][reg] : 0;
 }
 uint64_t vka_c2_handle(const vka_bstate *s, int st, unsigned b) {
+    if (vka_bind_fast_on()) return vka_c2_handle_fast(s, st, b);
     if (b >= DMSH_C2_TEX && b < DMSH_C2_SEPTEX && !((b - DMSH_C2_TEX) % DMSH_C2_ROW)) return vka_tex_slot(s, st, (b - DMSH_C2_TEX) / DMSH_C2_ROW);
     if (b >= DMSH_C2_SEPTEX && b < DMSH_C2_SAMP && !((b - DMSH_C2_SEPTEX) % DMSH_C2_ROW)) return s->tex[st][DMSH_SEPTEX_SLOT0 + (b - DMSH_C2_SEPTEX) / DMSH_C2_ROW];
     if (b >= DMSH_C2_SAMP && b < DMSH_C2_SAMP + DMSH_C2_ROW * DMSH_C2_SEP_SLOTS && !((b - DMSH_C2_SAMP) % DMSH_C2_ROW)) return s->samp[st][(b - DMSH_C2_SAMP) / DMSH_C2_ROW];
@@ -48,72 +50,94 @@ static int refuse(char *why, size_t n, const char *fmt, ...) {
     return VKA_WALK_REFUSE;
 }
 
+static int walk_elem(const vka_bstate *s, int st, const dmsh_vk_bind *b, unsigned k,
+                     uint32_t ssbo_align, uint64_t dev_align, vka_read_fn rd, void *ctx,
+                     const uint32_t *tw, const uint32_t *sw, vka_res *out, char *why, size_t whyn) {
+    vka_res r = {VKA_R_NULL, b->desc, b->flags, b->dim, b->binding, (uint16_t)k, 0, 0, 0, 0, 0};
+    int reg = b->reg, noslot = (b->flags & DMSH_VK_BF_NOSLOT) || reg < 0;
+    switch (b->kind) {
+    case DMSH_VK_KIND_CBUF:
+        if (!noslot && reg < 16 && s->ubo[st][reg].addr) { r.what = VKA_R_BUF; r.addr = s->ubo[st][reg].addr; r.size = s->ubo[st][reg].size; }
+        break;
+    case DMSH_VK_KIND_C1: r.what = VKA_R_C1; break;
+    case DMSH_VK_KIND_SUPPORT: r.what = VKA_R_SUPPORT; break;
+    case DMSH_VK_KIND_DRVCB: r.what = VKA_R_DRV; r.bank = (int16_t)reg; break;
+    case DMSH_VK_KIND_SBUF: case DMSH_VK_KIND_UBO_PTR:
+        if (!noslot && reg < 16) {
+            const vka_range *u = b->kind == DMSH_VK_KIND_SBUF ? &s->ssbo[st][reg] : &s->ubo[st][reg];
+            if (u->addr) { r.what = VKA_R_BUF; r.addr = u->addr; r.size = u->size; }
+        }
+        break;
+    case DMSH_VK_KIND_SBUF_UBO: {
+        uint64_t a = noslot ? 0 : ubo_word(s, st, reg, b->off, 8, rd, ctx);
+        if (a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }
+        break; }
+    case DMSH_VK_KIND_TEX: case DMSH_VK_KIND_TEX_UBO: case DMSH_VK_KIND_TEX_C2A: {
+        int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, tw ? tw[k] : (uint32_t)ubo_word(s, st, reg, b->off + ubo_elem(b, k), 4, rd, ctx)))
+                : b->kind == DMSH_VK_KIND_TEX_C2A ? (int)(vka_c2_handle(s, st, b->off + 8u * k) & 0xfffff)
+                : noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
+        int sid = !b->skind ? 0 : (b->skind == DMSH_VK_KIND_SAMP_UBO && sw) ? ubo_samp_id(s, sw[k]) : samp_of(s, st, b, k, rd, ctx);
+        if (tid) { r.what = VKA_R_TEX; r.tid = tid; r.sid = sid; }
+        break; }
+    case DMSH_VK_KIND_TBUF: {
+        int tid = noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
+        if (tid) { r.what = VKA_R_TBUF; r.tid = tid; }
+        break; }
+    case DMSH_VK_KIND_IMG: {
+        int tid = noslot || reg >= 32 ? 0 : (int)(s->img[st][reg] & 0xfffff);
+        if (tid) { r.what = VKA_R_IMG; r.tid = tid; }
+        break; }
+    case DMSH_VK_KIND_IMG_UBO: {
+        int tid = noslot ? 0 : ubo_tex_id(s, tw ? tw[k] : (uint32_t)ubo_word(s, st, reg, b->off + ubo_elem(b, k), 4, rd, ctx));
+        if (tid) { r.what = VKA_R_IMG; r.tid = tid; }
+        break; }
+    case DMSH_VK_KIND_SAMP: case DMSH_VK_KIND_SAMP_TEX: case DMSH_VK_KIND_SAMP_ID: case DMSH_VK_KIND_SAMP_UBO: case DMSH_VK_KIND_SAMP_C2A: {
+        dmsh_vk_bind sb = *b; sb.skind = b->kind; sb.sreg = b->reg; sb.soff = b->kind == DMSH_VK_KIND_SAMP_C2A ? b->soff : b->off;
+        int sid = (noslot && b->kind != DMSH_VK_KIND_SAMP_C2A) ? 0 : (b->kind == DMSH_VK_KIND_SAMP_UBO && sw) ? ubo_samp_id(s, sw[k]) : samp_of(s, st, &sb, k, rd, ctx);
+        if (sid) { r.what = VKA_R_TEX; r.sid = sid; }
+        break; }
+    case DMSH_VK_KIND_GMEM_MAP: r.what = VKA_R_GMEM_MAP; break;
+    case DMSH_VK_KIND_GMEM_LOG: r.what = VKA_R_GMEM_LOG; break;
+    case DMSH_VK_KIND_SHARED_SPILL:
+        if (!b->bytes || b->bytes % 4) return refuse(why, whyn, "binding %u: shared memory spill of %u bytes a slice", b->binding, b->bytes);
+        r.what = VKA_R_SHARED_SPILL; r.size = b->bytes; break;
+    default: return refuse(why, whyn, "binding %u: kind %u", b->binding, b->kind);
+    }
+    if (r.what == VKA_R_BUF && r.desc == 7) {
+        if (ssbo_align) { uint64_t d = r.addr & (ssbo_align - 1); r.addr -= d; if (r.size) r.size += d; }
+        else if (dev_align && (r.addr & (dev_align - 1)))
+            return refuse(why, whyn, "storage buffer (binding %u, slot %d) at %#llx is not %llu-byte aligned (a library built before ssbo_align)", b->binding, reg, (unsigned long long)r.addr, (unsigned long long)dev_align);
+    }
+    *out = r;
+    return 0;
+}
+
 int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_bind *bs, uint32_t ssbo_align, uint64_t dev_align, vka_read_fn rd, void *ctx,
              vka_res *out, int max, int *uses_pool, char *why, size_t whyn) {
     int n = 0;
     if (st < 0 || st >= VKA_NSTAGE) return refuse(why, whyn, "NVN stage %d", st);
+    int fast = vka_bind_fast_on();
     for (unsigned i = 0; i < e->bind_count; i++) {
         const dmsh_vk_bind *b = &bs[i];
         if (b->kind == DMSH_VK_KIND_UNKNOWN) return refuse(why, whyn, "binding %u has no placed kind", b->binding);
         if (b->set == DMSH_VK_SET_POOL || b->kind == DMSH_VK_KIND_TEX_POOL || b->kind == DMSH_VK_KIND_SAMP_POOL) { if (uses_pool) *uses_pool = 1; continue; }
         unsigned cnt = b->count ? b->count : 1;
+        uint32_t tw_buf[128], sw_buf[128];
+        const uint32_t *tw = NULL, *sw = NULL;
+        int noslot = (b->flags & DMSH_VK_BF_NOSLOT) || b->reg < 0;
+        if (fast && !noslot && (b->kind == DMSH_VK_KIND_TEX_UBO || b->kind == DMSH_VK_KIND_IMG_UBO)) {
+            if (vka_ubo_handles_prefetch(s, st, b->reg, b->off, cnt, vka_texu_elem, rd, ctx, tw_buf) > 0) tw = tw_buf;
+        }
+        if (fast && b->kind != DMSH_VK_KIND_SAMP_UBO && b->skind == DMSH_VK_KIND_SAMP_UBO) {
+            if (tw && b->sreg == b->reg && b->soff == b->off) sw = tw;
+            else if (vka_ubo_handles_prefetch(s, st, b->sreg, b->soff, cnt, vka_texu_elem, rd, ctx, sw_buf) > 0) sw = sw_buf;
+        } else if (fast && !noslot && b->kind == DMSH_VK_KIND_SAMP_UBO) {
+            if (vka_ubo_handles_prefetch(s, st, b->reg, b->off, cnt, vka_texu_elem, rd, ctx, sw_buf) > 0) sw = sw_buf;
+        }
         for (unsigned k = 0; k < cnt; k++) {
             if (n >= max) return refuse(why, whyn, "more than %d descriptors", max);
-            vka_res r = {VKA_R_NULL, b->desc, b->flags, b->dim, b->binding, (uint16_t)k, 0, 0, 0, 0, 0};
-            int reg = b->reg;
-            int noslot = (b->flags & DMSH_VK_BF_NOSLOT) || reg < 0;
-            switch (b->kind) {
-            case DMSH_VK_KIND_CBUF:
-                if (!noslot && reg < 16 && s->ubo[st][reg].addr) { r.what = VKA_R_BUF; r.addr = s->ubo[st][reg].addr; r.size = s->ubo[st][reg].size; }
-                break;
-            case DMSH_VK_KIND_C1: r.what = VKA_R_C1; break;
-            case DMSH_VK_KIND_SUPPORT: r.what = VKA_R_SUPPORT; break;
-            case DMSH_VK_KIND_DRVCB: r.what = VKA_R_DRV; r.bank = (int16_t)reg; break;
-            case DMSH_VK_KIND_SBUF: case DMSH_VK_KIND_UBO_PTR: {
-                const vka_range *u = noslot || reg >= 16 ? NULL : b->kind == DMSH_VK_KIND_SBUF ? &s->ssbo[st][reg] : &s->ubo[st][reg];
-                if (u && u->addr) { r.what = VKA_R_BUF; r.addr = u->addr; r.size = u->size; }
-                break; }
-            case DMSH_VK_KIND_SBUF_UBO: {
-                uint64_t a = noslot ? 0 : ubo_word(s, st, reg, b->off, 8, rd, ctx);
-                if (a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }   // the size is not known: to the end of the chunk
-                break; }
-            case DMSH_VK_KIND_TEX: case DMSH_VK_KIND_TEX_UBO: case DMSH_VK_KIND_TEX_C2A: {
-                int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off + ubo_elem(b, k), 4, rd, ctx)))
-                        : b->kind == DMSH_VK_KIND_TEX_C2A ? (int)(vka_c2_handle(s, st, b->off + 8u * k) & 0xfffff)
-                        : noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
-                int sid = b->skind ? samp_of(s, st, b, k, rd, ctx) : 0;
-                if (tid) { r.what = VKA_R_TEX; r.tid = tid; r.sid = sid; }
-                break; }
-            case DMSH_VK_KIND_TBUF: {
-                int tid = noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
-                if (tid) { r.what = VKA_R_TBUF; r.tid = tid; }
-                break; }
-            case DMSH_VK_KIND_IMG: {
-                int tid = noslot || reg >= 32 ? 0 : (int)(s->img[st][reg] & 0xfffff);
-                if (tid) { r.what = VKA_R_IMG; r.tid = tid; }
-                break; }
-            case DMSH_VK_KIND_IMG_UBO: {   // the image handle the game keeps in its uniform buffer (Unreal Engine 5 on the Switch 2: c[3]), read at bind time as tex_ubo's
-                int tid = noslot ? 0 : ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off + ubo_elem(b, k), 4, rd, ctx));
-                if (tid) { r.what = VKA_R_IMG; r.tid = tid; }
-                break; }
-            case DMSH_VK_KIND_SAMP: case DMSH_VK_KIND_SAMP_TEX: case DMSH_VK_KIND_SAMP_ID: case DMSH_VK_KIND_SAMP_UBO: case DMSH_VK_KIND_SAMP_C2A: {
-                dmsh_vk_bind sb = *b; sb.skind = b->kind; sb.sreg = b->reg; sb.soff = b->kind == DMSH_VK_KIND_SAMP_C2A ? b->soff : b->off;   // a sampler on its own: its own fields name it
-                int sid = noslot && b->kind != DMSH_VK_KIND_SAMP_C2A ? 0 : samp_of(s, st, &sb, k, rd, ctx);
-                if (sid) { r.what = VKA_R_TEX; r.sid = sid; }
-                break; }
-            case DMSH_VK_KIND_GMEM_MAP: r.what = VKA_R_GMEM_MAP; break;
-            case DMSH_VK_KIND_GMEM_LOG: r.what = VKA_R_GMEM_LOG; break;
-            case DMSH_VK_KIND_SHARED_SPILL:
-                if (!b->bytes || b->bytes % 4) return refuse(why, whyn, "binding %u: shared memory spill of %u bytes a slice", b->binding, b->bytes);
-                r.what = VKA_R_SHARED_SPILL; r.size = b->bytes; break;
-            default: return refuse(why, whyn, "binding %u: kind %u", b->binding, b->kind);
-            }
-            if (r.what == VKA_R_BUF && r.desc == 7 /* VK_DESCRIPTOR_TYPE_STORAGE_BUFFER */) {
-                if (ssbo_align) { uint64_t d = r.addr & (ssbo_align - 1); r.addr -= d; if (r.size) r.size += d; }   // the shader adds the difference back
-                else if (dev_align && (r.addr & (dev_align - 1)))
-                    return refuse(why, whyn, "storage buffer (binding %u, slot %d) at %#llx is not %llu-byte aligned (a library built before ssbo_align)", b->binding, reg, (unsigned long long)r.addr, (unsigned long long)dev_align);
-            }
-            out[n++] = r;
+            if (walk_elem(s, st, b, k, ssbo_align, dev_align, rd, ctx, tw, sw, &out[n], why, whyn) < 0) return VKA_WALK_REFUSE;
+            n++;
         }
     }
     return n;
@@ -138,6 +162,7 @@ static void c0_sample_rows(uint8_t *d, uint32_t samples) {
 
 size_t vka_drv_size(int bank) { return bank == DMSH_PUSH_BANK ? DMSH_PUSH_SIZE : DMSH_DRV_SIZE; }
 void vka_drv_fill(const vka_bstate *s, int st, int bank, int pool, uint8_t *d) {
+    if (vka_bind_fast_on()) { vka_drv_fill_fast(s, st, bank, pool, d); return; }
     if (bank == DMSH_PUSH_BANK) { memcpy(d, s->push[st == 5], DMSH_PUSH_SIZE); return; }
     memset(d, 0, DMSH_DRV_SIZE);
     if (bank == 0) {
@@ -175,6 +200,7 @@ void vka_drv_fill(const vka_bstate *s, int st, int bank, int pool, uint8_t *d) {
 }
 
 void vka_support_fill(uint8_t *d, size_t n) {
+    if (vka_bind_fast_on()) { vka_support_fill_fast(d, n); return; }
     memset(d, 0, n);
     for (size_t o = 192; o + 4 <= n && o < 192 + 16 * 73; o += 16) { const float one = 1.0f; memcpy(d + o, &one, 4); }   // render_scale[73] (nvn_mtl.m support_buf)
 }

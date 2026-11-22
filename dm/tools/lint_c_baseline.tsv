@@ -114,7 +114,6 @@ dm/gfx/vk/hle_vk.m	clang-analyzer-core.uninitialized.Assign	1
 dm/gfx/vk/hle_vk.m	clang-analyzer-security.ArrayBound	2
 dm/gfx/vk/hle_vk.m	clang-analyzer-unix.Malloc	1
 dm/gfx/vk/hle_vk.m	misc-misplaced-const	5
-dm/gfx/vk_android/vka_bind.c	clang-analyzer-core.NullDereference	5
 dm/gfx/vk_android/vka_layerreq.h	bugprone-signed-char-misuse	1
 dm/gfx/vk_android/vka_memu_spv.c	clang-analyzer-security.ArrayBound	1
 dm/gfx/vk_android/vka_pwlist.h	clang-analyzer-core.NullPointerArithm	1
