@@ -33,6 +33,7 @@
 #include "vka_view_fast.h"
 #include "vka_view_ub_fast.h"
 #include "vka_tbuf_vl_fast.h"
+#include "vka_mem_sparse_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -1043,20 +1044,25 @@ void vka_tex_gw_commit(uint64_t fence) {   // the writes recorded since the last
 static uint8_t *gw_content(const uint8_t *mem, uint64_t n, uint64_t *seen) {
     uint64_t a = (uint64_t)(uintptr_t)mem, b = a + n, done = vka_done(), cap = g_gwseq - 1; uint8_t *c = NULL;
     if (vka_gw_fast_on() && !vka_gw_sum_hit_locked(&g_gw_sum, a, b)) { *seen = cap; return NULL; }
+    int ms = vka_mem_sparse_fast_on(); vka_gw_prefix_t pfx = {0};
     for (int i = 0; i < g_ngw; i++) {
         gw_t *w = &g_gw[i];
         if (w->fence && w->fence <= done) continue;   // landed: memory has it
-        if (w->hi <= a || w->lo >= b) continue;
-        if (w->kind == GW_OPAQUE) { if (w->seq - 1 < cap) cap = w->seq - 1; continue; }
+        if (w->hi <= a || w->lo >= b) { if (ms) vka_gw_pfx_add(&pfx, w->lo, w->hi); continue; }
+        if (w->kind == GW_OPAQUE) { if (w->seq - 1 < cap) cap = w->seq - 1; if (ms) vka_gw_pfx_add(&pfx, w->lo, w->hi); continue; }
         if (!c) { if (!(c = malloc(n))) { cap = 0; break; } dm_guest_read_mapped(c, (uintptr_t)mem, n); }
         uint64_t lo = w->lo > a ? w->lo : a, hi = w->hi < b ? w->hi : b;
         if (w->kind == GW_FILL) { if (vka_gw_fast_on()) vka_gw_fill_bytes(c + (lo - a), lo, hi, w->lo, w->value); else for (uint64_t k = lo; k < hi; k++) { uint32_t v = w->value; c[k - a] = ((const uint8_t *)&v)[(k - w->lo) & 3]; } }
         else if (w->kind == GW_UPDATE) memcpy(c + (lo - a), w->data + (lo - w->lo), hi - lo);
         else {   // a copy: its source as the GPU will read it, which an earlier pending write over the source would change (then the write lands later: re-uploaded)
             const uint8_t *s = (const uint8_t *)(uintptr_t)(w->src + (lo - w->lo));
-            for (int j = 0; j < i; j++) { const gw_t *x = &g_gw[j]; if ((!x->fence || x->fence > done) && x->lo < w->src + (hi - w->lo) && x->hi > w->src + (lo - w->lo)) { if (w->seq - 1 < cap) cap = w->seq - 1; break; } }
+            uint64_t slo = w->src + (lo - w->lo), shi = w->src + (hi - w->lo);
+            if (!ms || vka_gw_pfx_may_overlap(&pfx, slo, shi)) for (int j = 0; j < i; j++) {
+                const gw_t *x = &g_gw[j]; if ((!x->fence || x->fence > done) && x->lo < shi && x->hi > slo) { if (w->seq - 1 < cap) cap = w->seq - 1; break; }
+            }
             memmove(c + (lo - a), s, hi - lo);
         }
+        if (ms) vka_gw_pfx_add(&pfx, w->lo, w->hi);
     }
     *seen = cap;
     return c;
@@ -1072,25 +1078,28 @@ int vka_tex_gw_read(uint64_t addr, uint64_t n, void *out) {
     if (vka_gw_fast_on() && !(out ? vka_gw_may_overlap(&g_gw_sum, addr, addr + n) : vka_gw_may_hazard(&g_gw_sum, addr, addr + n))) return 1;
     pthread_mutex_lock(&g_tmu);
     uint64_t a = addr, b = a + n, done = vka_done(); uint8_t *c = out; int ok = 1;
+    int ms = vka_mem_sparse_fast_on(); vka_gw_prefix_t pfx = {0};
     for (int i = 0; i < g_ngw; i++) {
         const gw_t *w = &g_gw[i];
         if (w->fence && w->fence <= done) continue;
-        if (w->hi <= a || w->lo >= b) continue;
+        if (w->hi <= a || w->lo >= b) { if (ms) vka_gw_pfx_add(&pfx, w->lo, w->hi); continue; }
         if (w->kind == GW_OPAQUE) { ok = 0; break; }
         uint64_t lo = w->lo > a ? w->lo : a, hi = w->hi < b ? w->hi : b;
         if (w->kind == GW_COPY) {
-            for (int j = 0; j < i; j++) {
+            uint64_t slo = w->src + (lo - w->lo), shi = w->src + (hi - w->lo);
+            if (!ms || vka_gw_pfx_may_overlap(&pfx, slo, shi)) for (int j = 0; j < i; j++) {
                 const gw_t *x = &g_gw[j];
-                if ((!x->fence || x->fence > done) && x->lo < w->src + (hi - w->lo) && x->hi > w->src + (lo - w->lo)) { ok = 0; break; }
+                if ((!x->fence || x->fence > done) && x->lo < shi && x->hi > slo) { ok = 0; break; }
             }
             if (!ok) break;
-            if (c) dm_guest_read_mapped(c + (lo - a), (uintptr_t)(w->src + (lo - w->lo)), (size_t)(hi - lo));
+            if (c) dm_guest_read_mapped(c + (lo - a), (uintptr_t)slo, (size_t)(hi - lo));
         } else if (c && w->kind == GW_FILL) {
             if (vka_gw_fast_on()) vka_gw_fill_bytes(c + (lo - a), lo, hi, w->lo, w->value);
             else for (uint64_t k = lo; k < hi; k++) { uint32_t v = w->value; c[k - a] = ((const uint8_t *)&v)[(k - w->lo) & 3]; }
         } else if (c && w->kind == GW_UPDATE) {
             memcpy(c + (lo - a), w->data + (lo - w->lo), (size_t)(hi - lo));
         }
+        if (ms) vka_gw_pfx_add(&pfx, w->lo, w->hi);
     }
     pthread_mutex_unlock(&g_tmu);
     return ok;

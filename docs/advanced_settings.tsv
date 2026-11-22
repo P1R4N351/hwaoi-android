@@ -632,6 +632,7 @@ DM_VK_MEMLOG	developer	Diagnostics			text			both
 DM_VK_MEMU_LIB	internal	Diagnostics			text			both						test harness	
 DM_VK_MEMU_OUT	internal	Diagnostics			text			both						test harness	
 DM_VK_MEM_LOCK_WHOLE	developer	Diagnostics			text			both							
+DM_VK_MEM_SPARSE_FAST	developer	Performance			text			both							
 DM_VK_MESH	developer	Graphics			text		On; off with Qualcomm's driver, where mesh draws go through compute	both							
 DM_VK_MESH_EMU	developer	Graphics			text			both							
 DM_VK_MESH_EMU_BAR	developer	Graphics			text			both							

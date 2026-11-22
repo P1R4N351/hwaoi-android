@@ -22,6 +22,7 @@
 #include "../nvn/nvn_dirty.h"
 #include "vka_place.h"
 #include "vka_qsched_fast.h"
+#include "vka_mem_sparse_fast.h"
 #include "vka_gmem.h"
 #include "vka_lowram.h"
 #include "../../host/dm.h"
@@ -703,10 +704,16 @@ typedef struct { seg_t *s; int n, cap; } segvec;
 // give-backs over its range end (pend_wait). It drops g_pl while it waits (a give-back waits for fences: other placements must not stall behind it) and cover looks at
 // the table again afterwards. Lock order g_pl, g_rw, g_pendmu
 static struct { uintptr_t lo, hi; } *g_pend; static int g_npend, g_pendcap;
+static vka_pend_filter_t g_pend_flt;
+static inline void pend_flt_sync(void) {
+    if (g_pend) vka_pend_publish_ranges(&g_pend_flt, &g_pend[0].lo, &g_pend[0].hi, sizeof g_pend[0] / sizeof(uintptr_t), g_npend);
+    else vka_pend_publish_ranges(&g_pend_flt, NULL, NULL, 2u, 0);
+}
 static pthread_mutex_t g_pendmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pendcv = PTHREAD_COND_INITIALIZER;
 static int pend_overlaps(uintptr_t lo, uintptr_t hi) { for (int i = 0; i < g_npend; i++) if (g_pend[i].lo < hi && lo < g_pend[i].hi) return 1; return 0; }   // under g_pendmu
 // Caller holds g_pl (and g_rw for writing under DM_VK_MEM_LOCK_WHOLE); 1 = it waited, with both dropped meanwhile and taken again: the table may have changed
 static int pend_wait(uintptr_t lo, uintptr_t hi) {
+    if (vka_mem_sparse_fast_on() && !vka_pend_may_overlap(&g_pend_flt, lo, hi)) return 0;
     pthread_mutex_lock(&g_pendmu); int busy = pend_overlaps(lo, hi); pthread_mutex_unlock(&g_pendmu);
     if (!busy) return 0;
     uint64_t t0 = mono_ns();
@@ -722,12 +729,14 @@ static int pend_wait(uintptr_t lo, uintptr_t hi) {
 static void pend_done(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_pendmu);
     for (int i = 0; i < g_npend; i++) if (g_pend[i].lo == lo && g_pend[i].hi == hi) { g_pend[i] = g_pend[--g_npend]; break; }
+    pend_flt_sync();
     pthread_cond_broadcast(&g_pendcv); pthread_mutex_unlock(&g_pendmu);
 }
 static void detach(int i, segvec *v) {   // caller holds g_pl, and g_rw for writing
     pthread_mutex_lock(&g_pendmu);
     if (g_npend == g_pendcap) { g_pendcap = g_pendcap ? 2 * g_pendcap : 16; g_pend = realloc(g_pend, (size_t)g_pendcap * sizeof *g_pend); }
     g_pend[g_npend].lo = g_sg[i].lo; g_pend[g_npend++].hi = g_sg[i].hi;
+    pend_flt_sync();
     pthread_mutex_unlock(&g_pendmu);
     if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 8; v->s = realloc(v->s, (size_t)v->cap * sizeof *v->s); }
     v->s[v->n++] = g_sg[i]; g_placed_bytes -= g_sg[i].hi - g_sg[i].lo;
@@ -993,6 +1002,39 @@ typedef struct { uintptr_t mem; uint64_t size; seglist segs; int lazy, part; uin
 static pool_ent *g_pool; static int g_npool, g_poolcap;
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_lzcv = PTHREAD_COND_INITIALIZER;   // g_lzcv: a placement by mtl_pool_need ended
 static _Atomic int g_nlazy; static uint64_t g_lazy_bytes, g_pool_id;   // pools not (wholly) placed yet and their bytes not placed (g_lazy_bytes, g_pool_id under g_pmu)
+static vka_mem_pool_map_t g_mem_pool_map; static int g_mem_pool_dirty = 1;
+static void mem_pool_sync_locked(void) {
+    if (!g_mem_pool_dirty) return;
+    vka_mem_pool_begin(&g_mem_pool_map, (uint32_t)g_npool);
+    uint64_t llo = UINT64_MAX, lhi = 0u, b64 = 0u, b4m = 0u; uint32_t ln = 0u;
+    for (int i = 0; i < g_npool; i++) {
+        vka_mem_pool_put(&g_mem_pool_map, g_pool[i].id, (uint64_t)g_pool[i].mem, i);
+        if (g_pool[i].lazy && g_pool[i].size) {
+            uint64_t a = (uint64_t)g_pool[i].mem, b = a + g_pool[i].size;
+            if (a < llo) llo = a;
+            if (b > lhi) lhi = b;
+            b64 |= vka_ms_bloom_bits(a, b, 16u); b4m |= vka_ms_bloom_bits(a, b, 22u); ln++;
+        }
+    }
+    vka_mem_lazy_publish(&g_mem_pool_map, ln, llo, lhi, b64, b4m);
+    g_mem_pool_dirty = 0;
+}
+static int mem_pool_by_id_locked(uint64_t id) {
+    if (vka_mem_sparse_fast_on()) {
+        mem_pool_sync_locked();
+        if (!g_mem_pool_map.overflow) return vka_mem_pool_find_id(&g_mem_pool_map, id);
+    }
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].id == id) return i;
+    return -1;
+}
+static int mem_pool_by_mem_locked(uintptr_t mem) {
+    if (vka_mem_sparse_fast_on()) {
+        mem_pool_sync_locked();
+        if (!g_mem_pool_map.overflow) return vka_mem_pool_find_mem(&g_mem_pool_map, (uint64_t)mem);
+    }
+    for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) return i;
+    return -1;
+}
 static _Atomic uint64_t g_lzgen = 1;   // bumped when a pool not placed yet comes (mtl_pool_add): mtl_pool_need's per-thread record of ranges with nothing left to place holds while it stands
 static int lazy_on(void) { static int v = -1; if (v < 0) { v = VKA_ENV("DM_VK_PLACE_LAZY", 1) != 0; if (!v) VLOG("DM_VK_PLACE_LAZY=0: every memory pool is placed when it is made"); } return v; }
 // The default is 1024, or the profile's low_ram_place_part_mb on a low-RAM device (vka_lowram.h)
@@ -1046,6 +1088,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_mutex_lock(&g_pmu);
     if (g_npool == g_poolcap) { g_poolcap = g_poolcap ? g_poolcap * 2 : 64; g_pool = realloc(g_pool, (size_t)g_poolcap * sizeof *g_pool); }
     g_pool[g_npool++] = (pool_ent){(uintptr_t)mem, size, l, lazy, part, ++g_pool_id, 0, 0, 0, part ? calloc((size_t)(size / part_gran() / 64 + 1), 8) : NULL};
+    g_mem_pool_dirty = 1; mem_pool_sync_locked();
     if (lazy) { atomic_fetch_add(&g_nlazy, 1); g_lazy_bytes += size; atomic_fetch_add(&g_lzgen, 1); }
     static int nlog; int first = nlog++ < 8;
     pthread_mutex_unlock(&g_pmu);
@@ -1106,11 +1149,18 @@ static void parts_mark(pool_ent *p, uintptr_t lo, uintptr_t hi) {   // caller ho
 enum { NJOIN = 32 };
 static struct { uint64_t id; uintptr_t a, e; const char *why; } g_join[NJOIN];   // the asks across parts, by pool (under g_pmu)
 static int g_njoin; static _Atomic int g_join_n;   // (g_join_n: the count, read without the lock by vka_mem_join_due)
+static vka_join_set_t g_join_set;
+static void join_set_rebuild_locked(void) {
+    vka_join_set_clear(&g_join_set);
+    for (int j = 0; j < g_njoin; j++) vka_join_set_put(&g_join_set, g_join[j].id, (uint64_t)g_join[j].a, (uint64_t)g_join[j].e);
+}
 static uint64_t join_cap(void) { static int64_t v = -1; if (v < 0) { v = (int64_t)VKA_ENV("DM_VK_PLACE_JOIN_MB", 256) << 20; if (v < 0) v = 0; if (!v) VLOG("DM_VK_PLACE_JOIN_MB=0: parts of a pool that a range given to the GPU lies across are not joined"); } return (uint64_t)v; }
 static int join_queue(uint64_t id, uintptr_t a, uintptr_t e, const char *why) {   // caller holds g_pmu; 0 = not queued
-    for (int j = 0; j < g_njoin; j++) if (g_join[j].id == id && g_join[j].a == a && g_join[j].e == e) return 1;   // (queued already)
+    if (vka_mem_sparse_fast_on() && vka_join_set_has(&g_join_set, id, (uint64_t)a, (uint64_t)e)) return 1;
+    if (!vka_mem_sparse_fast_on()) { for (int j = 0; j < g_njoin; j++) if (g_join[j].id == id && g_join[j].a == a && g_join[j].e == e) return 1; }
     if (!join_cap() || g_njoin == NJOIN) return 0;
     g_join[g_njoin++] = (typeof(g_join[0])){id, a, e, why}; atomic_store(&g_join_n, g_njoin);
+    vka_join_set_put(&g_join_set, id, (uint64_t)a, (uint64_t)e);
     return 1;
 }
 typedef struct { uint64_t gen; uintptr_t a, e; } negent;
@@ -1127,6 +1177,36 @@ static void join_placed(const pool_ent *p, uintptr_t a, uintptr_t e, const char 
     else if (!q && k < 8) VRED("memory pool %#lx+%#llx (placed by parts): the GPU is given %#lx+%#lx (%s) across parts placed earlier, which are not joined (%s): lookups over the whole range fail (draws that need it in one piece are skipped)",
                                (unsigned long)p->mem, (unsigned long long)p->size, (unsigned long)a, (unsigned long)(e - a), why, join_cap() ? "more than 32 joins waiting" : "DM_VK_PLACE_JOIN_MB=0");
 }
+static int mem_need_find_locked(uintptr_t a, uintptr_t e, const uint64_t *done, int ndone,
+                                int *busy_out, pool_ent *cp_out) {
+    int k = -1;
+    for (int i = 0; i < g_npool; i++) {
+        if (!g_pool[i].lazy || g_pool[i].mem >= e || a >= g_pool[i].mem + (g_pool[i].size ? g_pool[i].size : 1)) continue;
+        int skip = 0;
+        for (int j = 0; j < ndone; j++) if (done[j] == g_pool[i].id) { skip = 1; break; }
+        if (skip) continue;
+        if (parts_placed(&g_pool[i], a, e)) { if (!cp_out->id && g_pool[i].lazy == 1) *cp_out = g_pool[i]; continue; }
+        if (g_pool[i].lazy == 2) *busy_out = 1; else { k = i; break; }
+    }
+    return k;
+}
+static void mtl_pool_finish_locked(const pool_ent *pe, seglist l, int whole, int placed,
+                                   uint64_t plo, uint64_t phi, uint64_t mine, int span,
+                                   uintptr_t sa, uintptr_t se, const char *why,
+                                   uint32_t *nparts, uint32_t *nspan, int *joinq) {
+    int i = mem_pool_by_id_locked(pe->id);
+    if (i < 0) return;
+    pool_ent *p = &g_pool[i]; p->segs = l;
+    if (whole && (placed || !pe->part)) { g_lazy_bytes -= pe->size - (pe->pbytes < pe->size ? pe->pbytes : pe->size); p->lazy = 0; atomic_fetch_sub(&g_nlazy, 1); }
+    else {
+        uint64_t m = mine < pe->size - p->pbytes ? mine : pe->size - p->pbytes; p->pbytes += m; g_lazy_bytes -= m; p->lazy = 1;
+        if (placed && !whole) parts_mark(p, plo, phi);
+    }
+    if (mine) p->nparts++;
+    if (span) { p->nspan++; *joinq = join_queue(pe->id, sa, se, why); }
+    *nparts = p->nparts; *nspan = span ? p->nspan : 0;
+    g_mem_pool_dirty = 1; mem_pool_sync_locked();
+}
 void mtl_pool_need(const void *addr, uint64_t len, const char *why) {
     if (!atomic_load_explicit(&g_nlazy, memory_order_relaxed)) return;
     uintptr_t a = (uintptr_t)addr, e = a + (len ? len : 1);
@@ -1138,17 +1218,12 @@ void mtl_pool_need(const void *addr, uint64_t len, const char *why) {
     uint64_t done[NDONE]; int ndone = 0;   // pools placed by parts this call has placed its part of (each is still not wholly placed: the scan skips it)
     for (;;) {
         pthread_mutex_lock(&g_pmu);
-        int k = -1, busy = 0; pool_ent cp = {0};   // cp: a pool whose parts [a, e) lies in are all placed (one segment, or a join to queue)
-        for (int i = 0; i < g_npool; i++) if (g_pool[i].lazy && g_pool[i].mem < e && a < g_pool[i].mem + (g_pool[i].size ? g_pool[i].size : 1)) {
-            int skip = 0; for (int j = 0; j < ndone; j++) if (done[j] == g_pool[i].id) skip = 1;
-            if (skip) continue;
-            if (parts_placed(&g_pool[i], a, e)) { if (!cp.id && g_pool[i].lazy == 1) cp = g_pool[i]; continue; }
-            if (g_pool[i].lazy == 2) busy = 1; else { k = i; break; }
-        }
+        int busy = 0; pool_ent cp = {0};   // cp: a pool whose parts [a, e) lies in are all placed (one segment, or a join to queue)
+        int k = mem_need_find_locked(a, e, done, ndone, &busy, &cp);
         if (k < 0 && busy) { pthread_cond_wait(&g_lzcv, &g_pmu); pthread_mutex_unlock(&g_pmu); continue; }
         if (k < 0) { *ng = (negent){gen, a, e}; pthread_mutex_unlock(&g_pmu); if (cp.id) join_placed(&cp, a, e, why); return; }   // (gen read before the scan: a pool added since bumped it)
         if (ndone == NDONE) { pthread_mutex_unlock(&g_pmu); static _Atomic int nr; if (!atomic_fetch_add(&nr, 1)) VRED("the GPU is given %#lx+%#lx across more than %d memory pools placed by parts: the rest is not placed", (unsigned long)a, (unsigned long)(e - a), NDONE); return; }
-        pool_ent pe = g_pool[k]; g_pool[k].lazy = 2;
+        pool_ent pe = g_pool[k]; g_pool[k].lazy = 2; g_mem_pool_dirty = 1; mem_pool_sync_locked();
         pthread_mutex_unlock(&g_pmu);
         uint64_t plo = pe.mem, phi = pe.mem + pe.size;
         int whole = !(pe.part && vkp_part(pe.mem, pe.size, a, e, part_gran(), &plo, &phi));
@@ -1162,18 +1237,7 @@ void mtl_pool_need(const void *addr, uint64_t len, const char *why) {
         pthread_mutex_unlock(&g_pl);
         pthread_mutex_lock(&g_pmu);   // (mtl_pool_del waits while the pool is being placed: it is still in the table)
         uint32_t nparts = 0, nspan = 0;
-        for (int i = 0; i < g_npool; i++) if (g_pool[i].id == pe.id) {
-            pool_ent *p = &g_pool[i]; p->segs = l;
-            if (whole && (placed || !pe.part)) { g_lazy_bytes -= pe.size - (pe.pbytes < pe.size ? pe.pbytes : pe.size); p->lazy = 0; atomic_fetch_sub(&g_nlazy, 1); }
-            else {   // a part, or a whole placement of a pool placed by parts that failed: it stays not wholly placed, what was placed counted
-                uint64_t m = mine < pe.size - p->pbytes ? mine : pe.size - p->pbytes; p->pbytes += m; g_lazy_bytes -= m; p->lazy = 1;
-                if (placed && !whole) parts_mark(p, plo, phi);
-            }
-            if (mine) p->nparts++;
-            if (span) { p->nspan++; joinq = join_queue(pe.id, sa, se, why); }
-            nparts = p->nparts; nspan = span ? p->nspan : 0;
-            break;
-        }
+        mtl_pool_finish_locked(&pe, l, whole, placed, plo, phi, mine, span, sa, se, why, &nparts, &nspan, &joinq);
         if ((!whole || pe.part) && ndone < NDONE) done[ndone++] = pe.id;
         pthread_cond_broadcast(&g_lzcv);
         static int nlog; int first = nlog++ < 8 || (whole && (pe.pbytes || pe.part));   // (a pool placed by parts placed whole: always said, with the ask that did it)
@@ -1193,6 +1257,7 @@ void mtl_pool_need(const void *addr, uint64_t len, const char *why) {
     }
 }
 static void lazy_release_note(uintptr_t lo, uintptr_t hi) {
+    if (vka_mem_sparse_fast_on() && !vka_mem_lazy_may_overlap(&g_mem_pool_map, lo, hi)) return;
     pthread_mutex_lock(&g_pmu);   // pools not placed yet (DM_VK_PLACE_LAZY) over the range: their storage leaves the guest too
     for (int i = 0; i < g_npool; i++) if (g_pool[i].lazy && g_pool[i].mem < hi && lo < g_pool[i].mem + g_pool[i].size) {
         static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("guest memory %#lx+%#lx is given back under live pool memory %#lx+%#llx (not placed): its textures read zeros there", (unsigned long)lo, (unsigned long)(hi - lo), (unsigned long)g_pool[i].mem, (unsigned long long)g_pool[i].size);
@@ -1202,9 +1267,11 @@ static void lazy_release_note(uintptr_t lo, uintptr_t hi) {
 void mtl_pool_del(const void *mem) {
     pool_ent e = {0};
     pthread_mutex_lock(&g_pmu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == (uintptr_t)mem) {
-        if (g_pool[i].lazy == 2) { pthread_cond_wait(&g_lzcv, &g_pmu); i = -1; continue; }   // being placed (mtl_pool_need): its segments are given back below once it is
-        e = g_pool[i]; g_pool[i] = g_pool[--g_npool];
+    for (;;) {
+        int i = mem_pool_by_mem_locked((uintptr_t)mem);
+        if (i < 0) break;
+        if (g_pool[i].lazy == 2) { pthread_cond_wait(&g_lzcv, &g_pmu); continue; }   // being placed (mtl_pool_need): its segments are given back below once it is
+        e = g_pool[i]; g_pool[i] = g_pool[--g_npool]; g_mem_pool_dirty = 1; mem_pool_sync_locked();
         if (e.lazy == 1) { atomic_fetch_sub(&g_nlazy, 1); g_lazy_bytes -= e.size - (e.pbytes < e.size ? e.pbytes : e.size); }   // (a pool placed by parts: its parts are in segs)
         break;
     }
@@ -1367,22 +1434,68 @@ static uint64_t g_join_idle_ns;
 void vka_mem_join_stats(uint64_t *idle_ns) { *idle_ns = g_join_idle_ns; }
 // At the start of a submission (vka_rp_sub_begin, the replay thread; nothing recorded is held back there): the joins the asks queued (Joining parts). The queue is
 // waited idle once for all of them. A pool being placed (lazy 2) keeps its joins for the next submission; one finalized or placed whole since drops them
+static void mem_join_contig_segs(void) {
+    if (!contiguous_segs_due()) return;
+    pthread_mutex_lock(&g_pl);
+    for (int it = 0; it < 32 && g_nsg > 1; it++) {
+        int k0 = -1, k1 = -1;
+        for (int i = 0; i < g_nsg - 1; i++) {
+            if (g_sg[i].hi == g_sg[i + 1].lo && !g_sg[i].fd_alias && !g_sg[i + 1].fd_alias) {
+                k0 = i; k1 = i + 1;
+                while (k1 + 1 < g_nsg && g_sg[k1].hi == g_sg[k1 + 1].lo && !g_sg[k1 + 1].fd_alias
+                       && (g_sg[k1 + 1].hi - g_sg[k0].lo) <= join_cap()
+                       && (!V.max_alloc || (g_sg[k1 + 1].hi - g_sg[k0].lo) <= V.max_alloc)
+                       && (k1 + 1 - k0 < 32)) { k1++; }
+                break;
+            }
+        }
+        if (k0 < 0) break;
+        uintptr_t clo = g_sg[k0].lo, chi = g_sg[k1].hi; int ccnt = k1 - k0 + 1;
+        if (!join(k0, k1, NULL)) break;
+        static uint64_t n_cjoin;
+        if (++n_cjoin <= 16 || !(n_cjoin & 63))
+            VLOG("placed memory coalesced: %d contiguous segments joined into one %#lx+%#lx (total: %llu)", ccnt, (unsigned long)clo, (unsigned long)(chi - clo), (unsigned long long)n_cjoin);
+    }
+    pthread_mutex_unlock(&g_pl);
+}
+static int mem_join_has_ready_locked(void) {
+    int any = 0;
+    for (int j = 0; j < g_njoin && !any; j++) {
+        int i = mem_pool_by_id_locked(g_join[j].id);
+        if (i >= 0 && g_pool[i].lazy == 1) any = 1;
+    }
+    if (!any) {
+        int w = 0;
+        for (int j = 0; j < g_njoin; j++) {
+            int i = mem_pool_by_id_locked(g_join[j].id);
+            if (i >= 0 && g_pool[i].lazy == 2) g_join[w++] = g_join[j];
+        }
+        g_njoin = w; atomic_store(&g_join_n, w); join_set_rebuild_locked();
+    }
+    return any;
+}
+static int mem_join_pick_locked(typeof(g_join[0]) *q_out, pool_ent *pe_out) {
+    int r = -1, pi = -1;
+    for (int j = 0; j < g_njoin && r < 0;) {
+        int k = mem_pool_by_id_locked(g_join[j].id);
+        if (k < 0 || !g_pool[k].lazy) { g_join[j] = g_join[--g_njoin]; continue; }
+        if (g_pool[k].lazy == 1) { r = j; pi = k; } else j++;
+    }
+    if (r < 0) { atomic_store(&g_join_n, g_njoin); join_set_rebuild_locked(); return 0; }
+    *q_out = g_join[r]; g_join[r] = g_join[--g_njoin]; atomic_store(&g_join_n, g_njoin);
+    join_set_rebuild_locked();
+    *pe_out = g_pool[pi]; g_pool[pi].lazy = 2; g_mem_pool_dirty = 1; mem_pool_sync_locked();
+    return 1;
+}
 void vka_mem_join_due(void) {
     int has_join = atomic_load_explicit(&g_join_n, memory_order_relaxed);
     int has_contig = contiguous_segs_due();
     if (!has_join && !has_contig) return;
     if (has_join) {
         pthread_mutex_lock(&g_pmu);
-        int any = 0;
-        for (int j = 0; j < g_njoin && !any; j++) for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id && g_pool[i].lazy == 1) { any = 1; break; }
-        if (!any) {   // all for pools gone, placed whole, or being placed: drop the first two kinds
-            int w = 0; for (int j = 0; j < g_njoin; j++) { int keep = 0; for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id && g_pool[i].lazy == 2) keep = 1; if (keep) g_join[w++] = g_join[j]; }
-            g_njoin = w; atomic_store(&g_join_n, w);
-            pthread_mutex_unlock(&g_pmu);
-            if (!has_contig) return;
-        } else {
-            pthread_mutex_unlock(&g_pmu);
-        }
+        int any = mem_join_has_ready_locked();
+        pthread_mutex_unlock(&g_pmu);
+        if (!any && !has_contig) return;
     }
     uint64_t t0 = mono_ns();
     vka_up_flush();   // an open upload batch to the queue: it may name a part's buffer
@@ -1391,15 +1504,8 @@ void vka_mem_join_due(void) {
     uint64_t t1 = mono_ns();
     for (;;) {
         pthread_mutex_lock(&g_pmu);
-        int r = -1, pi = -1;
-        for (int j = 0; j < g_njoin && r < 0;) {
-            int k = -1; for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id) { k = i; break; }
-            if (k < 0 || !g_pool[k].lazy) { g_join[j] = g_join[--g_njoin]; continue; }   // finalized, or placed whole since
-            if (g_pool[k].lazy == 1) { r = j; pi = k; } else j++;
-        }
-        if (r < 0) { atomic_store(&g_join_n, g_njoin); pthread_mutex_unlock(&g_pmu); break; }
-        typeof(g_join[0]) q = g_join[r]; g_join[r] = g_join[--g_njoin]; atomic_store(&g_join_n, g_njoin);
-        pool_ent pe = g_pool[pi]; g_pool[pi].lazy = 2;   // (as a placement: mtl_pool_need and mtl_pool_del wait for it)
+        typeof(g_join[0]) q = {0}; pool_ent pe = {0};
+        if (!mem_join_pick_locked(&q, &pe)) { pthread_mutex_unlock(&g_pmu); break; }
         pthread_mutex_unlock(&g_pmu);
         seglist l = pe.segs; uintptr_t jlo = 0, jhi = 0; int k0 = 0, k1 = 0, c, done = 0, shared = 0, across = 0, alias = 0; uint64_t tj = mono_ns();
         pthread_mutex_lock(&g_pl);
@@ -1418,7 +1524,8 @@ void vka_mem_join_due(void) {
         }
         pthread_mutex_unlock(&g_pl);
         pthread_mutex_lock(&g_pmu);
-        for (int i = 0; i < g_npool; i++) if (g_pool[i].id == pe.id) { if (!across) g_pool[i].segs = l; g_pool[i].lazy = 1; break; }   // (a join across pools updated every pool's list itself)
+        int ri = mem_pool_by_id_locked(pe.id);
+        if (ri >= 0) { if (!across) g_pool[ri].segs = l; g_pool[ri].lazy = 1; g_mem_pool_dirty = 1; mem_pool_sync_locked(); }
         pthread_cond_broadcast(&g_lzcv);
         pthread_mutex_unlock(&g_pmu);
         static uint64_t nj; static _Atomic int nred;
@@ -1429,31 +1536,7 @@ void vka_mem_join_due(void) {
                  (unsigned long)pe.mem, (unsigned long long)pe.size, (unsigned long)q.a, (unsigned long)(q.e - q.a), q.why, c, (unsigned long)jlo, (unsigned long)(jhi - jlo),
                  alias ? "placed and exported-alias parts mixed" : jhi - jlo > join_cap() ? "more than DM_VK_PLACE_JOIN_MB" : (V.max_alloc && jhi - jlo > V.max_alloc) ? "more than one allocation can be" : "the join failed");
     }
-    if (contiguous_segs_due()) {
-        pthread_mutex_lock(&g_pl);
-        for (int it = 0; it < 32 && g_nsg > 1; it++) {
-            int k0 = -1, k1 = -1;
-            for (int i = 0; i < g_nsg - 1; i++) {
-                if (g_sg[i].hi == g_sg[i + 1].lo && !g_sg[i].fd_alias && !g_sg[i + 1].fd_alias) {
-                    k0 = i; k1 = i + 1;
-                    while (k1 + 1 < g_nsg && g_sg[k1].hi == g_sg[k1 + 1].lo && !g_sg[k1 + 1].fd_alias
-                           && (g_sg[k1 + 1].hi - g_sg[k0].lo) <= join_cap()
-                           && (!V.max_alloc || (g_sg[k1 + 1].hi - g_sg[k0].lo) <= V.max_alloc)
-                           && (k1 + 1 - k0 < 32)) {
-                        k1++;
-                    }
-                    break;
-                }
-            }
-            if (k0 < 0) break;
-            uintptr_t clo = g_sg[k0].lo, chi = g_sg[k1].hi; int ccnt = k1 - k0 + 1;
-            if (!join(k0, k1, NULL)) break;
-            static uint64_t n_cjoin;
-            if (++n_cjoin <= 16 || !(n_cjoin & 63))
-                VLOG("placed memory coalesced: %d contiguous segments joined into one %#lx+%#lx (total: %llu)", ccnt, (unsigned long)clo, (unsigned long)(chi - clo), (unsigned long long)n_cjoin);
-        }
-        pthread_mutex_unlock(&g_pl);
-    }
+    mem_join_contig_segs();
 }
 // The live memory pools (the frame capture's regions, vka_capture.c): at most max of them, the count returned
 int vka_pools(uint64_t *lo, uint64_t *size, int max) {

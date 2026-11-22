@@ -16,6 +16,7 @@
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "../nvn/nvn_tex_layout_fast.h"
+#include "vka_mem_sparse_fast.h"
 #include <stdlib.h>
 
 #define TILE 65536u
@@ -64,14 +65,19 @@ uint64_t vks_va_free(void) {
 static uint64_t stl_now(void) { uint64_t v = 0; if (vka_hung()) return UINT64_MAX; if (g_stl) vk.vkGetSemaphoreCounterValue(V.dev, g_stl, &v); return v; }
 // Empty blocks whose last unbind has run are freed while another block of their type has room (caller holds g_ks)
 static void blocks_trim(void) {
-    uint64_t now = 0; int got = 0;
+    uint64_t now = 0; int got = 0, fast = vka_mem_sparse_fast_on();
+    vka_sparse_type_cnt_t cnt = {0};
+    if (fast) for (uint32_t j = 0; j < g_ntb; j++) if (g_tb[j] && g_tb[j]->used < BLOCK_TILES) vka_sparse_cnt_add(&cnt, g_tb[j]->type);
     for (uint32_t i = 0; i < g_ntb; i++) {
         tblock *b = g_tb[i]; if (!b || b->used) continue;
-        int other = 0; for (uint32_t j = 0; j < g_ntb && !other; j++) other = j != i && g_tb[j] && g_tb[j]->type == b->type && g_tb[j]->used < BLOCK_TILES;
+        int other = fast ? vka_sparse_has_other(&cnt, b->type) : -1;
+        if (other < 0) { other = 0; for (uint32_t j = 0; j < g_ntb && !other; j++) other = j != i && g_tb[j] && g_tb[j]->type == b->type && g_tb[j]->used < BLOCK_TILES; }
         if (!other) continue;
         if (!got) { now = stl_now(); got = 1; }
         if (b->free_at > now) continue;
+        uint32_t btype = b->type;
         vk.vkFreeMemory(V.dev, b->dm, NULL); free(b); g_tb[i] = NULL; g_bytes -= (uint64_t)BLOCK_TILES * TILE;
+        if (fast) vka_sparse_cnt_dec(&cnt, btype);
     }
 }
 // A free 64 KiB slot of memory type type: its id + 1, 0 = none (caller holds g_ks)

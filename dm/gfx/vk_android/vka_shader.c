@@ -16,6 +16,7 @@
 #include "vka_shader_fast.h"
 #include "vka_rp_mod_fast.h"
 #include "vka_tbuf_vl_fast.h"
+#include "vka_mem_sparse_fast.h"
 #include "plat/plat.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -407,6 +408,8 @@ static const char *refusal(const vka_shlib *L, const dmsh_vk_entry *e) {
 // DM_VK_ONE_LANE (restart; read once): 0 = the profile's keys off; 1 = the profile's keys on any driver; <key>[,<key>...] = those keys too, on any driver (where the profile's keys
 // are off, those keys only); 1,<key>[,<key>...] = both
 static uint64_t g_one_env[16]; static int g_one_nenv, g_one_mode;   // g_one_mode: 0 = the profile's keys by driver, 1 = on, -1 = off
+static const uint64_t k_one_prof[] = DM_GAME_SUBGROUP_ONE_LANE;
+static vka_one_lane_set_t g_one_set;
 static void one_lane_env(void) {
     const char *q = getenv("DM_VK_ONE_LANE");
     if (q && !strcmp(q, "0")) g_one_mode = -1;
@@ -415,17 +418,23 @@ static void one_lane_env(void) {
         for (; q && *q && g_one_nenv < 16;) { char *e; uint64_t v = strtoull(q, &e, 16); if (e == q) break; if (v) g_one_env[g_one_nenv++] = v; q = *e ? e + 1 : e; }
     }
     int on = g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
+    vka_one_lane_build(&g_one_set, g_one_env, g_one_nenv, DM_GAME_NSUBGROUP_ONE_LANE ? k_one_prof : NULL, DM_GAME_NSUBGROUP_ONE_LANE);
     if (DM_GAME_NSUBGROUP_ONE_LANE) VLOG("profile subgroup_one_lane (%d shader key%s): %s%s", DM_GAME_NSUBGROUP_ONE_LANE, DM_GAME_NSUBGROUP_ONE_LANE == 1 ? "" : "s",
                                          g_one_mode < 0 ? "off (DM_VK_ONE_LANE=0)" : g_one_mode > 0 ? "on (DM_VK_ONE_LANE=1)" : on ? "on (Qualcomm's driver; DM_VK_ONE_LANE=0: off)" : "off (this driver; DM_VK_ONE_LANE=1: on)",
                                          g_one_nenv ? ", plus DM_VK_ONE_LANE's keys" : "");
     else if (g_one_nenv) VLOG("subgroup_one_lane: %d shader key%s from DM_VK_ONE_LANE", g_one_nenv, g_one_nenv == 1 ? "" : "s");
 }
 static int one_lane_forced(uint64_t key) {
-    static const uint64_t prof[] = DM_GAME_SUBGROUP_ONE_LANE; static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, one_lane_env);
+    int prof_on = g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
+    if (vka_mem_sparse_fast_on()) {
+        int hit = vka_one_lane_lookup(&g_one_set, key, prof_on);
+        if (hit >= 0) return hit;
+    }
     for (int i = 0; i < g_one_nenv; i++) if (g_one_env[i] == key) return 1;
-    if (g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY))
-        for (int i = 0; i < DM_GAME_NSUBGROUP_ONE_LANE; i++) if (prof[i] == key) return 1;
+    if (prof_on)
+        for (int i = 0; i < DM_GAME_NSUBGROUP_ONE_LANE; i++) if (k_one_prof[i] == key) return 1;
     return 0;
 }
 static void single_lane(uint64_t key, int stage, uint32_t **w, size_t *nb) {
