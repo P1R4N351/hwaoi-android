@@ -1,10 +1,10 @@
 # Updates
 
-How the app updates itself, what happens to your game's shaders afterwards, and where updates come from. Updates come only from the project's official releases.
+How the app updates itself, what happens to your game's shaders afterwards, and where updates come from. Updates come only from this repository's [releases](https://github.com/P1R4N351/hwaoi-android/releases).
 
 ## Updating the app
 
-Since v0.1.4 the app offers a newer release at start (**Update** or **Later**), downloads it from the project's [releases](https://git.eden-emu.dev/moceure/BananaNative/releases) and installs it after you confirm. Settings > **Updates** > **Check for updates** checks at any time. Updates download from the official site only.
+Since v0.1.4 the app offers a newer release at start (**Update** or **Later**), downloads it from this repository's [releases](https://github.com/P1R4N351/hwaoi-android/releases) and installs it after you confirm. Settings > **Updates** > **Check for updates** checks at any time. Updates download from there only.
 
 An update keeps the app's storage, so your saves, packs and copied games stay.
 
@@ -51,4 +51,6 @@ The project's release notes are on the releases page. A short list is in the rep
 
 ## Safety
 
-Download the APK only from the official releases page. Nobody connected to the project will ask for money, keys or game files.
+> **Fork note.** This page comes from Banana Native (moceure). Banana Native itself takes no donations. This repository is AoI Native, an independent port maintained by PiSCES, which accepts voluntary donations ([Support](https://github.com/P1R4N351/hwaoi-android#support)); they do not go to Banana Native.
+
+Download the APK only from this repository's [releases page](https://github.com/P1R4N351/hwaoi-android/releases). Nobody connected to the project will ask for money, keys or game files.

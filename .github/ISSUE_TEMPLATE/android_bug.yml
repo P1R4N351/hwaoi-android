@@ -1,5 +1,5 @@
 name: Android bug report
-description: Banana Native on Android crashes, hangs, draws wrong, runs slowly or will not prepare a game
+description: "AoI Native on Android crashes, hangs, draws wrong, runs slowly or will not prepare Hyrule Warriors: Age of Imprisonment"
 labels: [android]
 body:
   - type: markdown
@@ -55,16 +55,16 @@ body:
     id: game
     attributes:
       label: Game title ID and version
-      description: As the game's card shows them. The README's Games table lists the versions that run.
-      placeholder: "040074A01BF12000, update 458752"
+      description: As the game's card shows them. The README names the version that runs.
+      placeholder: "04003F40232DE000, update 196608"
     validations:
       required: true
   - type: input
     id: release
     attributes:
-      label: Banana Native release
+      label: AoI Native release
       description: Settings › About shows the build tag.
-      placeholder: "v0.1.0"
+      placeholder: "v0.1.0-beta.1"
     validations:
       required: true
   - type: dropdown
