@@ -34,6 +34,15 @@
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
+#include "vka_samp_maps_fast.h"
+_Static_assert(NVN_WRAP_MODE_CLAMP == 0 && NVN_WRAP_MODE_REPEAT == 1 && NVN_WRAP_MODE_MIRROR_CLAMP == 2 &&
+               NVN_WRAP_MODE_MIRROR_CLAMP_TO_EDGE == 3 && NVN_WRAP_MODE_MIRROR_CLAMP_TO_BORDER == 4 &&
+               NVN_WRAP_MODE_CLAMP_TO_BORDER == 5 && NVN_WRAP_MODE_MIRRORED_REPEAT == 6 &&
+               NVN_WRAP_MODE_CLAMP_TO_EDGE == 7, "NVN_WRAP_MODE constants");
+_Static_assert(VK_SAMPLER_ADDRESS_MODE_REPEAT == 0 && VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT == 1 &&
+               VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE == 2 && VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER == 3 &&
+               VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE == 4, "VK_SAMPLER_ADDRESS_MODE constants");
+_Static_assert(sizeof(samp_par) == 40u, "AoI samp_par 40B");
 #include <assert.h>
 #include "../nvn/nvn_tex.h"
 
@@ -1237,6 +1246,7 @@ static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb,
 static int is_astc(VkFormat v) { return v >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && v <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; }
 static const uint8_t k_astc_zero[16] = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static void astc_zero_blocks(uint8_t *p, size_t n) {   // the zeros of unmapped pages, as zero texels
+    if (vka_samp_maps_fast_on()) { vka_astc_zero_blocks_fast(p, n); return; }
     for (size_t i = 0; i + 16 <= n; i += 16) { uint64_t a, b; memcpy(&a, p + i, 8); memcpy(&b, p + i + 8, 8); if (!(a | b)) memcpy(p + i, k_astc_zero, 16); }
 }
 // Zero texels without staging: a buffer of zero blocks (first half) and of ASTC's zero blocks (second half), the source of every unmapped part of a sparse texture
@@ -2820,7 +2830,10 @@ void mtl_reg_samp(int id, const samp_par *p) {
     if (id < 0 || id >= 4096 * 4 || !p) return;
     pthread_mutex_lock(&g_tmu);
     if (!g_sreg_ok) g_sreg_ok = calloc(4096 * 4, 1);
-    if (id < g_nsreg && g_sreg_ok && nvn_reg_fast_on() && nvn_sreg_same(g_sreg_ok[id], (const uint8_t *)&g_sreg[id], (const uint8_t *)p, sizeof *p)) {
+    int s_same = (id < g_nsreg && g_sreg_ok && g_sreg_ok[id] && vka_samp_maps_fast_on())
+        ? vka_samp_par_eq_fast(&g_sreg[id], p)
+        : (id < g_nsreg && g_sreg_ok && nvn_reg_fast_on() && nvn_sreg_same(g_sreg_ok[id], (const uint8_t *)&g_sreg[id], (const uint8_t *)p, sizeof *p));
+    if (s_same) {
         pthread_mutex_unlock(&g_tmu);
         return;
     }
@@ -2834,6 +2847,7 @@ void mtl_reg_samp(int id, const samp_par *p) {
 void mtl_set_tex_pool_n(int n) { (void)n; }
 
 static VkSamplerAddressMode wrap(int w) {
+    if (vka_samp_maps_fast_on()) return (VkSamplerAddressMode)vka_wrap_fast(w);
     switch (w) {
     case NVN_WRAP_MODE_REPEAT: return VK_SAMPLER_ADDRESS_MODE_REPEAT; case NVN_WRAP_MODE_MIRRORED_REPEAT: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     case NVN_WRAP_MODE_CLAMP_TO_BORDER: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
@@ -2842,8 +2856,23 @@ static VkSamplerAddressMode wrap(int w) {
     }
 }
 static VkSampler sampler_of(const samp_par *p) {
-    for (int i = 0; i < g_nsamp; i++) if (!memcmp(&g_samp[i].p, p, sizeof *p)) return g_samp[i].s;
+    _Static_assert(offsetof(samp_ent, p) == 0u, "samp_ent.p offset 0");
+    static vka_samp_map_t g_samp_map;
+    static int g_samp_cap;
+    uint64_t h = vka_samp_par_hash_fast(p);
+    if (vka_samp_maps_fast_on()) {
+        int hit = vka_samp_map_find(&g_samp_map, g_samp, sizeof *g_samp, p, h);
+        if (hit >= 0) return g_samp[hit].s;
+    } else {
+        for (int i = 0; i < g_nsamp; i++) if (!memcmp(&g_samp[i].p, p, sizeof *p)) return g_samp[i].s;
+    }
     if (g_nsamp >= (int)g_nsamp_slots) { VRED_ONCE("more than %u distinct samplers", g_nsamp_slots); return VK_NULL_HANDLE; }
+    if (g_nsamp == g_samp_cap) {
+        int nc = g_samp_cap ? g_samp_cap * 2 : 64;
+        samp_ent *nr = realloc(g_samp, (size_t)nc * sizeof *g_samp);
+        if (!nr) return VK_NULL_HANDLE;
+        g_samp = nr; g_samp_cap = nc;
+    }
     int mip = p->minf >= NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST;
     float aniso = p->aniso > 1 ? (p->aniso < V.props.limits.maxSamplerAnisotropy ? p->aniso : V.props.limits.maxSamplerAnisotropy) : 1;
     float bias = p->lod_bias, bl = V.props.limits.maxSamplerLodBias; if (bias > bl) bias = bl; if (bias < -bl) bias = -bl;
@@ -2857,8 +2886,6 @@ static VkSampler sampler_of(const samp_par *p) {
         .compareOp = p->cmp_func >= 1 && p->cmp_func <= 8 ? (VkCompareOp)(p->cmp_func - 1) : VK_COMPARE_OP_NEVER,
         .minLod = p->lod_min, .maxLod = mip ? p->lod_max : (p->lod_min < 0.25f ? 0.25f : p->lod_min),
         .borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : opaque ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK};
-    // Reduction: a filtered sample takes the min or max of the texels it covers instead of their weighted average (NVN 1 min, 2 max: Vulkan's own numbers).
-    // samplerFilterMinmax guarantees it for the depth formats and R32_SFLOAT among others (Vulkan 1.2, "Required Format Support"), the formats depth pyramids use
     VkSamplerReductionModeCreateInfo red = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO, .reductionMode = (VkSamplerReductionMode)p->reduction};
     if (p->reduction == 1 || p->reduction == 2) {
         if (V.minmax) ci.pNext = &red;
@@ -2866,7 +2893,8 @@ static VkSampler sampler_of(const samp_par *p) {
     } else if (p->reduction) VRED_ONCE("sampler reduction mode %d not applied: not an NVN reduction mode", p->reduction);
     VkSampler s = VK_NULL_HANDLE;
     if (vk.vkCreateSampler(V.dev, &ci, NULL, &s)) return VK_NULL_HANDLE;
-    g_samp = realloc(g_samp, (size_t)(g_nsamp + 1) * sizeof *g_samp); g_samp[g_nsamp++] = (samp_ent){*p, s};
+    g_samp[g_nsamp++] = (samp_ent){*p, s};
+    vka_samp_map_insert(&g_samp_map, h, (uint16_t)g_nsamp);
     return s;
 }
 static VkComponentSwizzle swz1(int n) { return n >= 0 && n <= 5 ? (VkComponentSwizzle)(n + 1) : VK_COMPONENT_SWIZZLE_IDENTITY; }   // NVN ZERO ONE R G B A = Vulkan's minus 1

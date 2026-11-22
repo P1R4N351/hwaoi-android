@@ -733,6 +733,7 @@ DM_VK_ROWS	developer	Graphics			text			both
 DM_VK_RP_AREA	developer	Graphics			text			both							
 DM_VK_RT_LOG	developer	Diagnostics			text			both							
 DM_VK_RT_LOG_LINES	developer	Diagnostics			text			both							
+DM_VK_SAMP_MAPS_FAST	developer	Performance			text			both							
 DM_VK_SB_PEEK	developer	Diagnostics			text			both							
 DM_VK_SB_PEEK_AT	developer	Diagnostics			text			both							
 DM_VK_SB_PEEK_FROM	developer	Diagnostics			text			both							

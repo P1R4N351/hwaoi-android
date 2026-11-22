@@ -43,6 +43,8 @@
 #include "vka_placefail.h"
 #include "vka_fileback.h"
 #include "../../host/plat/plat_guestmap.h"
+#include "vka_samp_maps_fast.h"
+_Static_assert(PROT_READ == 1 && PROT_WRITE == 2 && PROT_EXEC == 4, "PROT_* bits");
 
 static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
@@ -273,6 +275,61 @@ static int maps_line(FILE *f, char *ln, int n, int *err) {
     if (!strchr(ln, '\n')) { int c; while ((c = getc(f)) != EOF && c != '\n') {} if (ferror(f)) { *err = 1; return 0; } }
     return 1;
 }
+static int snap_push(uintptr_t a, uintptr_t b, int p) {
+    if (g_snap.n && g_snap.r[g_snap.n - 1].prot == p && g_snap.r[g_snap.n - 1].hi == a) { g_snap.r[g_snap.n - 1].hi = b; return 1; }
+    if (g_snap.n == g_snap.cap) {
+        int nc = g_snap.cap ? 2 * g_snap.cap : 4096;
+        prun *nr = realloc(g_snap.r, (size_t)nc * sizeof *nr);
+        if (!nr) return 0;
+        g_snap.r = nr; g_snap.cap = nc;
+    }
+    g_snap.r[g_snap.n++] = (prun){a, b, p};
+    return 1;
+}
+static int snap_read_fast(void) {
+    atomic_fetch_add(&g_snap_reads, 1);
+    uint64_t g0 = atomic_load_explicit(&g_pgen, memory_order_acquire);
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { atomic_fetch_add(&g_snap_reads, 1); return 0; }
+    char buf[16384]; size_t have = 0u; int ok = 1, err = 0, skip_rest = 0, stop = 0; g_snap.n = 0;
+    while (!stop) {
+        ssize_t k = read(fd, buf + have, sizeof buf - have);
+        if (k < 0) { if (errno == EINTR) continue; err = 1; break; }
+        have += (size_t)k; size_t s = 0u;
+        for (const char *nl; !stop && s < have && (nl = memchr(buf + s, '\n', have - s)) != NULL; s = (size_t)(nl - buf) + 1u) {
+            if (skip_rest) { skip_rest = 0; continue; }
+            uintptr_t a = 0, b = 0; int p = 0;
+            if (!vka_maps_parse_line_fast(buf + s, (size_t)(nl - (buf + s)), &a, &b, &p) || b <= g_pg_lo) continue;
+            if (a >= g_pg_hi) { stop = 1; break; }
+            if (!snap_push(a, b, p)) { ok = 0; stop = 1; break; }
+        }
+        if (stop) break;
+        if (s == 0u && have == sizeof buf) {
+            if (!skip_rest) {
+                uintptr_t a = 0, b = 0; int p = 0;
+                if (vka_maps_parse_line_fast(buf, have, &a, &b, &p) && b > g_pg_lo) {
+                    if (a >= g_pg_hi) break;
+                    if (!snap_push(a, b, p)) { ok = 0; break; }
+                }
+                skip_rest = 1;
+            }
+            have = 0u; continue;
+        }
+        if (k == 0) {
+            if (have > s && !skip_rest) {
+                uintptr_t a = 0, b = 0; int p = 0;
+                if (vka_maps_parse_line_fast(buf + s, have - s, &a, &b, &p) && b > g_pg_lo && a < g_pg_hi && !snap_push(a, b, p)) ok = 0;
+            }
+            break;
+        }
+        if (s < have) memmove(buf, buf + s, have - s);
+        have -= s;
+    }
+    close(fd); atomic_fetch_add(&g_snap_reads, 1);
+    if (!ok || err) { g_snap.n = 0; return 0; }
+    g_snap.gen = g0 + 1; g_snap.ok = 1;
+    return 1;
+}
 static int snap_read(void) {   // the guest block's runs from the text; caller holds g_snapmu. 0 = no snapshot (none is used until a read succeeds)
     g_snap.ok = 0;
     if (!atomic_load(&g_pblk)) {
@@ -282,6 +339,7 @@ static int snap_read(void) {   // the guest block's runs from the text; caller h
         _Atomic uint64_t *b = calloc(((g_pg_hi - g_pg_lo) >> PBLK_SHIFT) + 1, sizeof *b); if (!b) return 0;
         atomic_store_explicit(&g_pblk, b, memory_order_release);
     }
+    if (vka_samp_maps_fast_on()) return snap_read_fast();
     atomic_fetch_add(&g_snap_reads, 1);
     uint64_t g0 = atomic_load_explicit(&g_pgen, memory_order_acquire);
     FILE *f = fopen("/proc/self/maps", "re"); if (!f) { atomic_fetch_add(&g_snap_reads, 1); return 0; }
@@ -362,7 +420,61 @@ static int prot_runs(uintptr_t lo, uintptr_t hi, prun *out, int max) {
     pthread_mutex_unlock(&g_snapmu);
     return n;
 }
+static int prot_runs_emit(uintptr_t lo, uintptr_t hi, uintptr_t a, uintptr_t b, int p,
+                          prun *out, int *n, int max, uintptr_t *at, int *stop) {
+    (void)lo;
+    if (b <= *at) return 1;
+    if (a >= hi) { *stop = 1; return 1; }
+    if (a > *at) { if (*n == max) { *stop = 1; return 1; } out[(*n)++] = (prun){*at, a, -1}; *at = a; }
+    uintptr_t e = b < hi ? b : hi;
+    if (*n && out[*n - 1].prot == p && out[*n - 1].hi == *at) out[*n - 1].hi = e;
+    else { if (*n == max) { *stop = 1; return 1; } out[(*n)++] = (prun){*at, e, p}; }
+    *at = e;
+    if (*at >= hi) *stop = 1;
+    return 1;
+}
+static int prot_runs_text_fast(uintptr_t lo, uintptr_t hi, prun *out, int max) {
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[16384]; size_t have = 0u; int n = 0, err = 0, skip_rest = 0, stop = 0; uintptr_t at = lo;
+    while (!stop && at < hi) {
+        ssize_t k = read(fd, buf + have, sizeof buf - have);
+        if (k < 0) { if (errno == EINTR) continue; err = 1; break; }
+        have += (size_t)k; size_t s = 0u;
+        for (const char *nl; !stop && s < have && (nl = memchr(buf + s, '\n', have - s)) != NULL; s = (size_t)(nl - buf) + 1u) {
+            if (skip_rest) { skip_rest = 0; continue; }
+            g_maps_lines++;
+            uintptr_t a = 0, b = 0; int p = 0;
+            if (vka_maps_parse_line_fast(buf + s, (size_t)(nl - (buf + s)), &a, &b, &p)) prot_runs_emit(lo, hi, a, b, p, out, &n, max, &at, &stop);
+        }
+        if (stop) break;
+        if (s == 0u && have == sizeof buf) {
+            if (!skip_rest) {
+                g_maps_lines++;
+                uintptr_t a = 0, b = 0; int p = 0;
+                if (vka_maps_parse_line_fast(buf, have, &a, &b, &p)) prot_runs_emit(lo, hi, a, b, p, out, &n, max, &at, &stop);
+                skip_rest = 1;
+            }
+            have = 0u; continue;
+        }
+        if (k == 0) {
+            if (have > s && !skip_rest) {
+                g_maps_lines++;
+                uintptr_t a = 0, b = 0; int p = 0;
+                if (vka_maps_parse_line_fast(buf + s, have - s, &a, &b, &p)) prot_runs_emit(lo, hi, a, b, p, out, &n, max, &at, &stop);
+            }
+            break;
+        }
+        if (s < have) memmove(buf, buf + s, have - s);
+        have -= s;
+    }
+    close(fd);
+    if (err) return 0;
+    if (at < hi && n < max) out[n++] = (prun){at, hi, -1};
+    return at >= hi || (n && out[n - 1].hi == hi) ? n : 0;
+}
 static int prot_runs_text(uintptr_t lo, uintptr_t hi, prun *out, int max) {
+    if (vka_samp_maps_fast_on()) return prot_runs_text_fast(lo, hi, out, max);
     FILE *f = fopen("/proc/self/maps", "re"); if (!f) return 0;
     char ln[512]; int n = 0, err = 0; uintptr_t at = lo;
     while (at < hi && maps_line(f, ln, sizeof ln, &err)) {
