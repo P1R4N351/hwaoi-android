@@ -42,5 +42,10 @@ class Support(unittest.TestCase):
         self.assertIn(VITADB, targets)
 
 
+    def test_bitcoin_address_is_the_published_one(self):
+        self.assertIn('bc1q4a3lqcg87rvw7vxulausdqhhuwkwwa6w6v4mxx', README.read_text(encoding='utf-8'), 'README.md does not carry the published Bitcoin address')
+        self.assertIn('bitcoin:bc1q4a3lqcg87rvw7vxulausdqhhuwkwwa6w6v4mxx', FUNDING.read_text(encoding='utf-8'), '.github/FUNDING.yml does not carry the published Bitcoin address')
+
+
 if __name__ == '__main__':
     unittest.main()
