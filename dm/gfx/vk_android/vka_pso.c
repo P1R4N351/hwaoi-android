@@ -9,6 +9,7 @@
 #include "vka_memu_abi.h"
 #include "vka_pwlist.h"
 #include "vka_pcache_fast.h"
+#include "vka_pso_key_fast.h"
 #include "vka_psogate.h"
 #include "vka_pso_cache.h"
 #include "vk_prewarm_seed.h"   // the profile's seed list (dm/games/<id>/vk_prewarm.bin; dm/games/game.py seed): dm_vk_prewarm_seed, dm_vk_prewarm_seed_len (0: none)
@@ -44,9 +45,12 @@ static void *km_get_prefix(kmap *m, const void *key, uint64_t h, uint32_t n, siz
         if (m->e[i].h == h && vka_lkey_eq_fast(m->e[i].key, key, n, active, vka_w34_fault())) return m->e[i].val;
     }
 }
+static inline int km_key_eq(const void *a, const void *b, size_t n) {
+    return vka_pso_key_fast_on() ? vka_km_eq_fast(a, b, n) : !memcmp(a, b, n);
+}
 static void *km_get(kmap *m, const void *key, uint64_t h) {
     if (!m->cap) return NULL;
-    for (size_t i = h & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) { if (!m->e[i].key) return NULL; if (m->e[i].h == h && !memcmp(m->e[i].key, key, m->klen)) return m->e[i].val; }
+    for (size_t i = h & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) { if (!m->e[i].key) return NULL; if (m->e[i].h == h && km_key_eq(m->e[i].key, key, m->klen)) return m->e[i].val; }
 }
 static void km_put(kmap *m, const void *key, uint64_t h, void *val) {
     if (2 * (m->n + 1) > m->cap) {
@@ -61,7 +65,7 @@ static void km_put(kmap *m, const void *key, uint64_t h, void *val) {
 // The value slot of key, to change an entry in place (NULL: not in the map)
 static void **km_slot(kmap *m, const void *key, uint64_t h) {
     if (!m->cap) return NULL;
-    for (size_t i = h & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) { if (!m->e[i].key) return NULL; if (m->e[i].h == h && !memcmp(m->e[i].key, key, m->klen)) return &m->e[i].val; }
+    for (size_t i = h & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) { if (!m->e[i].key) return NULL; if (m->e[i].h == h && km_key_eq(m->e[i].key, key, m->klen)) return &m->e[i].val; }
 }
 
 // ---------- Layouts ----------
@@ -359,41 +363,52 @@ static pthread_cond_t g_busy_cv = PTHREAD_COND_INITIALIZER;
 typedef struct {
     VkPipelineShaderStageCreateInfo ss[5]; uint32_t ns; VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rsg[5];
     VkBool32 gl_true; uint32_t afunc; VkSpecializationMapEntry me, ae; VkSpecializationInfo spec, aspec;
-    VkVertexInputBindingDescription vb[33]; VkVertexInputAttributeDescription va[32]; VkVertexInputBindingDivisorDescription vd[33];
     VkPipelineVertexInputDivisorStateCreateInfo vds; VkPipelineVertexInputStateCreateInfo vi; VkPipelineInputAssemblyStateCreateInfo ia; VkPipelineTessellationStateCreateInfo ts;
     VkPipelineViewportStateCreateInfo vp; VkPipelineRasterizationStateCreateInfo rs; VkPipelineMultisampleStateCreateInfo ms; VkPipelineDepthStencilStateCreateInfo ds;
     VkPipelineColorBlendAttachmentState cb[8]; VkPipelineColorBlendStateCreateInfo bs; VkDynamicState dyn[24]; VkPipelineDynamicStateCreateInfo dy;
     VkFormat cf[8]; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci; int tess, mesh;   // mesh: a task / mesh pipeline (pstate_fill)
+    uint8_t vin_static;
     VkDescriptorSetLayout set0;   // the layout's set 0 (the library probe's independent-sets layout)
     vka_shader *sh[VKA_NSTAGE];
+    VkVertexInputBindingDescription vb[33]; VkVertexInputAttributeDescription va[32]; VkVertexInputBindingDivisorDescription vd[33];
 } pstate;
+_Static_assert(sizeof(VkDynamicState) == sizeof(uint32_t), "VkDynamicState size");
+_Static_assert(VKA_DYN_VIEWPORT == VK_DYNAMIC_STATE_VIEWPORT && VKA_DYN_SCISSOR == VK_DYNAMIC_STATE_SCISSOR && VKA_DYN_LINE_WIDTH == VK_DYNAMIC_STATE_LINE_WIDTH
+    && VKA_DYN_DEPTH_BIAS == VK_DYNAMIC_STATE_DEPTH_BIAS && VKA_DYN_BLEND_CONSTANTS == VK_DYNAMIC_STATE_BLEND_CONSTANTS
+    && VKA_DYN_STENCIL_COMPARE_MASK == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK && VKA_DYN_STENCIL_WRITE_MASK == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK
+    && VKA_DYN_STENCIL_REFERENCE == VK_DYNAMIC_STATE_STENCIL_REFERENCE && VKA_DYN_CULL_MODE == VK_DYNAMIC_STATE_CULL_MODE
+    && VKA_DYN_FRONT_FACE == VK_DYNAMIC_STATE_FRONT_FACE && VKA_DYN_PRIMITIVE_TOPOLOGY == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY
+    && VKA_DYN_DEPTH_TEST_ENABLE == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE && VKA_DYN_DEPTH_WRITE_ENABLE == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE
+    && VKA_DYN_DEPTH_COMPARE_OP == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP && VKA_DYN_DEPTH_BOUNDS_TEST_ENABLE == VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE
+    && VKA_DYN_STENCIL_TEST_ENABLE == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE && VKA_DYN_STENCIL_OP == VK_DYNAMIC_STATE_STENCIL_OP
+    && VKA_DYN_VERTEX_INPUT_EXT == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && VKA_DYN_RASTERIZER_DISCARD_ENABLE == VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE
+    && VKA_DYN_DEPTH_BIAS_ENABLE == VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE && VKA_DYN_PRIMITIVE_RESTART_ENABLE == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+    "vka_pso_key_fast.h dynamic states");
 
 // A VkFormat's class for colour outputs: 1 UINT, 2 SINT, 0 the rest (float, normalized, scaled)
 static int vkf_int_class(uint32_t f) {
+    if (vka_pso_key_fast_on()) return vka_vkf_int_class_fast(f);
     static const uint16_t u[] = {13, 20, 27, 34, 41, 48, 55, 62, 68, 74, 81, 88, 95, 98, 101, 104, 107, 110, 113, 116, 119};
     for (size_t i = 0; i < sizeof u / sizeof *u; i++) { if (f == u[i]) return 1; if (f == u[i] + 1u) return 2; }
     return 0;
 }
 // VKA_FS_RETYPE: the pixel shader's float outputs (fout_types) that it writes (fout_mask) into UINT / SINT attachments of the key: retyped in its module (vka_shader_fout_module)
 static void fout_masks(const vka_shader *fs, const vka_gkey *k, uint32_t *um, uint32_t *sm) {
+    _Static_assert(DMSH_VK_TYPE_FLOAT == 0, "DMSH_VK_TYPE_FLOAT");
+    if (vka_pso_key_fast_on()) { vka_fout_masks_fast(fs->e->fout_mask, fs->e->fout_types, k->cfmt, k->ncolor, um, sm); return; }
     *um = *sm = 0;
     for (uint32_t i = 0; i < k->ncolor && i < 8; i++) {
         int c = vkf_int_class(k->cfmt[i]);
         if (c && (fs->e->fout_mask >> i & 1) && (fs->e->fout_types >> (2 * i) & 3) == DMSH_VK_TYPE_FLOAT) { if (c == 1) *um |= 1u << i; else *sm |= 1u << i; }
     }
 }
-// 0 = a stage's module is missing (logged by vka_shader_module)
-static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
-    memset(P, 0, sizeof *P);
-    memcpy(P->sh, sh, sizeof P->sh);
-    // Stages: vertex, tess control, tess evaluation, geometry, fragment; the GL depth constant on the last of the first four. A mesh pipeline (NVN2 task and mesh programs,
-    // nvnCommandBufferDrawMeshTasks): task (optional), mesh, fragment, the GL depth constant on the mesh stage; it has no vertex input or input assembly state
+static int pstate_fill_stages(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_gkey *k) {
     static const int ovtx[5] = {0, 3, 4, 2, 1}, omesh[5] = {6, 7, 1, -1, -1};
     const int mesh = sh[7] != NULL, *order = mesh ? omesh : ovtx, nord = mesh ? 3 : 5;
     int last_pre = -1;
     for (int i = 0; i < nord - 1; i++) if (sh[order[i]]) last_pre = order[i];
     P->gl_true = VK_TRUE; P->me = (VkSpecializationMapEntry){DMSH_VK_SPEC_GL_DEPTH, 0, sizeof(VkBool32)}; P->spec = (VkSpecializationInfo){1, &P->me, sizeof P->gl_true, &P->gl_true};
-    P->afunc = k->alpha_func; P->ae = (VkSpecializationMapEntry){DMSH_VK_SPEC_ALPHA_FUNC, 0, sizeof(uint32_t)};   // the alpha test's function on an F_ALPHA_TEST pixel shader
+    P->afunc = k->alpha_func; P->ae = (VkSpecializationMapEntry){DMSH_VK_SPEC_ALPHA_FUNC, 0, sizeof(uint32_t)};
     P->aspec = (VkSpecializationInfo){1, &P->ae, sizeof P->afunc, &P->afunc};
     for (int i = 0; i < nord; i++) {
         vka_shader *s = sh[order[i]]; if (!s) continue;
@@ -402,16 +417,14 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
         VkShaderModule mod = order[i] == 0 && (k->vin_u | k->vin_s) ? vka_shader_vin_module(s, k->vin_u, k->vin_s) : order[i] == 2 && k->gs_fx ? vka_shader_gs_module(s)
                            : fs && k->fs_variant == VKA_FS_RETYPE ? (fu | fsm ? vka_shader_fout_module(s, fu, fsm) : vka_shader_module(s, DMSH_VK_MOD_BASE))
                            : vka_shader_module(s, fs ? k->fs_variant : DMSH_VK_MOD_BASE);
-        if (!mod && order[i] == 2 && k->gs_fx) mod = vka_shader_module(s, DMSH_VK_MOD_BASE);   // no module with the claim (logged): the shader as it is
-        if (mod && order[i] == 2 && sh[1]) {   // the pixel shader's inputs the geometry shader does not write, added (vka_shader_gs_link_module); none: the module above
+        if (!mod && order[i] == 2 && k->gs_fx) mod = vka_shader_module(s, DMSH_VK_MOD_BASE);
+        if (mod && order[i] == 2 && sh[1]) {
             VkShaderModule lm = vka_shader_gs_link_module(s, sh[0], sh[1], k->gs_fx && mod == vka_shader_gs_module(s));
             if (lm) mod = lm;
         }
         if (!mod) return 0;
-        // A task or mesh module that reads its subgroup lanes, with its specialization constants folded in instead of VkSpecializationInfo (vka_shader_spec_module)
         VkShaderModule frz = order[i] >= 6 ? vka_shader_spec_module(s, gl) : VK_NULL_HANDLE;
         if (frz) mod = frz;
-        // Float textures and images bound to integer texture views (vka_draw.c tex_masks): the module above with them retyped (vka_shader_tex_module); not with the geometry claim
         int rg = vka_shader_tex_range(s);
         if (rg >= 0 && rg < 5 && (k->tex_u[rg] | k->tex_s[rg])) {
             vka_texmod_key tk = {fs ? (k->fs_variant == VKA_FS_RETYPE ? DMSH_VK_MOD_BASE : k->fs_variant) : DMSH_VK_MOD_BASE, order[i] == 0 ? k->vin_u : 0, order[i] == 0 ? k->vin_s : 0,
@@ -420,16 +433,22 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
             if (t) mod = t;
             else VRED_ONCE("%016llx: a stage module with its textures retyped was not made: its integer texture views are read as floats", (unsigned long long)s->key);
         }
-        // A pixel module that reports its pool reads was given early depth tests where they give the late ones' result; alpha to coverage, or its alpha test on, takes the
-        // twin without them (vka_shader.c "Texture pool reads")
         if (fs) mod = vka_shader_pfb_pick(mod, k->a2c, k->alpha_func);
         uint32_t n = P->ns++;
         P->ss[n] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = (VkShaderStageFlagBits)stage_bit(s->e->stage), .module = mod, .pName = "main",
                                                     .pSpecializationInfo = frz ? NULL : gl ? &P->spec : fs && P->afunc && (s->e->flags & DMSH_VK_F_ALPHA_TEST) ? &P->aspec : NULL};
-        uint32_t pin = (s->e->flags & DMSH_VK_F_SUBGROUP) ? vka_shader_sg_pin(s->e->stage) : 0;   // subgroup shaders of a stage whose size the device varies: pinned to the library's (vka_shader_sg_pin)
+        uint32_t pin = (s->e->flags & DMSH_VK_F_SUBGROUP) ? vka_shader_sg_pin(s->e->stage) : 0;
         if (pin) { P->rsg[n] = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = pin};
                    P->ss[n].pNext = &P->rsg[n]; }
     }
+    return 1;
+}
+// 0 = a stage's module is missing (logged by vka_shader_module)
+static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+    memset(P, 0, (vka_pso_key_fast_on() && !k->vin_static) ? offsetof(pstate, vb) : sizeof *P);
+    memcpy(P->sh, sh, sizeof P->sh);
+    if (!pstate_fill_stages(P, sh, k)) return 0;
+    const int mesh = sh[7] != NULL;
     uint32_t nvb = 0, nva = 0, nvd = 0;
     if (k->vin_static) {
         for (uint32_t i = 0; i < 32; i++) if (k->va[i].used) P->va[nva++] = (VkVertexInputAttributeDescription){i, k->va[i].binding, (VkFormat)k->va[i].fmt, k->va[i].offset};
@@ -443,7 +462,7 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
                                                    .vertexAttributeDescriptionCount = nva, .pVertexAttributeDescriptions = P->va};
     P->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = (VkPrimitiveTopology)k->topo};
     P->ts = (VkPipelineTessellationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, .patchControlPoints = 3};
-    P->vp = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};   // one viewport, as nvn_mtl.m draws
+    P->vp = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
     P->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = k->depth_clamp && V.depth_clamp,
         .polygonMode = (VkPolygonMode)k->poly_mode, .lineWidth = 1.0f};
     P->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = (VkSampleCountFlagBits)(k->samples ? k->samples : 1), .alphaToCoverageEnable = k->a2c};
@@ -452,25 +471,29 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
         P->cb[i] = (VkPipelineColorBlendAttachmentState){k->att[i].en, (VkBlendFactor)k->att[i].src, (VkBlendFactor)k->att[i].dst, (VkBlendOp)k->att[i].op,
                                                           (VkBlendFactor)k->att[i].srca, (VkBlendFactor)k->att[i].dsta, (VkBlendOp)k->att[i].opa, k->att[i].mask};
     P->bs = (VkPipelineColorBlendStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .logicOpEnable = k->logic_en, .logicOp = (VkLogicOp)k->logic_op, .attachmentCount = k->ncolor, .pAttachments = P->cb};
-    static const VkDynamicState base[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
-        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
-        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-        VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_LINE_WIDTH};
     uint32_t nd = 0;
-    for (size_t i = 0; i < sizeof base / sizeof *base; i++)   // (a mesh pipeline may not name the primitive topology or restart: it has no input assembly)
-        if (!mesh || (base[i] != VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && base[i] != VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE)) P->dyn[nd++] = base[i];
-    if (!k->vin_static && !mesh) P->dyn[nd++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
+    if (vka_pso_key_fast_on()) {
+        const uint32_t *sl = vka_dyn_full_fast(mesh, k->vin_static != 0, &nd);
+        memcpy(P->dyn, sl, (size_t)nd * sizeof P->dyn[0]);
+    } else {
+        static const VkDynamicState base[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+            VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+            VK_DYNAMIC_STATE_LINE_WIDTH};
+        for (size_t i = 0; i < sizeof base / sizeof *base; i++)
+            if (!mesh || (base[i] != VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && base[i] != VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE)) P->dyn[nd++] = base[i];
+        if (!k->vin_static && !mesh) P->dyn[nd++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
+    }
     P->dy = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = nd, .pDynamicStates = P->dyn};
     for (int i = 0; i < k->ncolor; i++) P->cf[i] = (VkFormat)k->cfmt[i];
     P->ri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor, .pColorAttachmentFormats = P->cf,
                                             .depthAttachmentFormat = (VkFormat)k->dfmt, .stencilAttachmentFormat = (VkFormat)k->sfmt};
-    P->tess = !mesh && (sh[3] || sh[4]); P->mesh = mesh;
+    P->tess = !mesh && (sh[3] || sh[4]); P->mesh = mesh; P->vin_static = k->vin_static != 0;
     P->ci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = vka_classic_rp() ? P->ri.pNext : &P->ri, .stageCount = P->ns, .pStages = P->ss, .pVertexInputState = mesh ? NULL : &P->vi,
-        .pInputAssemblyState = mesh ? NULL : &P->ia,
-        .pTessellationState = P->tess ? &P->ts : NULL, .pViewportState = &P->vp, .pRasterizationState = &P->rs, .pMultisampleState = &P->ms, .pDepthStencilState = &P->ds, .pColorBlendState = &P->bs,
-        .pDynamicState = &P->dy, .layout = lay->layout};
-    if (vka_classic_rp()) { P->ci.renderPass = vka_rp_compat(P->cf, k->ncolor, (VkFormat)k->dfmt, (VkFormat)k->sfmt, k->samples); P->ci.subpass = 0; }   // DM_VK_CLASSIC_RP
+        .pInputAssemblyState = mesh ? NULL : &P->ia, .pTessellationState = P->tess ? &P->ts : NULL, .pViewportState = &P->vp, .pRasterizationState = &P->rs, .pMultisampleState = &P->ms, .pDepthStencilState = &P->ds,
+        .pColorBlendState = &P->bs, .pDynamicState = &P->dy, .layout = lay->layout};
+    if (vka_classic_rp()) { P->ci.renderPass = vka_rp_compat(P->cf, k->ncolor, (VkFormat)k->dfmt, (VkFormat)k->sfmt, k->samples); P->ci.subpass = 0; }
     P->set0 = lay->set0;
     return 1;
 }
@@ -501,12 +524,19 @@ static int build_begin(const char *what, uint64_t vs, uint64_t fs) {
 // from its start
 enum { NHEAVY = 1024 };
 static uint64_t g_heavy[NHEAVY]; static _Atomic int g_heavy_n; static char g_heavy_path[1100]; static pthread_mutex_t g_heavy_mu = PTHREAD_MUTEX_INITIALIZER;
-static int heavy_has(uint64_t k) { int n = atomic_load(&g_heavy_n); for (int i = 0; i < n; i++) if (g_heavy[i] == k) return 1; return 0; }
+static vka_heavy_set_t g_heavy_fast;
+static int heavy_has(uint64_t k) {
+    if (vka_pso_key_fast_on()) return vka_heavy_has_fast(&g_heavy_fast, k);
+    int n = atomic_load(&g_heavy_n);
+    for (int i = 0; i < n; i++) if (g_heavy[i] == k) return 1;
+    return 0;
+}
 static void heavy_add(uint64_t k, int save) {
     pthread_mutex_lock(&g_heavy_mu);
     int n = atomic_load(&g_heavy_n);
-    if (k && n < NHEAVY && !heavy_has(k)) {
+    if (k && n < NHEAVY && !vka_heavy_has_fast(&g_heavy_fast, k)) {
         g_heavy[n] = k; atomic_store(&g_heavy_n, n + 1);
+        vka_heavy_add_fast(&g_heavy_fast, k);
         if (!g_heavy_path[0] && g_pc_path[0]) snprintf(g_heavy_path, sizeof g_heavy_path, "%s.heavy", g_pc_path);
         FILE *f = save && g_heavy_path[0] ? fopen(g_heavy_path, "a") : NULL;
         if (f) { fprintf(f, "%016llx\n", (unsigned long long)k); fclose(f); }
@@ -672,7 +702,14 @@ static int dyn_part(VkDynamicState d) {
     }
 }
 static void dyn_of(const pstate *P, int part, VkDynamicState *out, VkPipelineDynamicStateCreateInfo *dy) {
+    _Static_assert(L_VI == 0 && L_PRE == 1 && L_FS == 2 && L_FO == 3 && L_PREFS == 4, "L_* slice ids");
     uint32_t n = 0;
+    if (vka_pso_key_fast_on()) {
+        const uint32_t *sl = vka_dyn_slice_fast(P->mesh, P->vin_static, part, &n);
+        if (n && sl) memcpy(out, sl, (size_t)n * sizeof *out);
+        *dy = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = n, .pDynamicStates = out};
+        return;
+    }
     for (uint32_t i = 0; i < P->dy.dynamicStateCount; i++) { int d = dyn_part(P->dyn[i]); if (d == part || (part == L_PREFS && (d == L_PRE || d == L_FS))) out[n++] = P->dyn[i]; }
     *dy = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = n, .pDynamicStates = out};
 }
@@ -1423,13 +1460,19 @@ static inline VkPipeline gval_use(gval *g) {
     return p;
 }
 VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+    _Static_assert(sizeof(VkPipelineLayout) == sizeof(uint64_t), "VkPipelineLayout 64-bit handle");
     static gkey_full fk, last; static size_t last_len; static gval *last_g;
-    // With vertex input dynamic state the key's static vertex input (va, vb: two thirds of it) stays zero: only what comes before it is hashed and compared with the
-    // previous draw's key (draws in a row often share their pipeline). The entry's pipeline is read at each draw: the optimized one replaces a linked one in place
     size_t len = k->vin_static ? sizeof fk : offsetof(gkey_full, k.va);
-    memset(&fk, 0, len);   // (the rest stays zero: vin_static is the device's, the same for every key)
-    memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay->layout; memcpy(&fk.k, k, len - offsetof(gkey_full, k));
-    if (last_g && last_len == len && !memcmp(&fk, &last, len)) return gval_use(last_g);
+    size_t klen = len - offsetof(gkey_full, k);
+    if (vka_pso_key_fast_on()) {
+        if (last_g && last_len == len && vka_gkey_same_last_fast(last.sh, (uint64_t)(uintptr_t)last.layout, &last.k, sh, (uint64_t)(uintptr_t)lay->layout, k, sizeof fk.sh, klen))
+            return gval_use(last_g);
+        vka_gkey_pack_fast(&fk, offsetof(gkey_full, layout), sizeof fk.layout, offsetof(gkey_full, k), sh, sizeof fk.sh, &lay->layout, k, klen);
+    } else {
+        memset(&fk, 0, len);
+        memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay->layout; memcpy(&fk.k, k, klen);
+        if (last_g && last_len == len && !memcmp(&fk, &last, len)) return gval_use(last_g);
+    }
     uint64_t h = fnv(&fk, len, 1469598103934665603ull);
     int memo = pso_memo_on(), async = !sh[7] && as_threads() > 0;
     gval *g = memo ? vka_pso_gfx_get(&g_gfx_fast, &g_gfx_full, &fk, (uint32_t)len, h) : NULL;
