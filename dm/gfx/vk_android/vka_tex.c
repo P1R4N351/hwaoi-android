@@ -34,6 +34,7 @@
 #include "vka_view_ub_fast.h"
 #include "vka_tbuf_vl_fast.h"
 #include "vka_mem_sparse_fast.h"
+#include "vka_treg_ub_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -311,7 +312,11 @@ static _Atomic uint8_t *g_tisbuf;                   // per texture ID: registere
 static inline void serial_gens_bump(void) { atomic_fetch_add_explicit(&g_smap_gen, 1u, memory_order_release); atomic_fetch_add_explicit(&g_gpu_own_gen, 1u, memory_order_release); }
 static inline void gpu_own_note(int owned) { if (owned) atomic_store_explicit(&g_gpu_own_ever, 1u, memory_order_release); atomic_fetch_add_explicit(&g_gpu_own_gen, 1u, memory_order_release); }
 static smap_ent *map_get(uint64_t s) { return vksm_get(&g_smap, s); }
-static void map_put(uint64_t s, vka_img *im) { vksm_put(&g_smap, s, im); serial_gens_bump(); }   // (no memory for a new key: the texture has no entry, so its next lookup makes its image again; the old image goes when its refs do)
+static vka_treg_sidx_t g_treg_sidx;
+static void map_put(uint64_t s, vka_img *im) {
+    if (im && s != im->serial) vka_treg_sidx_mark_multi(&g_treg_sidx, (uintptr_t)im);
+    vksm_put(&g_smap, s, im); serial_gens_bump();
+}   // (no memory for a new key: the texture has no entry, so its next lookup makes its image again; the old image goes when its refs do)
 static void map_del(uint64_t s) { if (vksm_del(&g_smap, s)) { atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); serial_gens_bump(); } }   // a tombstone (never a valid serial)
 static void map_del_im(vka_img *im) { if (im && vksm_del_im(&g_smap, im)) { atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); serial_gens_bump(); } }
 static int cpuw_take(uint64_t s, int add) {   // add: insert; else: remove and say whether it was there
@@ -354,6 +359,7 @@ static void unref_locked(vka_img *im) {
     serial_gens_bump();
     if (--im->refs) return;
     if (g_lrz_prev == im) g_lrz_prev = NULL;   // (vka_lrz_touch)
+    vka_treg_sidx_unmark_multi(&g_treg_sidx, (uintptr_t)im);
     map_del_im(im);
     if (im->par) {   // a level child: destroyed after its last use, then its reference on the parent let go (the parent's image outlives the child's views' use)
         vka_img *p = im->par; uint64_t lf = __atomic_load_n(&im->last_fence, __ATOMIC_RELAXED); uint64_t f = lf ? lf : (vka_fence_last() + 1);
@@ -1452,11 +1458,48 @@ static treg_ent *g_treg; static int g_ntreg;   // indexed by host texture ID
 // The image made again from texture level base (caller holds g_tmu): the old image, its memory and views go when the GPU is done with them, and the texture IDs that name it
 // are written again at this submission (vka_tex_prepare); then everything is uploaded
 static uint64_t g_rebase;
-static unsigned redirty_ids(vka_img *im) {   // the texture IDs registered with im's texture, written again at this submission (caller holds g_tmu)
+static unsigned mark_im_treg_dirty_locked(vka_img *im) {
     unsigned nid = 0;
-    for (int id = 1; id < g_ntreg; id++) { if (!g_treg[id].t.serial) continue; smap_ent *e = map_get(g_treg[id].t.serial); if (e && e->im == im) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); nid++; } }
+    if (vka_treg_ub_fast_on()) {
+        if (!g_treg_sidx.inited) return 0;
+        if (!vka_treg_sidx_is_multi(&g_treg_sidx, (uintptr_t)im)) {
+            smap_ent *se = im->serial ? map_get(im->serial) : NULL;
+            if (!se || se->im != im) return 0;
+            for (int id = vka_treg_sidx_first(&g_treg_sidx, im->serial); id > 0; id = vka_treg_sidx_next(&g_treg_sidx, id, im->serial)) {
+                dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); nid++;
+            }
+            return nid;
+        }
+        uint64_t lser = 0u; int lhit = 0;
+        for (int k = 0; k < g_treg_sidx.n_act; k++) {
+            int id = g_treg_sidx.act_ids[k]; uint64_t ser = g_treg[id].t.serial;
+            if (!ser) continue;
+            if (ser != lser) { smap_ent *e = map_get(ser); lser = ser; lhit = e && e->im == im; }
+            if (lhit) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); nid++; }
+        }
+        return nid;
+    }
+    for (int id = 1; id < g_ntreg; id++) {
+        if (!g_treg[id].t.serial) continue;
+        smap_ent *e = map_get(g_treg[id].t.serial);
+        if (e && e->im == im) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); nid++; }
+    }
     return nid;
 }
+static void mark_serial_treg_linear_locked(uint64_t serial, uint32_t stride) {
+    if (vka_treg_ub_fast_on()) {
+        for (int id = vka_treg_sidx_first(&g_treg_sidx, serial); id > 0; id = vka_treg_sidx_next(&g_treg_sidx, id, serial)) {
+            g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+            if (!g_treg[id].t.d.stride) g_treg[id].t.d.stride = stride;
+        }
+        return;
+    }
+    for (int id = 1; id < g_ntreg; id++) if (g_treg[id].t.serial == serial) {
+        g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+        if (!g_treg[id].t.d.stride) g_treg[id].t.d.stride = stride;
+    }
+}
+static unsigned redirty_ids(vka_img *im) { return mark_im_treg_dirty_locked(im); }
 static int img_rebase(vka_img *im, uint32_t base, VkCommandBuffer cb) {
     tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem; t.pool = (pool_t *)im->vpool;   // (the pool: a sparse residency image again)
     if (im->usage & VK_IMAGE_USAGE_STORAGE_BIT) t.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;   // (made with storage use, or upgraded to it: its storage use and learned formats stay)
@@ -1995,13 +2038,17 @@ static void vka_tex_prune_locked(void) {
     // remade thousands of images a second (Turnip under 1 fps, a crash in Qualcomm's driver). An image a live pool slot names is in use: it stays, and a working
     // set over the limit is kept (logged below). Only with DM_VK_EAGER_TEX=1 (default 0): without it no image is made for a slot alone, so nothing to keep
     int pool_keep = VKA_ENV("DM_VK_EAGER_TEX", 0), npool = 0;
-    if (pool_keep)
-        for (int id = 1; id < g_ntreg; id++) {
+    if (pool_keep) {
+        int fast_act = vka_treg_ub_fast_on();
+        int lim = fast_act ? g_treg_sidx.n_act : (g_ntreg > 1 ? g_ntreg - 1 : 0);
+        for (int k = 0; k < lim; k++) {
+            int id = fast_act ? g_treg_sidx.act_ids[k] : (k + 1);
             const treg_ent *te = &g_treg[id];
-            if (!te->t.serial || (te->t.pool && te->pgen && nvn_pool_live(te->t.pool, NULL, NULL) != te->pgen)) continue;   // (a finalized pool's slot has the null view: treg_dead)
+            if (!te->t.serial || (te->t.pool && te->pgen && nvn_pool_live(te->t.pool, NULL, NULL) != te->pgen)) continue;
             smap_ent *se = map_get(te->t.serial);
             if (se && se->im && se->im->pool_frame != cur_frame) { se->im->pool_frame = cur_frame; npool++; }
         }
+    }
     uint64_t gpu_kept = 0; int ngpu_kept = 0;
     // The shipped pressure policy (DM_VK_IMG_PSI=1) also keeps the working set out of the candidates: the target is never under it, but the array order is the LRU order and
     // a GPU-only image is protected for 120 frames, so the oldest candidate can be one the scene used 3 frames ago (and g_img_ws is up to 60 frames stale). With the pressure
@@ -2115,6 +2162,7 @@ static vka_img *tex_get_create_locked(const tex_t *t, VkCommandBuffer cb, int *t
             int revived = im->pdead;
             if (revived) {
                 im->pdead = 0; im->track = (im->mode == ST_TRACK);
+                if (im->serial != t->serial) vka_treg_sidx_mark_multi(&g_treg_sidx, (uintptr_t)im);
                 im->serial = t->serial;
             }
             if (t->pool && (im->pool != t->pool || revived)) { uint64_t fin = nvn_pool_fin(), g = nvn_pool_live(t->pool, NULL, NULL); if (g) { im->pool = t->pool; im->pfin = fin; im->pgen = g; } } }
@@ -2151,10 +2199,7 @@ static void tex_late_video_locked(vka_img *im, uint64_t serial) {
     im->is_video = 1; im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
     if (!im->d.stride) im->d.stride = vs ? vs : 7680;
     im->track = 1; __atomic_store_n(&im->gpu_owned, 0, __ATOMIC_RELEASE); gpu_own_note(0);
-    for (int id = 1; id < g_ntreg; id++) if (g_treg[id].t.serial == serial) {
-        g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
-        if (!g_treg[id].t.d.stride) g_treg[id].t.d.stride = im->d.stride;
-    }
+    mark_serial_treg_linear_locked(serial, im->d.stride);
     VLOG("texture serial %llu: late video pool detection, marked linear (stride %u)", (unsigned long long)im->serial, im->d.stride);
 }
 vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
@@ -2859,6 +2904,7 @@ static void treg(int id, const tex_t *t, const view_t *v, int img) {
         return;
     }
     e->t = *t; e->has_v = v != NULL; if (v) e->v = *v; e->img = (uint8_t)img; e->pgen = pgen;
+    if (id > 0) vka_treg_sidx_set(&g_treg_sidx, id, t->serial);
     dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
     _Atomic uint32_t *tv = __atomic_load_n(&g_tver, __ATOMIC_RELAXED);
     if (!tv) { tv = calloc(1 << 20, sizeof *g_tver); __atomic_store_n(&g_tver, tv, __ATOMIC_RELEASE); }
@@ -3031,8 +3077,7 @@ static int img_storage_upgrade(vka_img *im, VkCommandBuffer cb, VkFormat need) {
     else vka_after(vka_fence_last() + 1, img_destroy, n);
     // Views made of the old image are gone with it: the recording memo (g_tgen) and the registered pool slots that name the image are made again
     atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
-    int named = 0;
-    for (int id = 1; id < g_ntreg; id++) { smap_ent *e = g_treg[id].t.serial ? map_get(g_treg[id].t.serial) : NULL; if (e && e->im == im) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); named++; } }
+    int named = (int)mark_im_treg_dirty_locked(im);
     static _Atomic int k; if (atomic_fetch_add(&k, 1) < 16)
         VLOG("texture serial %llu %ux%u format %#x (VkFormat %d) flags %#x: bound as a shader image %s, remade with storage use%s (content copied, %d texture IDs rewritten)",
              (unsigned long long)im->serial, im->w, im->h, im->d.format, im->f.vk, im->d.flags, listed ? "without the image flag" : "through a view in another format", listed ? "" : " and that format in its list", named);
@@ -3718,12 +3763,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
                     if (!im->d.stride) im->d.stride = vs;
                     im->track = 1;
                     __atomic_store_n(&im->gpu_owned, 0, __ATOMIC_RELEASE); gpu_own_note(0);
-                    for (int id = 1; id < g_ntreg; id++) {
-                        if (g_treg[id].t.serial == im->serial) {
-                            g_treg[id].t.d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
-                            if (!g_treg[id].t.d.stride) g_treg[id].t.d.stride = vs;
-                        }
-                    }
+                    mark_serial_treg_linear_locked(im->serial, vs);
                     VLOG("texture serial %llu: late video pool detection in prepare, marked linear (stride %u)", (unsigned long long)im->serial, vs);
                 }
             }
@@ -3825,7 +3865,15 @@ vka_img *vka_cap_shared(const tex_t *t) {
     vka_fmt f; vka_img *im = NULL;
     if (!t || !t->mem || !vka_fmt_of(t->d.format, &f)) return NULL;
     pthread_mutex_lock(&g_tmu);
-    for (int i = 0; i < g_nlive && !im; i++) if (same_shape(g_live[i], t, &f, 0)) { im = g_live[i]; im->refs++; }
+    if (vka_treg_ub_fast_on()) {
+        int lk;
+        for (vka_img *o = live_first(t->mem, &lk); o; o = live_next(o, t->mem, &lk)) {
+            if (same_shape(o, t, &f, 0) && (!im || o->live_ix < im->live_ix)) im = o;
+        }
+        if (im) im->refs++;
+    } else {
+        for (int i = 0; i < g_nlive && !im; i++) if (same_shape(g_live[i], t, &f, 0)) { im = g_live[i]; im->refs++; }
+    }
     pthread_mutex_unlock(&g_tmu);
     return im;
 }

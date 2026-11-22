@@ -26,6 +26,7 @@
 #include "vka_view_fast.h"
 #include "vka_rp_mod_fast.h"
 #include "vka_view_ub_fast.h"
+#include "vka_treg_ub_fast.h"
 _Static_assert(sizeof(((vka_dstate *)0)->ubo_dirty) == 32 && VKA_NSTAGE == 8 && sizeof(p_scissor) == 16, "inst_fast sizes");
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
@@ -255,13 +256,21 @@ static struct {
 // draw whose non-UBO buffers overlap UB (or whose UBO has an uncompleted opaque GPU write) ends the pass first (ub_hazard), and vka_rp_end flushes UB to placed guest RAM
 enum { UB_MAX = 256 };
 static struct {
-    int n, m_valid; uint64_t lo, hi, seq, m_seq, m_addr, m_size, bloom; vka_span m_span; vka_ub_shadow_memo4 sm;
+    int n, m_valid; uint64_t lo, hi, seq, m_seq, m_addr, m_size, bloom; vka_span m_span; vka_ub_shadow_memo4 sm; vka_ub_dir_t dir;
     struct { uint64_t dst, n, cap; uint8_t *data; } e[UB_MAX];
 } UB;
 static int ub_overlaps(uint64_t addr, uint64_t size) {
     uint64_t b = addr + size;
     if (!UB.n || !size || b <= UB.lo || addr >= UB.hi) return 0;
     if (vka_gw_fast_on() && !(UB.bloom & vka_ub_bloom_mask(addr, b))) return 0;
+    if (vka_treg_ub_fast_on()) {
+        uint64_t cand[4]; if (!vka_ub_dir_cand(&UB.dir, addr, b, cand)) return 0;
+        for (int w = 0; w < 4; w++) for (uint64_t m = cand[w]; m; m &= m - 1u) {
+            int i = (w << 6) + __builtin_ctzll(m);
+            if (i < UB.n && UB.e[i].dst < b && addr < UB.e[i].dst + UB.e[i].n) return 1;
+        }
+        return 0;
+    }
     for (int i = 0; i < UB.n; i++) if (UB.e[i].dst < b && addr < UB.e[i].dst + UB.e[i].n) return 1;
     return 0;
 }
@@ -270,6 +279,16 @@ static void ub_apply(uint64_t addr, void *out, size_t size) {
     if (!UB.n || !size || b <= UB.lo || addr >= UB.hi) return;
     if (vka_gw_fast_on() && !(UB.bloom & vka_ub_bloom_mask(addr, b))) return;
     uint8_t *c = out;
+    if (vka_treg_ub_fast_on()) {
+        uint64_t cand[4]; if (!vka_ub_dir_cand(&UB.dir, addr, b, cand)) return;
+        for (int w = 0; w < 4; w++) for (uint64_t m = cand[w]; m; m &= m - 1u) {
+            int i = (w << 6) + __builtin_ctzll(m);
+            if (i >= UB.n) break;
+            uint64_t lo = UB.e[i].dst > addr ? UB.e[i].dst : addr, hi = UB.e[i].dst + UB.e[i].n < b ? UB.e[i].dst + UB.e[i].n : b;
+            if (lo < hi) memcpy(c + (lo - addr), UB.e[i].data + (lo - UB.e[i].dst), (size_t)(hi - lo));
+        }
+        return;
+    }
     for (int i = 0; i < UB.n; i++) {
         uint64_t lo = UB.e[i].dst > addr ? UB.e[i].dst : addr, hi = UB.e[i].dst + UB.e[i].n < b ? UB.e[i].dst + UB.e[i].n : b;
         if (lo < hi) memcpy(c + (lo - addr), UB.e[i].data + (lo - UB.e[i].dst), (size_t)(hi - lo));
@@ -277,7 +296,7 @@ static void ub_apply(uint64_t addr, void *out, size_t size) {
 }
 static void ub_flush(void) {
     if (!UB.n) return;
-    int n = UB.n; UB.n = 0; UB.m_valid = 0; UB.bloom = 0; vka_ub_shadow_reset(&UB.sm);
+    int n = UB.n; UB.n = 0; UB.m_valid = 0; UB.bloom = 0; vka_ub_shadow_reset(&UB.sm); vka_ub_dir_clear(&UB.dir);
     uint64_t last_d = 0, last_n = 0;
     int vufast = vka_view_ub_fast_on();
     vka_range_haz_t haz = {0};
@@ -302,6 +321,35 @@ static void ub_flush(void) {
     if (last_n) vka_rw_point(g_cb, 'u', 0, last_n, last_d);
 }
 static void inst_close(void);
+static int ub_defer_slot(uint64_t dst, uint64_t n) {
+    if (!vka_treg_ub_fast_on()) {
+        for (int i = UB.n - 1; i >= 0; i--) {
+            uint64_t lo = UB.e[i].dst, hi = lo + UB.e[i].n;
+            if (lo <= dst && dst + n <= hi) return i;
+            if (i == UB.n - 1 && hi == dst) return i;
+            if (lo < dst + n && dst < hi) return -1;
+        }
+        return -1;
+    }
+    if (UB.n > 0) {
+        int last = UB.n - 1; uint64_t lo = UB.e[last].dst, hi = lo + UB.e[last].n;
+        if ((lo <= dst && dst + n <= hi) || hi == dst) return last;
+        if (lo < dst + n && dst < hi) return -1;
+    }
+    uint64_t cand[4];
+    if (!vka_ub_dir_cand(&UB.dir, dst, dst + n, cand)) return -1;
+    for (int w = 3; w >= 0; w--) {
+        uint64_t m = cand[w];
+        while (m) {
+            int bit = 63 - __builtin_clzll(m); m &= ~(UINT64_C(1) << bit);
+            int i = (w << 6) + bit;
+            if (i >= UB.n - 1) continue;
+            uint64_t lo = UB.e[i].dst, hi = lo + UB.e[i].n;
+            if (lo < dst + n && dst < hi) return (lo <= dst && dst + n <= hi) ? i : -1;
+        }
+    }
+    return -1;
+}
 int vka_rp_ub_defer(uint64_t dst, uint64_t n, const void *data) {
     if (!R.on || !n || n > 65536 || !VKA_ENV("DM_VK_UB_DEFER", 1)) return 0;
     for (uint64_t done = 0; done < n;) {
@@ -309,13 +357,7 @@ int vka_rp_ub_defer(uint64_t dst, uint64_t n, const void *data) {
         if (!k) return 0;
         done += k;
     }
-    int slot = -1, was_empty = (UB.n == 0);
-    for (int i = UB.n - 1; i >= 0; i--) {
-        uint64_t lo = UB.e[i].dst, hi = lo + UB.e[i].n;
-        if (lo <= dst && dst + n <= hi) { slot = i; break; }
-        if (i == UB.n - 1 && hi == dst) { slot = i; break; }
-        if (lo < dst + n && dst < hi) break;
-    }
+    int slot = ub_defer_slot(dst, n), was_empty = (UB.n == 0), dir_slot = slot;
     if (slot >= 0) {
         uint64_t need = (dst - UB.e[slot].dst) + n;
         if (need > UB.e[slot].cap) {
@@ -336,8 +378,9 @@ int vka_rp_ub_defer(uint64_t dst, uint64_t n, const void *data) {
         memcpy(UB.e[i].data, data, (size_t)n);
         UB.e[i].dst = dst; UB.e[i].n = n;
         if (!UB.n || dst < UB.lo) UB.lo = dst;
-        UB.n++;
+        dir_slot = i; UB.n++;
     }
+    vka_ub_dir_add(&UB.dir, dir_slot, dst, dst + n);
     if (dst + n > UB.hi) UB.hi = dst + n;
     UB.bloom = was_empty ? vka_ub_bloom_mask(dst, dst + n) : (UB.bloom | vka_ub_bloom_mask(dst, dst + n));
     UB.seq++; UB.m_valid = 0;
@@ -2466,9 +2509,17 @@ static vkpp_pair g_pp_dep[64];
 // Diagnostic (prepass_unlisted): the depth-only mesh draws of the last frames, and the pairs already reported
 static struct { uint64_t key, ind, dep, frame, fs; } g_dom[16]; static int g_dom_next;
 static uint64_t g_unlisted[64][2]; static int g_unlisted_n;
+static const uint64_t g_pp_cut[][4] = DM_GAME_MESH_PREPASS_CUT;
+static vka_pp_cut_map_t g_pp_cut_map;
+static void prepass_cut_init(void) { vka_pp_cut_build(&g_pp_cut_map, g_pp_cut, DM_GAME_NMESH_PREPASS_CUT); }
+static const vka_pp_cut_map_t *prepass_cut_map(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, prepass_cut_init);
+    return &g_pp_cut_map;
+}
 static int prepass_listed(uint64_t prepass, uint64_t colour) {
-    static const uint64_t cut[][4] = DM_GAME_MESH_PREPASS_CUT;
-    for (int i = 0; i < DM_GAME_NMESH_PREPASS_CUT; i++) if (cut[i][0] == prepass && cut[i][1] == colour) return 1;
+    if (vka_treg_ub_fast_on()) return vka_pp_cut_has_pair(prepass_cut_map(), prepass, colour);
+    for (int i = 0; i < DM_GAME_NMESH_PREPASS_CUT; i++) if (g_pp_cut[i][0] == prepass && g_pp_cut[i][1] == colour) return 1;
     return 0;
 }
 // A depth-only mesh draw is remembered; an EQUAL mesh draw from the indirect record of one in this frame or the one before, into the same depth image, whose pair no row
@@ -2497,26 +2548,26 @@ static void prepass_unlisted(const vka_dstate *d, const p_set_rt *rt, int has_rt
 }
 // -1: a prepass draw, not drawn; 1: a colour draw to test LEQUAL for EQUAL; 2 + i: a colour draw that prepass_draw gives its depth first (pair i); 0: neither
 static int mesh_cut(const vka_dstate *d, const p_set_rt *rt, int has_rt, uint64_t key, uint64_t ind, vka_shader *fs) {
-    static const uint64_t cut[][4] = DM_GAME_MESH_PREPASS_CUT;
     if (g_fs_sub || g_pp_side) return 0;
     int m = VKA_ENV("DM_VK_MESH_PREPASS_SKIP", -1);
-    if (m < 0 ? V.memu || V.driver_id != VK_DRIVER_ID_QUALCOMM_PROPRIETARY : !m) return 0;   // (through compute the driver's mesh stage, whose fault this is, is not used)
+    if (m < 0 ? V.memu || V.driver_id != VK_DRIVER_ID_QUALCOMM_PROPRIETARY : !m) return 0;
     uint64_t vka_frame(void), f = vka_frame() + 1, dep = depth_id(rt, has_rt);
     prepass_unlisted(d, rt, has_rt, key, ind, fs, f);
-    for (int i = 0; i < DM_GAME_NMESH_PREPASS_CUT && i < 64; i++) {
-        if (key == cut[i][1]) {
-            if (d->ds.df != NVN_DEPTH_FUNC_EQUAL) return 0;
-            if (!vkpp_colour(&g_pp_dep[i], dep, f)) return 0;   // no prepass draw of the pair cut lately: it was drawn as asked (or not at all), EQUAL as asked
-            return cut[i][3] && VKA_ENV("DM_VK_MESH_PREPASS_DEPTH", 1) && prepass_find(i, ind) ? 2 + i : 1;
+    int role = 0, i = vka_treg_ub_fast_on() ? vka_pp_cut_first_key(prepass_cut_map(), key, &role) : -1;
+    if (!vka_treg_ub_fast_on()) {
+        for (int k = 0; k < DM_GAME_NMESH_PREPASS_CUT && k < 64; k++) {
+            if (key == g_pp_cut[k][1]) { i = k; role = 1; break; }
+            if (key == g_pp_cut[k][0]) { i = k; role = 0; break; }
         }
-        if (key != cut[i][0]) continue;
-        if (!depth_only(d, rt, has_rt)) return 0;
-        // only into a depth image of the shape the pair's colour draws tested EQUAL against in the last 4 frames: a depth-only draw into another (a shadow map) is drawn as asked
-        if (!vkpp_prepass(&g_pp_dep[i], dep, f)) return 0;
-        if (cut[i][3] && fs) prepass_note(d, i, ind, fs);
-        return -1;
     }
-    return 0;
+    if (i < 0) return 0;
+    if (role) {
+        if (d->ds.df != NVN_DEPTH_FUNC_EQUAL || !vkpp_colour(&g_pp_dep[i], dep, f)) return 0;
+        return g_pp_cut[i][3] && VKA_ENV("DM_VK_MESH_PREPASS_DEPTH", 1) && prepass_find(i, ind) ? 2 + i : 1;
+    }
+    if (!depth_only(d, rt, has_rt) || !vkpp_prepass(&g_pp_dep[i], dep, f)) return 0;
+    if (g_pp_cut[i][3] && fs) prepass_note(d, i, ind, fs);
+    return -1;
 }
 // The prepass's depth for the colour draw of pair i (mesh_cut): the same draw record with the colour draw's mesh stages and targets, the prepass's pixel shader (moved
 // inputs), pixel bindings and depth / stencil / rasterizer state, no colour channel written. 0 = not drawn (the pixel shader refused the move, or the draw stopped
