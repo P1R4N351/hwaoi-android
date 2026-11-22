@@ -14,6 +14,7 @@
 #include "vka_spvpatch.h"
 #include "vka_layerreq.h"
 #include "vka_shader_fast.h"
+#include "vka_rp_mod_fast.h"
 #include "plat/plat.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -591,6 +592,9 @@ VkShaderModule vka_shader_spec_module(vka_shader *s, int gl) {
 // A geometry shader's module for one vertex / pixel pair: outputs added for the pixel inputs it does not write (vka_spv_gs_link: the passthrough copies a geometry shader
 // translated alone lacks; Qualcomm's driver refuses such a pipeline with -13). Made once per pair (and claim choice), kept for the process. VK_NULL_HANDLE: nothing to add, or
 // not made (logged): the caller's module as before
+_Static_assert(sizeof(vka_texmod_key) == 40, "vka_texmod_key 40B");
+static vka_mod_pair_map_t g_mod_pair_map;
+static vka_mod_tex_map_t g_mod_tex_map;
 struct vka_gslink { struct vka_gslink *next; uint64_t vs, fs; int claim; VkShaderModule mod; };
 static uint32_t *base_words(vka_shader *s, size_t *nb, char *err, size_t errn) {
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_BASE);
@@ -601,8 +605,14 @@ VkShaderModule vka_shader_gs_link_module(vka_shader *gs, vka_shader *vs, vka_sha
     uint32_t ptag = 4u + (uint32_t)(claim != 0);
     vka_sh_tls_block *t = sh_fast_on() ? sh_tls() : NULL; uint64_t hit = 0;
     if (t && vka_sh_pair64_find(&t->pair, ptag, (uintptr_t)gs, vs->key, fs->key, &hit)) return (VkShaderModule)(uintptr_t)hit;
+    int mfast = vka_rp_mod_fast_on(); uint64_t mhit = 0;
     pthread_mutex_lock(&g_mu);
-    for (struct vka_gslink *l = gs->gslink; l; l = l->next) if (l->vs == vs->key && l->fs == fs->key && l->claim == claim) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, ptag, (uintptr_t)gs, vs->key, fs->key, &mhit)) {
+        VkShaderModule m = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (t) vka_sh_pair64_put(&t->pair, ptag, (uintptr_t)gs, vs->key, fs->key, mhit);
+        return m;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_gslink *l = gs->gslink; l; l = l->next) if (l->vs == vs->key && l->fs == fs->key && l->claim == claim) {
         VkShaderModule m = l->mod; pthread_mutex_unlock(&g_mu);
         if (t) vka_sh_pair64_put(&t->pair, ptag, (uintptr_t)gs, vs->key, fs->key, (uint64_t)(uintptr_t)m);
         return m;
@@ -620,13 +630,19 @@ VkShaderModule vka_shader_gs_link_module(vka_shader *gs, vka_shader *vs, vka_sha
                                                                        (unsigned long long)gs->key, (unsigned long long)fs->key, copied, (unsigned long long)vs->key, nulled); }
     else if (err[0]) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("geometry shader %016llx with pixel shader %016llx: inputs it does not write not added (%s); a driver may refuse the pipeline", (unsigned long long)gs->key, (unsigned long long)fs->key, err); }
     pthread_mutex_lock(&g_mu);
-    for (struct vka_gslink *l = gs->gslink; l; l = l->next) if (l->vs == vs->key && l->fs == fs->key && l->claim == claim) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, ptag, (uintptr_t)gs, vs->key, fs->key, &mhit)) {
+        VkShaderModule had = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu); if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
+        if (t) vka_sh_pair64_put(&t->pair, ptag, (uintptr_t)gs, vs->key, fs->key, mhit);
+        return had;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_gslink *l = gs->gslink; l; l = l->next) if (l->vs == vs->key && l->fs == fs->key && l->claim == claim) {
         VkShaderModule had = l->mod; pthread_mutex_unlock(&g_mu); if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
         if (t) vka_sh_pair64_put(&t->pair, ptag, (uintptr_t)gs, vs->key, fs->key, (uint64_t)(uintptr_t)had);
         return had;
     }
     struct vka_gslink *l = malloc(sizeof *l);
-    if (l) { *l = (struct vka_gslink){gs->gslink, vs->key, fs->key, claim, mod}; gs->gslink = l; }
+    if (l) { *l = (struct vka_gslink){gs->gslink, vs->key, fs->key, claim, mod}; gs->gslink = l;
+             if (mfast) vka_mod_pair_put(&g_mod_pair_map, ptag, (uintptr_t)gs, vs->key, fs->key, (uint64_t)(uintptr_t)mod); else g_mod_pair_map.partial = 1u; }
     pthread_mutex_unlock(&g_mu);
     if (t) vka_sh_pair64_put(&t->pair, ptag, (uintptr_t)gs, vs->key, fs->key, (uint64_t)(uintptr_t)mod);
     return mod;
@@ -636,8 +652,14 @@ struct vka_vinmod { struct vka_vinmod *next; uint32_t u, s; VkShaderModule mod; 
 VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t smask) {
     vka_sh_tls_block *t = sh_fast_on() ? sh_tls() : NULL; uint64_t hit = 0;
     if (t && vka_sh_pair64_find(&t->pair, 1, (uintptr_t)s, umask, smask, &hit)) return (VkShaderModule)(uintptr_t)hit;
+    int mfast = vka_rp_mod_fast_on(); uint64_t mhit = 0;
     pthread_mutex_lock(&g_mu);
-    for (struct vka_vinmod *v = s->vin; v; v = v->next) if (v->u == umask && v->s == smask) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, 1u, (uintptr_t)s, umask, smask, &mhit)) {
+        VkShaderModule m = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (t) vka_sh_pair64_put(&t->pair, 1, (uintptr_t)s, umask, smask, mhit);
+        return m;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_vinmod *v = s->vin; v; v = v->next) if (v->u == umask && v->s == smask) {
         VkShaderModule m = v->mod; pthread_mutex_unlock(&g_mu);
         if (t) vka_sh_pair64_put(&t->pair, 1, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)m);
         return m;
@@ -655,14 +677,21 @@ VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t sma
                 mod = vka_shader_module(s, DMSH_VK_MOD_BASE); }
     // Two threads (the frame path and a prewarm or optimizer thread) may have made it at once: the first one in the list wins, the other's module is destroyed
     pthread_mutex_lock(&g_mu);
-    for (struct vka_vinmod *o = s->vin; o; o = o->next) if (o->u == umask && o->s == smask) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, 1u, (uintptr_t)s, umask, smask, &mhit)) {
+        VkShaderModule w = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (own && mod != w) vk.vkDestroyShaderModule(V.dev, mod, NULL);
+        if (t) vka_sh_pair64_put(&t->pair, 1, (uintptr_t)s, umask, smask, mhit);
+        return w;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_vinmod *o = s->vin; o; o = o->next) if (o->u == umask && o->s == smask) {
         VkShaderModule w = o->mod; pthread_mutex_unlock(&g_mu);
-        if (own && mod != w) vk.vkDestroyShaderModule(V.dev, mod, NULL);   // (no pipeline was made from it: it never left this function)
+        if (own && mod != w) vk.vkDestroyShaderModule(V.dev, mod, NULL);
         if (t) vka_sh_pair64_put(&t->pair, 1, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)w);
         return w;
     }
     struct vka_vinmod *v = malloc(sizeof *v);
-    if (v) { *v = (struct vka_vinmod){s->vin, umask, smask, mod}; s->vin = v; }
+    if (v) { *v = (struct vka_vinmod){s->vin, umask, smask, mod}; s->vin = v;
+             if (mfast) vka_mod_pair_put(&g_mod_pair_map, 1u, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)mod); else g_mod_pair_map.partial = 1u; }
     pthread_mutex_unlock(&g_mu);
     if (t) vka_sh_pair64_put(&t->pair, 1, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)mod);
     return mod;
@@ -671,8 +700,14 @@ VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t sma
 VkShaderModule vka_shader_fout_module(vka_shader *s, uint32_t umask, uint32_t smask) {
     vka_sh_tls_block *t = sh_fast_on() ? sh_tls() : NULL; uint64_t hit = 0;
     if (t && vka_sh_pair64_find(&t->pair, 2, (uintptr_t)s, umask, smask, &hit)) return (VkShaderModule)(uintptr_t)hit;
+    int mfast = vka_rp_mod_fast_on(); uint64_t mhit = 0;
     pthread_mutex_lock(&g_mu);
-    for (struct vka_vinmod *v = s->fout; v; v = v->next) if (v->u == umask && v->s == smask) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, 2u, (uintptr_t)s, umask, smask, &mhit)) {
+        VkShaderModule m = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (t) vka_sh_pair64_put(&t->pair, 2, (uintptr_t)s, umask, smask, mhit);
+        return m;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_vinmod *v = s->fout; v; v = v->next) if (v->u == umask && v->s == smask) {
         VkShaderModule m = v->mod; pthread_mutex_unlock(&g_mu);
         if (t) vka_sh_pair64_put(&t->pair, 2, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)m);
         return m;
@@ -690,14 +725,21 @@ VkShaderModule vka_shader_fout_module(vka_shader *s, uint32_t umask, uint32_t sm
                 mod = vka_shader_module(s, DMSH_VK_MOD_BASE); }
     else { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("pixel shader %016llx: float outputs %#x (uint) / %#x (int) retyped for their integer targets (their bits written as they are)", (unsigned long long)s->key, umask, smask); }
     pthread_mutex_lock(&g_mu);
-    for (struct vka_vinmod *x = s->fout; x; x = x->next) if (x->u == umask && x->s == smask) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, 2u, (uintptr_t)s, umask, smask, &mhit)) {
+        VkShaderModule had = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (own && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
+        if (t) vka_sh_pair64_put(&t->pair, 2, (uintptr_t)s, umask, smask, mhit);
+        return had;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_vinmod *x = s->fout; x; x = x->next) if (x->u == umask && x->s == smask) {
         VkShaderModule had = x->mod; pthread_mutex_unlock(&g_mu);
         if (own && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
         if (t) vka_sh_pair64_put(&t->pair, 2, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)had);
         return had;
     }
     struct vka_vinmod *v = malloc(sizeof *v);
-    if (v) { *v = (struct vka_vinmod){s->fout, umask, smask, mod}; s->fout = v; }
+    if (v) { *v = (struct vka_vinmod){s->fout, umask, smask, mod}; s->fout = v;
+             if (mfast) vka_mod_pair_put(&g_mod_pair_map, 2u, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)mod); else g_mod_pair_map.partial = 1u; }
     pthread_mutex_unlock(&g_mu);
     if (t) vka_sh_pair64_put(&t->pair, 2, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)mod);
     return mod;
@@ -709,8 +751,14 @@ struct vka_imgmod { struct vka_imgmod *next; uint64_t u, s; VkShaderModule mod; 
 VkShaderModule vka_shader_img_module(vka_shader *s, uint64_t umask, uint64_t smask) {
     vka_sh_tls_block *t = sh_fast_on() ? sh_tls() : NULL; uint64_t hit = 0;
     if (t && vka_sh_pair64_find(&t->pair, 3, (uintptr_t)s, umask, smask, &hit)) return (VkShaderModule)(uintptr_t)hit;
+    int mfast = vka_rp_mod_fast_on(); uint64_t mhit = 0;
     pthread_mutex_lock(&g_mu);
-    for (struct vka_imgmod *v = s->img; v; v = v->next) if (v->u == umask && v->s == smask) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, 3u, (uintptr_t)s, umask, smask, &mhit)) {
+        VkShaderModule m = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (t) vka_sh_pair64_put(&t->pair, 3, (uintptr_t)s, umask, smask, mhit);
+        return m;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_imgmod *v = s->img; v; v = v->next) if (v->u == umask && v->s == smask) {
         VkShaderModule m = v->mod; pthread_mutex_unlock(&g_mu);
         if (t) vka_sh_pair64_put(&t->pair, 3, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)m);
         return m;
@@ -731,14 +779,21 @@ VkShaderModule vka_shader_img_module(vka_shader *s, uint64_t umask, uint64_t sma
         else VRED("compute shader %016llx: images and textures at bindings %#llx (uint) / %#llx (int) not retyped for their integer textures: %s; the base module, which reads them as floats",
                   (unsigned long long)s->key, (unsigned long long)umask, (unsigned long long)smask, err); } }
     pthread_mutex_lock(&g_mu);
-    for (struct vka_imgmod *x = s->img; x; x = x->next) if (x->u == umask && x->s == smask) {
+    if (mfast && vka_mod_pair_find(&g_mod_pair_map, 3u, (uintptr_t)s, umask, smask, &mhit)) {
+        VkShaderModule had = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
+        if (t) vka_sh_pair64_put(&t->pair, 3, (uintptr_t)s, umask, smask, mhit);
+        return had;
+    }
+    if (!mfast || g_mod_pair_map.partial) for (struct vka_imgmod *x = s->img; x; x = x->next) if (x->u == umask && x->s == smask) {
         VkShaderModule had = x->mod; pthread_mutex_unlock(&g_mu);
         if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
         if (t) vka_sh_pair64_put(&t->pair, 3, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)had);
         return had;
     }
     struct vka_imgmod *v = malloc(sizeof *v);
-    if (v) { *v = (struct vka_imgmod){s->img, umask, smask, mod}; s->img = v; }
+    if (v) { *v = (struct vka_imgmod){s->img, umask, smask, mod}; s->img = v;
+             if (mfast) vka_mod_pair_put(&g_mod_pair_map, 3u, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)mod); else g_mod_pair_map.partial = 1u; }
     pthread_mutex_unlock(&g_mu);
     if (t) vka_sh_pair64_put(&t->pair, 3, (uintptr_t)s, umask, smask, (uint64_t)(uintptr_t)mod);
     return mod;
@@ -758,8 +813,14 @@ VkShaderModule vka_shader_tex_module(vka_shader *s, const vka_texmod_key *key) {
     if (t && vka_sh_tex_find(&t->tex, &tk, &hit)) return (VkShaderModule)(uintptr_t)hit;
     vka_texmod_key k; memset(&k, 0, sizeof k); k.variant = key->variant; k.vin_u = key->vin_u; k.vin_s = key->vin_s; k.fout_u = key->fout_u; k.fout_s = key->fout_s;
     k.frz = key->frz; k.tex_u = key->tex_u; k.tex_s = key->tex_s;
+    int mfast = vka_rp_mod_fast_on(); uint64_t mhit = 0;
     pthread_mutex_lock(&g_mu);
-    for (struct vka_texmod *v = s->tex; v; v = v->next) if (!memcmp(&v->k, &k, sizeof k)) {
+    if (mfast && vka_mod_tex_find(&g_mod_tex_map, (uintptr_t)s, &k, &mhit)) {
+        VkShaderModule m = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (t) vka_sh_tex_put(&t->tex, &tk, mhit);
+        return m;
+    }
+    if (!mfast || g_mod_tex_map.partial) for (struct vka_texmod *v = s->tex; v; v = v->next) if (mfast ? vka_texmod_key_eq_fast(&v->k, &k) : !memcmp(&v->k, &k, sizeof k)) {
         VkShaderModule m = v->mod; pthread_mutex_unlock(&g_mu);
         if (t) vka_sh_tex_put(&t->tex, &tk, (uint64_t)(uintptr_t)m);
         return m;
@@ -784,14 +845,21 @@ VkShaderModule vka_shader_tex_module(vka_shader *s, const vka_texmod_key *key) {
         else VRED("%s shader %016llx: textures at bindings %#llx (uint) / %#llx (int) not retyped for their integer texture views: %s; read through float views of the same size, which convert them",
                   stage_name(s->e->stage), (unsigned long long)s->key, (unsigned long long)k.tex_u, (unsigned long long)k.tex_s, err); } }
     pthread_mutex_lock(&g_mu);
-    for (struct vka_texmod *x = s->tex; x; x = x->next) if (!memcmp(&x->k, &k, sizeof k)) {
+    if (mfast && vka_mod_tex_find(&g_mod_tex_map, (uintptr_t)s, &k, &mhit)) {
+        VkShaderModule had = (VkShaderModule)(uintptr_t)mhit; pthread_mutex_unlock(&g_mu);
+        if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
+        if (t) vka_sh_tex_put(&t->tex, &tk, mhit);
+        return had;
+    }
+    if (!mfast || g_mod_tex_map.partial) for (struct vka_texmod *x = s->tex; x; x = x->next) if (mfast ? vka_texmod_key_eq_fast(&x->k, &k) : !memcmp(&x->k, &k, sizeof k)) {
         VkShaderModule had = x->mod; pthread_mutex_unlock(&g_mu);
         if (mod && mod != had) vk.vkDestroyShaderModule(V.dev, mod, NULL);
         if (t) vka_sh_tex_put(&t->tex, &tk, (uint64_t)(uintptr_t)had);
         return had;
     }
     struct vka_texmod *v = malloc(sizeof *v);
-    if (v) { v->next = s->tex; v->k = k; v->mod = mod; s->tex = v; }
+    if (v) { v->next = s->tex; v->k = k; v->mod = mod; s->tex = v;
+             if (mfast) vka_mod_tex_put(&g_mod_tex_map, (uintptr_t)s, &k, (uint64_t)(uintptr_t)mod); else g_mod_tex_map.partial = 1u; }
     pthread_mutex_unlock(&g_mu);
     if (t) vka_sh_tex_put(&t->tex, &tk, (uint64_t)(uintptr_t)mod);
     return mod;

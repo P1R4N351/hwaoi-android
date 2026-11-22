@@ -24,6 +24,8 @@
 #include "vka_cs_fast.h"
 #include "vka_gw_fast.h"
 #include "vka_view_fast.h"
+#include "vka_rp_mod_fast.h"
+_Static_assert(sizeof(((vka_dstate *)0)->ubo_dirty) == 32 && VKA_NSTAGE == 8 && sizeof(p_scissor) == 16, "inst_fast sizes");
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
 static uint64_t addr_run_fast(uint64_t addr, uint64_t len, VkBuffer *b, VkDeviceSize *o) {
@@ -371,14 +373,23 @@ typedef struct { VkFormat cf[8]; uint32_t n; VkFormat ds; uint32_t d, s, samples
 // Every shape's render pass is kept for the run (the pipelines made against it hold no reference, but each pass begun with it does until its fence): the list grows, so a
 // shape past any cap never makes a new VkRenderPass per pass (the 256-entry array this was did, and leaked one at each)
 typedef struct { rpkey k; VkRenderPass rp; } rpent;
-_Static_assert(sizeof(rpkey) == 56, "rpkey must be 56B");
+_Static_assert(sizeof(rpkey) == 56 && offsetof(rpent, k) == 0, "rpkey must be 56B at offset 0");
 static _Thread_local vka_rp_memo4 t_rp_memo4;
+static vka_rp_map_t g_rp_map;
 static rpent *g_rpc; static int g_nrpc, g_rpcap; static pthread_mutex_t g_rpmu = PTHREAD_MUTEX_INITIALIZER;
 static VkRenderPass rp_obtain(const rpkey *k) {
-    int fast = vka_view_fast_on();
+    int fast = vka_view_fast_on(), mfast = vka_rp_mod_fast_on();
     if (fast) { uint64_t rpu = 0; if (vka_rp_memo4_get(&t_rp_memo4, k, &rpu)) return (VkRenderPass)(uintptr_t)rpu; }
+    uint64_t rph = vka_rpkey_hash_fast(k);
     pthread_mutex_lock(&g_rpmu);
-    for (int i = 0; i < g_nrpc; i++) if (!memcmp(&g_rpc[i].k, k, sizeof *k)) {
+    int hit = mfast ? vka_rp_map_find(&g_rp_map, g_rpc, sizeof *g_rpc, k, rph) : -1;
+    if (hit >= 0) {
+        VkRenderPass r = g_rpc[hit].rp;
+        if (fast && r != VK_NULL_HANDLE) vka_rp_memo4_put(&t_rp_memo4, k, (uint64_t)(uintptr_t)r);
+        pthread_mutex_unlock(&g_rpmu); return r;
+    }
+    int start = mfast ? (int)g_rp_map.mapped_end : 0;
+    for (int i = start; i < g_nrpc; i++) if (mfast ? vka_rpkey_eq_fast(&g_rpc[i].k, k) : !memcmp(&g_rpc[i].k, k, sizeof *k)) {
         VkRenderPass r = g_rpc[i].rp;
         if (fast && r != VK_NULL_HANDLE) vka_rp_memo4_put(&t_rp_memo4, k, (uint64_t)(uintptr_t)r);
         pthread_mutex_unlock(&g_rpmu); return r; }
@@ -401,7 +412,7 @@ static VkRenderPass rp_obtain(const rpkey *k) {
     if (e) { VRED_ONCE("vkCreateRenderPass %d", e); r = VK_NULL_HANDLE; }
     else {
         if (g_nrpc == g_rpcap) { int nc = g_rpcap ? 2 * g_rpcap : 64; rpent *n = realloc(g_rpc, (size_t)nc * sizeof *n); if (n) { g_rpc = n; g_rpcap = nc; } }
-        if (g_nrpc < g_rpcap) { g_rpc[g_nrpc].k = *k; g_rpc[g_nrpc++].rp = r; } else VRED_ONCE("render pass list: out of memory");
+        if (g_nrpc < g_rpcap) { g_rpc[g_nrpc].k = *k; g_rpc[g_nrpc++].rp = r; if (mfast) vka_rp_map_insert(&g_rp_map, rph, (uint16_t)g_nrpc); } else VRED_ONCE("render pass list: out of memory");
         if (fast && r != VK_NULL_HANDLE) vka_rp_memo4_put(&t_rp_memo4, k, (uint64_t)(uintptr_t)r);
         if ((g_nrpc & (g_nrpc - 1)) == 0 && g_nrpc >= 256) VLOG("classic render passes: %d shapes", g_nrpc);
     }
@@ -2074,7 +2085,15 @@ static void vin_bind_kept(const vka_dstate *d) {
 
 // The guest indices of an indexed draw as 32-bit values (the CPU's view): for primitives Vulkan has no topology for and 8-bit indices on a device without them
 static uint32_t *read_indices(uint64_t addr, int itype, uint32_t count) {
-    size_t isz = itype == 0 ? 1 : itype == 1 ? 2 : 4; uint8_t *raw = malloc(isz * count + 4); uint32_t *o = malloc(4 * (size_t)count + 4);
+    size_t isz = itype == 0 ? 1 : itype == 1 ? 2 : 4;
+    if (vka_rp_mod_fast_on()) {
+        uint32_t *o = malloc(4 * (size_t)count + 4);
+        uint8_t *dst = !o ? NULL : (uint8_t *)o + (isz < 4 ? (4u - isz) * (size_t)count : 0u);
+        if (!dst || !cpu_read(addr, dst, isz * (size_t)count)) { free(o); return NULL; }
+        if (isz < 4) vka_widen_idx_tail_fast(o, count, isz);
+        return o;
+    }
+    uint8_t *raw = malloc(isz * count + 4); uint32_t *o = malloc(4 * (size_t)count + 4);
     if (!raw || !o || !cpu_read(addr, raw, isz * count)) { free(raw); free(o); return NULL; }
     for (uint32_t i = 0; i < count; i++) o[i] = isz == 1 ? raw[i] : isz == 2 ? ((uint16_t *)raw)[i] : ((uint32_t *)raw)[i];
     free(raw); return o;
@@ -2201,8 +2220,14 @@ static int inst_fast(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scis
     if (vka_enc_total() != RUN.mark) return 0;
     if (di->ind || di->mdi_cnt || di->ibuf != RUN.ibuf || di->count != (int32_t)RUN.base.cnt || di->base_vertex != RUN.base.bv || di->itype != RUN.itype || di->prim != RUN.prim
         || di->instances > 1 || di->base_instance || d->b.base_instance) return 0;
-    for (int st = 0; st < VKA_NSTAGE; st++) { uint32_t allow = st == 0 ? 1u << RUN.iv : st == 1 ? 1u << RUN.ip : 0; /* NVN stages: 0 vertex, 1 fragment */ if (d->ubo_dirty[st] & ~allow) return 0; }
-    if (has_rt != RUN.has_rt || (has_rt && memcmp(rt, &RUN.rt, sizeof *rt)) || has_sc != RUN.has_sc || (has_sc && memcmp(sc, &RUN.sc, sizeof *sc))) return 0;
+    int mfast = vka_rp_mod_fast_on();
+    if (mfast) {
+        if (!vka_inst_ubo_dirty_ok_fast(d->ubo_dirty, RUN.iv, RUN.ip)) return 0;
+    } else {
+        for (int st = 0; st < VKA_NSTAGE; st++) { uint32_t allow = st == 0 ? 1u << RUN.iv : st == 1 ? 1u << RUN.ip : 0; /* NVN stages: 0 vertex, 1 fragment */ if (d->ubo_dirty[st] & ~allow) return 0; }
+    }
+    int sc_diff = has_sc != RUN.has_sc || (has_sc && (mfast ? !vka_scissor_eq_fast(sc, &RUN.sc) : memcmp(sc, &RUN.sc, sizeof *sc) != 0));
+    if (has_rt != RUN.has_rt || (has_rt && memcmp(rt, &RUN.rt, sizeof *rt)) || sc_diff) return 0;
     vka_range v = d->b.ubo[0][RUN.iv], f = d->b.ubo[1][RUN.ip];
     int64_t dv = (int64_t)v.addr - (int64_t)RUN.uv.addr, dp = (int64_t)f.addr - (int64_t)RUN.up.addr;
     if (dv != dp || dv < 0 || (dv & 15) || v.size != RUN.uv.size || f.size != RUN.up.size) return 0;
