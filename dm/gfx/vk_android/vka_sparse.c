@@ -15,11 +15,12 @@
 // DM_VK_SPARSE_RES=0: dense images as before (read once)
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "../nvn/nvn_tex_layout_fast.h"
 #include <stdlib.h>
 
 #define TILE 65536u
 #define BLOCK_TILES 1024u                     // 64 MiB tile blocks
-typedef struct { VkDeviceMemory dm; uint32_t type, used; uint64_t bits[BLOCK_TILES / 64]; uint64_t free_at; } tblock;   // free_at: the sparse value after which, empty, it may be freed
+typedef struct { VkDeviceMemory dm; uint32_t type, used; uint64_t bits[BLOCK_TILES / 64]; uint64_t free_at; uint8_t cursor; } tblock;   // free_at: the sparse value after which, empty, it may be freed
 struct vks_img {
     VkImage img; uint32_t type, w, h, levels, layers, tiled, mtfl, tw, th;
     uint32_t lofs[16], ntx[16], nty[16], per_layer;   // levels < mtfl: first tile of the level in a layer's run of slot[], tiles across and down; tiles a layer
@@ -40,6 +41,8 @@ static pimg *g_pi; static uint32_t g_npi, g_cpi;
 static popq *g_po; static uint32_t g_npo, g_cpo;
 static uint32_t *g_rel; static uint32_t g_nrel, g_crel;   // slots that pending binds unbind: given back once their batch is queued
 static uint64_t g_bytes, g_va, g_nbatch, g_nbinds, g_nimg;
+static uint32_t g_tb_hint[32];
+static nvn_sparse_fast_state_t g_sfast;
 static int grow(void **p, uint32_t *cap, uint32_t n, size_t sz) {
     if (n < *cap) return 1;
     uint32_t c = *cap ? *cap * 2 : 256; void *q = realloc(*p, (size_t)c * sz); if (!q) return 0; *p = q; *cap = c; return 1;
@@ -74,6 +77,8 @@ static void blocks_trim(void) {
 // A free 64 KiB slot of memory type type: its id + 1, 0 = none (caller holds g_ks)
 static uint32_t slot_take(uint32_t type) {
     tblock *b = NULL; uint32_t bi = 0;
+    uint32_t h = dm_tex_layout_fast_on() ? g_tb_hint[type & 31u] : UINT32_MAX;
+    if (h < g_ntb && g_tb[h] && g_tb[h]->type == type && g_tb[h]->used < BLOCK_TILES) { b = g_tb[h]; bi = h; }
     for (uint32_t i = 0; i < g_ntb && !b; i++) if (g_tb[i] && g_tb[i]->type == type && g_tb[i]->used < BLOCK_TILES) { b = g_tb[i]; bi = i; }
     if (!b) {
         for (bi = 0; bi < g_ntb && g_tb[bi]; bi++) {}
@@ -85,14 +90,26 @@ static uint32_t slot_take(uint32_t type) {
         b->type = type; g_tb[bi] = b; if (bi == g_ntb) g_ntb++;
         g_bytes += (uint64_t)BLOCK_TILES * TILE; vka_mem_grew((uint64_t)BLOCK_TILES * TILE);
     }
+    if (dm_tex_layout_fast_on()) {
+        g_tb_hint[type & 31u] = bi;
+        int k = nvn_sparse_bmap_take(b->bits, &b->cursor);
+        if (k >= 0) { b->used++; return bi * BLOCK_TILES + (uint32_t)k + 1u; }
+        return 0;
+    }
     for (uint32_t w = 0; w < BLOCK_TILES / 64; w++) if (~b->bits[w]) {
         uint32_t k = (uint32_t)__builtin_ctzll(~b->bits[w]); b->bits[w] |= 1ull << k; b->used++;
         return bi * BLOCK_TILES + w * 64 + k + 1;
     }
     return 0;
 }
-static void slot_give(uint32_t id, uint64_t at) {   // caller holds g_ks; at: the sparse value after which no binding uses it
-    id--; tblock *b = id / BLOCK_TILES < g_ntb ? g_tb[id / BLOCK_TILES] : NULL; uint32_t k = id % BLOCK_TILES;
+static void slot_give(uint32_t id, uint64_t at) {
+    id--; uint32_t bi = id / BLOCK_TILES, k = id % BLOCK_TILES;
+    tblock *b = bi < g_ntb ? g_tb[bi] : NULL;
+    if (dm_tex_layout_fast_on()) {
+        if (!b || !nvn_sparse_bmap_give(b->bits, &b->cursor, k)) { VRED_ONCE("sparse tile slot %u given back twice", id); return; }
+        b->used--; if (at > b->free_at) b->free_at = at; g_tb_hint[b->type & 31u] = bi;
+        return;
+    }
     if (!b || !(b->bits[k / 64] >> (k % 64) & 1)) { VRED_ONCE("sparse tile slot %u given back twice", id); return; }
     b->bits[k / 64] &= ~(1ull << (k % 64)); b->used--; if (at > b->free_at) b->free_at = at;
 }
@@ -175,7 +192,8 @@ vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t le
             ok = id && push_opaque(s, at, len, id);
             if (ok) { s->tail[t * s->tail_each + j] = id; s->bound++; } else if (id) slot_give(id, 0);
         }
-    g_nimg++;   // (vks_free counts it out)
+    g_nimg++;
+    nvn_sparse_publish(&g_sfast, (uintptr_t)g_stl, g_sval, (uint32_t)(g_npi || g_npo));
     pthread_mutex_unlock(&g_ks);
     if (!ok) { vks_free(s); return NULL; }   // (its pending binds dropped, its slots back)
     return s;
@@ -192,6 +210,7 @@ int vks_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, int
         if (*t && grow((void **)&g_rel, &g_crel, g_nrel, sizeof *g_rel) && push_tile(s, lv, ly, tx, ty, 0)) { g_rel[g_nrel++] = *t; *t = 0; s->bound--; }
         r = *t != 0;
     }
+    nvn_sparse_publish(&g_sfast, (uintptr_t)g_stl, g_sval, (uint32_t)(g_npi || g_npo));
     pthread_mutex_unlock(&g_ks);
     return r;
 }
@@ -222,6 +241,7 @@ void vks_free(vks_img *s) {
     for (size_t i = 0; i < (size_t)s->ntail * s->tail_each; i++) if (s->tail[i]) slot_give(s->tail[i], at);
     if (g_nimg) g_nimg--;
     blocks_trim();
+    nvn_sparse_publish(&g_sfast, (uintptr_t)g_stl, g_sval, (uint32_t)(g_npi || g_npo));
     pthread_mutex_unlock(&g_ks);
     free(s->slot); free(s->tail); free(s);
 }
@@ -236,56 +256,83 @@ static int cmp_img(const void *a, const void *b) {
     CMPK(p->b.offset.y, q->b.offset.y); CMPK(p->b.offset.x, q->b.offset.x); CMPK(p->seq, q->seq); return 0;
 }
 static int cmp_opq(const void *a, const void *b) { const popq *p = a, *q = b; CMPK((uintptr_t)p->s, (uintptr_t)q->s); CMPK(p->seq, q->seq); return 0; }
-void vks_queue_locked(uint32_t *nw, VkSemaphore *ws, uint64_t *wv, VkPipelineStageFlags *wst) {
-    pthread_mutex_lock(&g_ks);
-    if (!g_stl) { pthread_mutex_unlock(&g_ks); return; }   // no sparse image yet
-    if (vka_hung()) { g_npi = g_npo = g_nrel = 0; pthread_mutex_unlock(&g_ks); return; }   // nothing runs any more: the binds dropped (their slots are not reused either)
-    if (g_npi || g_npo) {
-        qsort(g_pi, g_npi, sizeof *g_pi, cmp_img); qsort(g_po, g_npo, sizeof *g_po, cmp_opq);
-        { uint32_t j = 0; for (uint32_t i = 0; i < g_npi; i++) {
-              const pimg *p = &g_pi[i], *q = i + 1 < g_npi ? &g_pi[i + 1] : NULL;
-              if (q && q->s == p->s && q->b.subresource.arrayLayer == p->b.subresource.arrayLayer && q->b.subresource.mipLevel == p->b.subresource.mipLevel
-                  && q->b.offset.x == p->b.offset.x && q->b.offset.y == p->b.offset.y) continue;   // a later bind of the same tile
-              g_pi[j++] = *p; }
-          g_npi = j; }
-        uint32_t ni = 0, no = 0;
-        for (uint32_t i = 0; i < g_npi; i++) ni += !i || g_pi[i].s != g_pi[i - 1].s;
-        for (uint32_t i = 0; i < g_npo; i++) no += !i || g_po[i].s != g_po[i - 1].s;
-        VkSparseImageMemoryBindInfo *ii = calloc(ni + 1, sizeof *ii); VkSparseImageOpaqueMemoryBindInfo *oi = calloc(no + 1, sizeof *oi);
-        VkSparseImageMemoryBind *ib = malloc(((size_t)g_npi + 1) * sizeof *ib); VkSparseMemoryBind *ob = malloc(((size_t)g_npo + 1) * sizeof *ob);
-        if (ii && oi && ib && ob) {
-            // Everything handed to the queue before: an empty submission signals g_sig + 1 once all of it (and the batch before, which it waits for: a timeline's values are
-            // signalled in order) is done. vkQueueBindSparse does not wait for earlier submissions by itself, and replay parts and upload batches do not all signal V.tl
-            uint64_t pre = g_sig + 1, n = pre + 1;
-            VkPipelineStageFlags pst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            VkTimelineSemaphoreSubmitInfo pti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = g_sig ? 1 : 0, .pWaitSemaphoreValues = &g_sig,
-                                                 .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &pre};
-            VkSubmitInfo psi = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &pti, .waitSemaphoreCount = g_sig ? 1 : 0, .pWaitSemaphores = &g_stl, .pWaitDstStageMask = &pst,
-                                .signalSemaphoreCount = 1, .pSignalSemaphores = &g_stl};
-            VkResult r = vk.vkQueueSubmit(V.q, 1, &psi, VK_NULL_HANDLE);
-            if (!r) {
-                g_sig = pre;
-                ni = 0; for (uint32_t i = 0; i < g_npi; i++) { ib[i] = g_pi[i].b; if (!i || g_pi[i].s != g_pi[i - 1].s) { ii[ni].image = g_pi[i].s->img; ii[ni].pBinds = &ib[i]; ni++; } ii[ni - 1].bindCount++; }
-                no = 0; for (uint32_t i = 0; i < g_npo; i++) { ob[i] = g_po[i].b; if (!i || g_po[i].s != g_po[i - 1].s) { oi[no].image = g_po[i].s->img; oi[no].pBinds = &ob[i]; no++; } oi[no - 1].bindCount++; }
-                VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &pre, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &n};
-                VkBindSparseInfo bi = {VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .pNext = &ti, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_stl, .imageOpaqueBindCount = no, .pImageOpaqueBinds = oi,
-                                       .imageBindCount = ni, .pImageBinds = ii, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_stl};
-                r = vk.vkQueueBindSparse(V.q, 1, &bi, VK_NULL_HANDLE);
-            }
-            if (r == VK_ERROR_DEVICE_LOST) vka_device_lost("a sparse bind batch");   // (it takes neither lock)
-            if (r) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 8) VRED("sparse bind batch of %u tile and %u tail binds: %s %d (kept for the next submission; what is uploaded into those tiles until then is lost until the game writes them again)",
-                                                                                  g_npi, g_npo, g_sig == pre ? "vkQueueBindSparse" : "the submission before it", r); }
-            else {
-                g_sig = g_sval = n; g_nbatch++; g_nbinds += g_npi + g_npo;
-                for (uint32_t i = 0; i < g_npi; i++) g_pi[i].s->last = n;
-                for (uint32_t i = 0; i < g_npo; i++) g_po[i].s->last = n;
-                for (uint32_t i = 0; i < g_nrel; i++) slot_give(g_rel[i], n);   // reused only by a later batch, which runs after this one
-                g_npi = g_npo = g_nrel = 0;
-                blocks_trim();
-            }
-        } else VRED_ONCE("sparse bind batch not built (no memory): the binds wait for the next submission");
-        free(ii); free(oi); free(ib); free(ob);
+static int pimg_sorted(void) {
+    for (uint32_t i = 1; i < g_npi; i++) if (cmp_img(&g_pi[i - 1], &g_pi[i]) > 0) return 0;
+    return 1;
+}
+static int popq_sorted(void) {
+    for (uint32_t i = 1; i < g_npo; i++) if (cmp_opq(&g_po[i - 1], &g_po[i]) > 0) return 0;
+    return 1;
+}
+static VkResult vks_submit_bind_batch(VkSparseImageMemoryBindInfo *ii, VkSparseImageOpaqueMemoryBindInfo *oi,
+                                      VkSparseImageMemoryBind *ib, VkSparseMemoryBind *ob, uint64_t *out_pre, uint64_t *out_n) {
+    uint64_t pre = g_sig + 1, n = pre + 1;
+    VkPipelineStageFlags pst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkTimelineSemaphoreSubmitInfo pti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = g_sig ? 1 : 0, .pWaitSemaphoreValues = &g_sig,
+                                         .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &pre};
+    VkSubmitInfo psi = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &pti, .waitSemaphoreCount = g_sig ? 1 : 0, .pWaitSemaphores = &g_stl, .pWaitDstStageMask = &pst,
+                        .signalSemaphoreCount = 1, .pSignalSemaphores = &g_stl};
+    VkResult r = vk.vkQueueSubmit(V.q, 1, &psi, VK_NULL_HANDLE);
+    if (r) return r;
+    g_sig = pre;
+    uint32_t ni = 0, no = 0;
+    for (uint32_t i = 0; i < g_npi; i++) { ib[i] = g_pi[i].b; if (!i || g_pi[i].s != g_pi[i - 1].s) { ii[ni].image = g_pi[i].s->img; ii[ni].pBinds = &ib[i]; ni++; } ii[ni - 1].bindCount++; }
+    for (uint32_t i = 0; i < g_npo; i++) { ob[i] = g_po[i].b; if (!i || g_po[i].s != g_po[i - 1].s) { oi[no].image = g_po[i].s->img; oi[no].pBinds = &ob[i]; no++; } oi[no - 1].bindCount++; }
+    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &pre, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &n};
+    VkBindSparseInfo bi = {VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .pNext = &ti, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_stl, .imageOpaqueBindCount = no, .pImageOpaqueBinds = oi,
+                           .imageBindCount = ni, .pImageBinds = ii, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_stl};
+    *out_pre = pre; *out_n = n;
+    return vk.vkQueueBindSparse(V.q, 1, &bi, VK_NULL_HANDLE);
+}
+static void vks_flush_binds_locked(void) {
+    if (!dm_tex_layout_fast_on() || !pimg_sorted()) qsort(g_pi, g_npi, sizeof *g_pi, cmp_img);
+    if (!dm_tex_layout_fast_on() || !popq_sorted()) qsort(g_po, g_npo, sizeof *g_po, cmp_opq);
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < g_npi; i++) {
+        const pimg *p = &g_pi[i], *q = i + 1 < g_npi ? &g_pi[i + 1] : NULL;
+        if (q && q->s == p->s && q->b.subresource.arrayLayer == p->b.subresource.arrayLayer && q->b.subresource.mipLevel == p->b.subresource.mipLevel
+            && q->b.offset.x == p->b.offset.x && q->b.offset.y == p->b.offset.y) continue;
+        g_pi[j++] = *p;
     }
+    g_npi = j;
+    uint32_t ni = 0, no = 0;
+    for (uint32_t i = 0; i < g_npi; i++) ni += !i || g_pi[i].s != g_pi[i - 1].s;
+    for (uint32_t i = 0; i < g_npo; i++) no += !i || g_po[i].s != g_po[i - 1].s;
+    VkSparseImageMemoryBindInfo iis[16] = {0}; VkSparseImageOpaqueMemoryBindInfo ois[16] = {0};
+    VkSparseImageMemoryBind ibs[64] = {0}; VkSparseMemoryBind obs[64] = {0};
+    int use_s = dm_tex_layout_fast_on() && ni < 16 && no < 16 && g_npi <= 64 && g_npo <= 64;
+    VkSparseImageMemoryBindInfo *ii = use_s ? iis : calloc(ni + 1, sizeof *ii);
+    VkSparseImageOpaqueMemoryBindInfo *oi = use_s ? ois : calloc(no + 1, sizeof *oi);
+    VkSparseImageMemoryBind *ib = use_s ? ibs : malloc(((size_t)g_npi + 1) * sizeof *ib);
+    VkSparseMemoryBind *ob = use_s ? obs : malloc(((size_t)g_npo + 1) * sizeof *ob);
+    if (ii && oi && ib && ob) {
+        uint64_t pre = 0, n = 0;
+        VkResult r = vks_submit_bind_batch(ii, oi, ib, ob, &pre, &n);
+        if (r == VK_ERROR_DEVICE_LOST) vka_device_lost("a sparse bind batch");
+        if (r) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 8) VRED("sparse bind batch of %u tile and %u tail binds: %s %d", g_npi, g_npo, g_sig == pre ? "vkQueueBindSparse" : "the submission before it", r); }
+        else {
+            g_sig = g_sval = n; g_nbatch++; g_nbinds += g_npi + g_npo;
+            for (uint32_t i = 0; i < g_npi; i++) g_pi[i].s->last = n;
+            for (uint32_t i = 0; i < g_npo; i++) g_po[i].s->last = n;
+            for (uint32_t i = 0; i < g_nrel; i++) slot_give(g_rel[i], n);
+            g_npi = g_npo = g_nrel = 0;
+            blocks_trim();
+        }
+    } else VRED_ONCE("sparse bind batch not built (no memory): the binds wait for the next submission");
+    if (!use_s) { free(ii); free(oi); free(ib); free(ob); }
+}
+void vks_queue_locked(uint32_t *nw, VkSemaphore *ws, uint64_t *wv, VkPipelineStageFlags *wst) {
+    uintptr_t sem_u = 0; uint64_t sv = 0;
+    int hung = vka_hung();
+    if (dm_tex_layout_fast_on() && nvn_sparse_try_idle(&g_sfast, hung, &sem_u, &sv)) {
+        if (sv) { ws[*nw] = (VkSemaphore)sem_u; wv[*nw] = sv; wst[*nw] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; (*nw)++; }
+        return;
+    }
+    pthread_mutex_lock(&g_ks);
+    if (!g_stl) { nvn_sparse_publish(&g_sfast, 0, 0, 0); pthread_mutex_unlock(&g_ks); return; }
+    if (hung) { g_npi = g_npo = g_nrel = 0; nvn_sparse_publish(&g_sfast, (uintptr_t)g_stl, g_sval, 0); pthread_mutex_unlock(&g_ks); return; }
+    if (g_npi || g_npo) vks_flush_binds_locked();
+    nvn_sparse_publish(&g_sfast, (uintptr_t)g_stl, g_sval, (uint32_t)(g_npi || g_npo));
     if (g_sval) { ws[*nw] = g_stl; wv[*nw] = g_sval; wst[*nw] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; (*nw)++; }
     pthread_mutex_unlock(&g_ks);
 }

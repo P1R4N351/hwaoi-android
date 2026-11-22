@@ -2,6 +2,7 @@
 // Component remapping: "no alpha" formats such as RGBX / RGB_DXT1 read a as 1; RGB-family 16-bit packed formats swap r/b; all others are identity.
 // BC1–7 need GPU BC support (MTLDevice.supportsBCTextureCompression: Apple silicon Macs, A17 Pro and later, M1 iPads); the table does not check it, mtl_init (nvn_mtl.m) and the iOS front end (main.m) refuse a device without it.
 #include "nvn_fmt_mtl.h"
+#include "../nvn/nvn_tex_layout_fast.h"
 
 enum {   // MTLPixelFormat
     R8Unorm = 10, R8Snorm = 12, R8Uint = 13, R8Sint = 14, R16Unorm = 20, R16Snorm = 22, R16Uint = 23, R16Sint = 24, R16Float = 25,
@@ -66,6 +67,10 @@ static const ent T[0x9D] = {
     [0x71] = X(RGBA16Float), X(RGBA16Unorm), X(RGBA16Snorm), X(RGBA16Uint), X(RGBA16Sint),
     [0x76] = X(RGBA32Float), X(RGBA32Uint), X(RGBA32Sint),
     // 0x79–0x94 ASTC is computed by astc_off (two groups, LDR / sRGB, 14 each)
+    [0x79] = E(ASTC_LDR0+0), E(ASTC_LDR0+1), E(ASTC_LDR0+2), E(ASTC_LDR0+3), E(ASTC_LDR0+4), E(ASTC_LDR0+6), E(ASTC_LDR0+7),
+             E(ASTC_LDR0+8), E(ASTC_LDR0+9), E(ASTC_LDR0+10), E(ASTC_LDR0+11), E(ASTC_LDR0+12), E(ASTC_LDR0+13), E(ASTC_LDR0+14),
+    [0x87] = E(ASTC_SRGB0+0), E(ASTC_SRGB0+1), E(ASTC_SRGB0+2), E(ASTC_SRGB0+3), E(ASTC_SRGB0+4), E(ASTC_SRGB0+6), E(ASTC_SRGB0+7),
+             E(ASTC_SRGB0+8), E(ASTC_SRGB0+9), E(ASTC_SRGB0+10), E(ASTC_SRGB0+11), E(ASTC_SRGB0+12), E(ASTC_SRGB0+13), E(ASTC_SRGB0+14),
     [0x95] = S(B5G6R5Unorm), SX(BGR5A1Unorm), S(BGR5A1Unorm), S(A1BGR5Unorm),
     [0x99] = X(BGRA8Unorm), E(BGRA8Unorm), X(BGRA8Unorm_sRGB), E(BGRA8Unorm_sRGB),
 };
@@ -75,7 +80,8 @@ static const uint8_t astc_off[14] = {0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 
 
 int nvn_fmt_to_mtl(int f, uint32_t *mtl, uint8_t swz[4]) {
     ent e = {0, 0, 0, 0};
-    if (f >= 0x79 && f <= 0x94) { int k = (f - 0x79) % 14; e = (ent){(uint16_t)((f < 0x87 ? ASTC_LDR0 : ASTC_SRGB0) + astc_off[k]), 1, 0, 0}; }
+    if (dm_tex_layout_fast_on()) { if ((unsigned)f < 0x9Du) e = T[f]; }
+    else if (f >= 0x79 && f <= 0x94) { int k = (f - 0x79) % 14; e = (ent){(uint16_t)((f < 0x87 ? ASTC_LDR0 : ASTC_SRGB0) + astc_off[k]), 1, 0, 0}; }
     else if (f > 0 && f < (int)(sizeof T / sizeof *T)) e = T[f];
     if (mtl) *mtl = e.kind ? e.mtl : 0;
     if (swz) { swz[0] = e.rb ? NVN_SWZ_B : NVN_SWZ_R; swz[1] = NVN_SWZ_G; swz[2] = e.rb ? NVN_SWZ_R : NVN_SWZ_B; swz[3] = e.noalpha ? NVN_SWZ_ONE : NVN_SWZ_A; }

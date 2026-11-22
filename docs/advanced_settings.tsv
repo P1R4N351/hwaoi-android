@@ -461,6 +461,7 @@ DM_TEST_SWKBD_LAG_MS	developer	Diagnostics			text			both
 DM_TEST_TRANSFORM_FEEDBACK	internal	Diagnostics			text			both						test harness	
 DM_TEST_UP_LEAK	developer	Diagnostics			text			both							
 DM_TEST_UP_LOST	developer	Diagnostics			text			both							
+DM_TEX_LAYOUT_FAST	developer	Graphics			text			both							
 DM_THERMAL_CAP	internal	Game			text			both						Mac or iOS only	
 DM_THR	developer	Diagnostics			text			both							
 DM_THRCPU	internal	Diagnostics			text			both						Mac or iOS only	
