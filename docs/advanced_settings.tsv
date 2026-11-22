@@ -498,6 +498,7 @@ DM_VK_COALESCE_PCT	developer	Graphics			text			both
 DM_VK_CS_ASYNC	developer	Graphics			text			both							
 DM_VK_CS_FAST	developer	Graphics			text			both							
 DM_VK_CS_SHARED_OVER	developer	Diagnostics			text			both							
+DM_VK_CTL_FAST	developer	Performance			text			both							
 DM_VK_DEVICE_FAULT	developer	Graphics			text			both							
 DM_VK_DEV_FAST	developer	Performance			text			both							
 DM_VK_DISPATCH_LOG	developer	Diagnostics			text			both							

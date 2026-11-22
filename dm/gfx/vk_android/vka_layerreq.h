@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "vka_ctl_fast.h"
 
 // The layer's folder: DM_VK_LAYER_DIR (dir) when set, else $DM_TEMP/shader_layer (temp); none when the layer is off (DM_VK_LAYER=0: on = 0) or neither is set.
 // 1 = out holds the folder
@@ -68,6 +69,7 @@ typedef struct vka_lreq {
     struct { uint64_t key; uint8_t *ctl, *code; uint32_t nctl, ncode; } st[VKA_LREQ_STAGES];
     struct { uint64_t vs, ps; } pr[VKA_LREQ_STAGES * VKA_LREQ_STAGES];
     size_t bytes;   // what it holds (the queue's bound)
+    unsigned slab_mask;
 } vka_lreq;
 // A pair as one key of a vka_keyset (never 0)
 static inline uint64_t vka_lreq_pair_id(uint64_t vs, uint64_t ps) {
@@ -76,14 +78,17 @@ static inline uint64_t vka_lreq_pair_id(uint64_t vs, uint64_t ps) {
 }
 static inline void vka_lreq_free(vka_lreq *r) {
     if (!r) return;
-    for (unsigned i = 0; i < r->ns; i++) { free(r->st[i].ctl); free(r->st[i].code); }
+    for (unsigned i = 0; i < r->ns; i++) { if (!(r->slab_mask & (1u << i))) free(r->st[i].code); free(r->st[i].ctl); }
     free(r);
 }
 // Adds a stage (copies ctl and code; 0 = out of memory or full)
 static inline int vka_lreq_add(vka_lreq *r, uint64_t key, const void *ctl, uint32_t nctl, const void *code, uint32_t ncode) {
     if (r->ns >= VKA_LREQ_STAGES || !ctl || !code || !nctl || !ncode) return 0;
-    uint8_t *c = malloc(nctl), *d = malloc(ncode);
-    if (!c || !d) { free(c); free(d); return 0; }
+    int slab = vka_ctl_fast_on() && ((uint64_t)nctl + (uint64_t)ncode) <= UINT64_C(0xffffffff);
+    uint8_t *c = slab ? malloc((size_t)nctl + ncode) : malloc(nctl);
+    uint8_t *d = slab ? (c ? c + nctl : NULL) : malloc(ncode);
+    if (!c || !d) { if (!slab) free(d); free(c); return 0; }
+    if (slab) r->slab_mask |= (1u << r->ns);
     memcpy(c, ctl, nctl); memcpy(d, code, ncode);
     r->st[r->ns].key = key; r->st[r->ns].ctl = c; r->st[r->ns].nctl = nctl; r->st[r->ns].code = d; r->st[r->ns].ncode = ncode; r->ns++;
     r->bytes += (size_t)nctl + ncode;
@@ -119,6 +124,7 @@ typedef struct vka_lrq {
     unsigned long long written, refused, failed;   // stages written; requests refused (full); stages and pairs not written
     void (*unwritten)(void *ctx, int pair, uint64_t a, uint64_t b, int err); void *ctx;
     int pairs_read, pairs_cut;   // (the writer thread's) pairs.tsv's pairs read into pseen; its last line lacks its newline
+    _Atomic unsigned n_fast; _Atomic size_t bytes_fast; _Atomic unsigned long long written_fast; _Atomic uint32_t idle_waiters;
     vka_keyset pseen;            // (the writer thread's) the pairs in pairs.tsv
 } vka_lrq;
 #define VKA_LRQ_INIT {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .idle = PTHREAD_COND_INITIALIZER, .max_n = 256, .max_bytes = 64u << 20}
@@ -133,6 +139,8 @@ static inline void vka_lrq_read_pairs(vka_lrq *q, const char *path) {
     char ln[128]; int last = '\n';
     while (fgets(ln, sizeof ln, f)) {
         size_t l = strlen(ln); if (l) last = ln[l - 1];
+        uint64_t vs64 = 0, ps64 = 0;
+        if (vka_ctl_fast_on() && vka_ctl_pair_line_parse(ln, l, &vs64, &ps64)) { vka_keyset_add(&q->pseen, vka_lreq_pair_id(vs64, ps64)); continue; }
         unsigned long long vs, ps;
         if (l >= 33 && ln[16] == '\t' && sscanf(ln, "%16llx\t%16llx", &vs, &ps) == 2 && ln[l - 1] == '\n') vka_keyset_add(&q->pseen, vka_lreq_pair_id(vs, ps));
     }
@@ -168,7 +176,8 @@ static inline unsigned vka_lreq_write(vka_lrq *q, const vka_lreq *r) {
     for (unsigned i = 0; i < r->np; i++) {
         if (vka_keyset_has(&q->pseen, vka_lreq_pair_id(r->pr[i].vs, r->pr[i].ps))) continue;
         want[nw++] = i;
-        tl += (size_t)snprintf(txt + tl, sizeof txt - tl, "%016llx\t%016llx\n", (unsigned long long)r->pr[i].vs, (unsigned long long)r->pr[i].ps);
+        if (vka_ctl_fast_on() && tl + 34u < sizeof txt) tl += vka_ctl_pair_line_put(txt + tl, r->pr[i].vs, r->pr[i].ps);
+        else tl += (size_t)snprintf(txt + tl, sizeof txt - tl, "%016llx\t%016llx\n", (unsigned long long)r->pr[i].vs, (unsigned long long)r->pr[i].ps);
     }
     if (!nw) return wrote;
     int e = err;
@@ -193,12 +202,13 @@ static inline void *vka_lrq_thread(void *a) {
         while (!q->head) pthread_cond_wait(&q->cv, &q->mu);
         vka_lreq *r = q->head; q->head = r->next; if (!q->head) q->tail = NULL;
         q->n--; q->bytes -= r->bytes; q->busy = 1;
+        atomic_store_explicit(&q->n_fast, q->n, memory_order_release); atomic_store_explicit(&q->bytes_fast, q->bytes, memory_order_release);
         pthread_mutex_unlock(&q->mu);
         unsigned w = vka_lreq_write(q, r);   // (dirs_made, pseen: only this thread touches them once started)
         vka_lreq_free(r);
         pthread_mutex_lock(&q->mu);
-        q->written += w; q->busy = 0;
-        if (!q->head) pthread_cond_broadcast(&q->idle);
+        q->written += w; q->busy = 0; atomic_store_explicit(&q->written_fast, q->written, memory_order_release);
+        if (!q->head) vka_lrq_idle_broadcast(&q->idle, &q->idle_waiters, vka_ctl_fast_on());
     }
     return NULL;
 }
@@ -218,6 +228,7 @@ static inline int vka_lrq_push(vka_lrq *q, const char *root, vka_lreq *r) {
     if (q->started > 0 && q->n < q->max_n && q->bytes + r->bytes <= q->max_bytes) {
         r->next = NULL; if (q->tail) q->tail->next = r; else q->head = r; q->tail = r;
         q->n++; q->bytes += r->bytes; ok = 1;
+        atomic_store_explicit(&q->n_fast, q->n, memory_order_release); atomic_store_explicit(&q->bytes_fast, q->bytes, memory_order_release);
         pthread_cond_signal(&q->cv);
     } else q->refused++;
     pthread_mutex_unlock(&q->mu);
@@ -225,14 +236,20 @@ static inline int vka_lrq_push(vka_lrq *q, const char *root, vka_lreq *r) {
 }
 // 1 = the queue is at most half full (a request it refused may be asked again)
 static inline int vka_lrq_room(vka_lrq *q) {
+    if (vka_ctl_fast_on()) return atomic_load_explicit(&q->n_fast, memory_order_acquire) <= q->max_n / 2 && atomic_load_explicit(&q->bytes_fast, memory_order_acquire) <= q->max_bytes / 2;
     pthread_mutex_lock(&q->mu); int r = q->n <= q->max_n / 2 && q->bytes <= q->max_bytes / 2; pthread_mutex_unlock(&q->mu);
     return r;
 }
-static inline unsigned long long vka_lrq_written(vka_lrq *q) { pthread_mutex_lock(&q->mu); unsigned long long w = q->written; pthread_mutex_unlock(&q->mu); return w; }
+static inline unsigned long long vka_lrq_written(vka_lrq *q) {
+    if (vka_ctl_fast_on()) return atomic_load_explicit(&q->written_fast, memory_order_acquire);
+    pthread_mutex_lock(&q->mu); unsigned long long w = q->written; pthread_mutex_unlock(&q->mu); return w;
+}
 // Waits until every queued request is written (tests, and a caller that must see the files)
 static inline void vka_lrq_drain(vka_lrq *q) {
     pthread_mutex_lock(&q->mu);
+    vka_lrq_idle_enter(&q->idle_waiters);
     while (q->head || q->busy) pthread_cond_wait(&q->idle, &q->mu);
+    vka_lrq_idle_leave(&q->idle_waiters);
     pthread_mutex_unlock(&q->mu);
 }
 
@@ -242,10 +259,12 @@ static inline void vka_lrq_drain(vka_lrq *q) {
 typedef struct vka_lyh { void *obj; unsigned refs; } vka_lyh;
 typedef struct {
     pthread_mutex_t mu; vka_lyh *cur; void (*drop)(void *obj);
+    _Atomic uintptr_t cur_fast;
     unsigned live; unsigned long long set, dropped;   // layers mapped now (the current one and replaced ones a lookup still holds); layers taken; layers dropped
 } vka_lylife;
 #define VKA_LYLIFE_INIT(drop_fn) {.mu = PTHREAD_MUTEX_INITIALIZER, .drop = (drop_fn)}
 static inline vka_lyh *vka_ly_get(vka_lylife *l) {   // NULL = no layer
+    if (vka_ctl_fast_on() && atomic_load_explicit(&l->cur_fast, memory_order_acquire) == 0u) return NULL;
     pthread_mutex_lock(&l->mu); vka_lyh *h = l->cur; if (h) h->refs++; pthread_mutex_unlock(&l->mu);
     return h;
 }
@@ -257,7 +276,7 @@ static inline void vka_ly_put(vka_lylife *l, vka_lyh *h) {
 static inline int vka_ly_set(vka_lylife *l, void *obj) {   // 0 = out of memory (obj not taken)
     vka_lyh *n = malloc(sizeof *n); if (!n) return 0;
     n->obj = obj; n->refs = 1;   // (the current layer's own reference)
-    pthread_mutex_lock(&l->mu); vka_lyh *old = l->cur; l->cur = n; l->live++; l->set++; pthread_mutex_unlock(&l->mu);
+    pthread_mutex_lock(&l->mu); vka_lyh *old = l->cur; l->cur = n; atomic_store_explicit(&l->cur_fast, (uintptr_t)n, memory_order_release); l->live++; l->set++; pthread_mutex_unlock(&l->mu);
     vka_ly_put(l, old);
     return 1;
 }

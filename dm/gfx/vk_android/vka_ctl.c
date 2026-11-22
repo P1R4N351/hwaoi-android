@@ -11,6 +11,7 @@
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vk_android.h"
+#include "vka_ctl_fast.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,8 @@ enum { NOVR = 64 };
 static struct { char key[64]; char val[256]; int set; } g_ovr[NOVR];   // the switches set live; set 0 = cleared (reads as unset)
 static int g_novr;
 static pthread_mutex_t g_emu = PTHREAD_MUTEX_INITIALIZER;
+static vka_ctl_ovr_fast_t g_ovr_fast;
+static _Atomic uint32_t g_ctl_setenv_used;
 static struct { char key[64]; char val[256]; } g_pend[NOVR];   // queued by the control thread, applied at the frame boundary
 static int g_npend;
 static _Atomic int g_pending; static _Atomic uint64_t g_pend_frame;
@@ -39,6 +42,14 @@ static const char *ovr_find(const char *key, int *found) {   // under g_emu
     *found = 0; return NULL;
 }
 static int str_get(const char *key, char *out, size_t n) {   // 1 = set (out holds the value)
+    if (vka_ctl_fast_on()) {
+        int fnd = 0; int fr = vka_ctl_ovr_lookup(&g_ovr_fast, key, out, n, &fnd);
+        if (fr >= 0 && fnd) return fr;
+        if (fr >= 0 && !atomic_load_explicit(&g_ctl_setenv_used, memory_order_acquire)) {
+            const char *v = getenv(key); int r = v && *v; if (r) vka_ctl_copy_str(out, n, v);
+            return r;
+        }
+    }
     pthread_mutex_lock(&g_emu);
     int found; const char *v = ovr_find(key, &found);
     if (!found) v = getenv(key);
@@ -49,7 +60,8 @@ static int str_get(const char *key, char *out, size_t n) {   // 1 = set (out hol
 int vka_env_str(const char *key, char *out, size_t n) { return str_get(key, out, n); }
 double vka_env_slow(vka_envc *c, const char *key, double def) {
     uint32_t g = atomic_load(&vka_env_gen);   // before the value: a change applied meanwhile makes the next call read again
-    char b[256]; double v = str_get(key, b, sizeof b) ? strtod(b, NULL) : def;
+    char b[256]; double v = def;
+    if (str_get(key, b, sizeof b) && (!vka_ctl_fast_on() || !vka_ctl_parse_double(b, &v))) v = strtod(b, NULL);
     // Refresh the cache only to a newer generation, one thread at a time (gen UINT32_MAX while v is written: readers take this slow path meanwhile); a thread whose g is
     // older than the cache's, or that loses the race, returns its value uncached
     uint32_t cur = atomic_load_explicit(&c->gen, memory_order_relaxed);
@@ -92,9 +104,12 @@ static void apply(void) {
         int j = 0; while (j < g_novr && strcmp(g_ovr[j].key, p[i].key)) j++;
         if (j == g_novr) { if (g_novr == NOVR) { VRED("ctl: more than %d live switches: %s dropped", NOVR, p[i].key); continue; } g_novr++; }
         snprintf(g_ovr[j].key, sizeof g_ovr[j].key, "%s", p[i].key); snprintf(g_ovr[j].val, sizeof g_ovr[j].val, "%s", p[i].val); g_ovr[j].set = p[i].val[0] != 0;
+        vka_ctl_ovr_put_locked(&g_ovr_fast, p[i].key, p[i].val, g_ovr[j].set);
+        atomic_store_explicit(&g_ctl_setenv_used, 1u, memory_order_release);
         if (p[i].val[0]) setenv(p[i].key, p[i].val, 1); else unsetenv(p[i].key);
         lsfg |= !strncmp(p[i].key, "DM_LSFG", 7) && strcmp(p[i].key, "DM_LSFG_DLL"); pre |= !strcmp(p[i].key, "DM_VK_PRETRANSFORM");
-        const char *kind = in(g_restart, p[i].key) ? "restart only: takes effect at the next start" : in(g_live, p[i].key) ? "live"
+        int kf = vka_ctl_fast_on() ? vka_ctl_kind_fast(p[i].key, g_restart, g_live) : (in(g_restart, p[i].key) ? 1 : in(g_live, p[i].key) ? 2 : 0);
+        const char *kind = kf == 1 ? "restart only: takes effect at the next start" : kf == 2 ? "live"
                          : !strncmp(p[i].key, "DM_VK_", 6) ? "not in the live table: live where its reader uses VKA_ENV" : "set in the environment (live where the host reads it at use)";
         VLOG("ctl: env %s=%s applied at frame %llu (%s)", p[i].key, p[i].val, (unsigned long long)vka_frame(), kind);
         dn += (size_t)snprintf(done + dn, dn < sizeof done ? sizeof done - dn : 0, "%s%s", dn ? " " : "", p[i].key); if (dn >= sizeof done) dn = sizeof done - 1;
