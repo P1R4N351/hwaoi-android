@@ -311,7 +311,7 @@ typedef struct vka_img {
     uint8_t soft; uint64_t soft_saved;
     // The texture cache's own bookkeeping (vka_tex.c "Live images"): its place in the live list + 1 (0: not in it), the next live image in its storage address's chain,
     // and the video pool registrations count (dm_codec_video_epoch) at which it was last checked for lying in a video pool
-    int live_ix; struct vka_img *mnext; uint64_t vep;
+    int live_ix; uint8_t wbf_ix; struct vka_img *mnext; uint64_t vep;
 } vka_img;
 // Texture level lv as a level of im (a sparse or soft texture's image starts at level im->base): 0 when the image does not hold it
 static inline int vka_img_lv(const vka_img *im, uint32_t *lv) { if (!vksoft_lv(im->base, im->levels - im->lvk, lv)) return 0; *lv += im->lvk; return 1; }   // (a level child's: + lvk)
@@ -511,7 +511,7 @@ typedef struct {
     vka_bstate b;
     const prog_t *bst[VKA_NSTAGE], *cprog;   // the program bound per graphics stage (NVN stage bits; [5] unused, [6] / [7] NVN2's task and mesh bits), the compute program
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
-    va_st attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
+    va_st attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16]; uint16_t vbuf_nz_mask;
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp; uint8_t vp_sw[16][4];
     float blend_color[4], alpha_ref;

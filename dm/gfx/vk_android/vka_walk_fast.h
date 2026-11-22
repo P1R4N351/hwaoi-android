@@ -2,6 +2,7 @@
 #define VKA_WALK_FAST_H
 /* Wave 10 (Opt 12): 64x4 multi-material stage binding walk front-memo & O(1) resource summary flags (DM_VK_WALK_FAST=1). */
 #include "vka_bind.h"
+#include "vka_wk_prep_fast.h"
 #include <assert.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -68,6 +69,7 @@ typedef struct {
 typedef struct {
     vka_range ubo[16];
     vka_res r[VKA_WALK_MAX_RES];
+    vka_wk_masks_t mk;
 } vka_walk_slot;
 
 static inline int vka_walk_fast_on(void) {
@@ -81,24 +83,31 @@ static inline int vka_walk_fast_on(void) {
     return r;
 }
 
-static inline uint8_t vka_walk_summarize(const vka_res *r, int n) {
+static inline uint8_t vka_walk_summarize_masks(const vka_res *r, int n, vka_wk_masks_t *mk) {
+    if (mk) memset(mk, 0, sizeof *mk);
     if (n < 0) return VKA_WF_FALLBACK;
     assert(n == 0 || r != NULL);
     assert(n <= 512);
     uint8_t fl = 0;
     for (int i = 0; i < n; i++) {
-        int tex_img = (r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].tid != 0;
-        if (tex_img) {
-            fl |= VKA_WF_TEX_IMG;
-            if (!(r[i].dim & (DMSH_VK_DIM_SINT | DMSH_VK_DIM_UINT))) fl |= VKA_WF_FLOAT_TEX;
-        }
+        int is_tex = r[i].what == VKA_R_TEX, is_img = r[i].what == VKA_R_IMG;
+        int is_ft = !(r[i].dim & (DMSH_VK_DIM_SINT | DMSH_VK_DIM_UINT));
+        int tex_img = (is_tex || is_img) && r[i].tid != 0;
+        if (tex_img) { fl |= VKA_WF_TEX_IMG; if (is_ft) fl |= VKA_WF_FLOAT_TEX; }
         if (r[i].what == VKA_R_TBUF && r[i].tid != 0) fl |= VKA_WF_TBUF;
-        if ((r[i].flags & DMSH_VK_BF_RW) || r[i].what == VKA_R_IMG || r[i].what == VKA_R_GMEM_LOG) fl |= VKA_WF_WRITES_MEM;
+        if ((r[i].flags & DMSH_VK_BF_RW) || is_img || r[i].what == VKA_R_GMEM_LOG) fl |= VKA_WF_WRITES_MEM;
         if (r[i].what == VKA_R_GMEM_MAP) fl |= VKA_WF_GMEM_MAP;
         if (r[i].what == VKA_R_BUF) fl |= VKA_WF_BUF;
+        if (mk && n <= 64) vka_wk_masks_add(mk, i, is_tex, is_img, r[i].what == VKA_R_TBUF,
+                                            r[i].what == VKA_R_BUF, r[i].tid != 0, is_ft);
     }
+    if (mk) vka_wk_masks_finish(mk, n);
     if (VKA_WALK_FAULT(3)) fl &= (uint8_t)~(VKA_WF_WRITES_MEM | VKA_WF_FLOAT_TEX);
     return fl;
+}
+
+static inline uint8_t vka_walk_summarize(const vka_res *r, int n) {
+    return vka_walk_summarize_masks(r, n, NULL);
 }
 
 static inline int vka_walk_bind_uncacheable(const dmsh_vk_bind *b) {
@@ -172,11 +181,11 @@ static inline uint32_t vka_walk_idx(uint64_t sh_key, uint8_t st, uint64_t s_ssbo
     return (uint32_t)(((x ^ (x >> 31)) >> 4) & (VKA_WALK_SETS - 1u));
 }
 
-static inline int vka_walk_memo4_find(const vka_walk_meta4 *m, const vka_walk_slot *slots,
-                                      uintptr_t sh_u, uintptr_t bs_u, uint64_t sh_key, uint8_t st,
-                                      uint64_t s_ssbo, uint64_t s_tex, const vka_range ubo[16], uint16_t ubo_mask,
-                                      uint32_t ssbo_align, uint64_t dev_align, uint8_t texu_elem,
-                                      vka_res *out_r, int *n_out, int *pool_out, uint8_t *fl_out) {
+static inline int vka_walk_memo4_find_ext(const vka_walk_meta4 *m, const vka_walk_slot *slots,
+                                          uintptr_t sh_u, uintptr_t bs_u, uint64_t sh_key, uint8_t st,
+                                          uint64_t s_ssbo, uint64_t s_tex, const vka_range ubo[16], uint16_t ubo_mask,
+                                          uint32_t ssbo_align, uint64_t dev_align, uint8_t texu_elem,
+                                          vka_res *out_r, int *n_out, int *pool_out, uint8_t *fl_out, vka_wk_masks_t *mk_out) {
     assert(m != NULL && slots != NULL && out_r != NULL && n_out != NULL && pool_out != NULL && fl_out != NULL);
     if (!s_ssbo || !s_tex) return 0;
     uint64_t ubo_hash = vka_walk_ubo_hash(ubo, ubo_mask);
@@ -192,16 +201,27 @@ static inline int vka_walk_memo4_find(const vka_walk_meta4 *m, const vka_walk_sl
         if (!VKA_WALK_FAULT(1) && (e->ubo_hash != ubo_hash || !vka_walk_ubo_eq(slots[slot].ubo, ubo, ubo_mask))) continue;
         if (e->n > 0) memcpy(out_r, slots[slot].r, (size_t)e->n * sizeof(vka_res));
         *n_out = (int)e->n; *pool_out = (int)e->pool; *fl_out = e->fl;
+        if (mk_out) *mk_out = slots[slot].mk;
         return 1;
     }
+    if (mk_out) memset(mk_out, 0, sizeof *mk_out);
     return 0;
 }
 
-static inline void vka_walk_memo4_put(vka_walk_meta4 *m, vka_walk_slot *slots,
+static inline int vka_walk_memo4_find(const vka_walk_meta4 *m, const vka_walk_slot *slots,
                                       uintptr_t sh_u, uintptr_t bs_u, uint64_t sh_key, uint8_t st,
                                       uint64_t s_ssbo, uint64_t s_tex, const vka_range ubo[16], uint16_t ubo_mask,
                                       uint32_t ssbo_align, uint64_t dev_align, uint8_t texu_elem,
-                                      const vka_res *r, int n, int pool, uint8_t fl) {
+                                      vka_res *out_r, int *n_out, int *pool_out, uint8_t *fl_out) {
+    return vka_walk_memo4_find_ext(m, slots, sh_u, bs_u, sh_key, st, s_ssbo, s_tex, ubo,
+                                   ubo_mask, ssbo_align, dev_align, texu_elem, out_r, n_out, pool_out, fl_out, NULL);
+}
+
+static inline void vka_walk_memo4_put_ext(vka_walk_meta4 *m, vka_walk_slot *slots,
+                                          uintptr_t sh_u, uintptr_t bs_u, uint64_t sh_key, uint8_t st,
+                                          uint64_t s_ssbo, uint64_t s_tex, const vka_range ubo[16], uint16_t ubo_mask,
+                                          uint32_t ssbo_align, uint64_t dev_align, uint8_t texu_elem,
+                                          const vka_res *r, int n, int pool, uint8_t fl, const vka_wk_masks_t *mk) {
     assert(m != NULL && slots != NULL);
     if (!s_ssbo || !s_tex || n < 0 || n > VKA_WALK_MAX_RES) return;
     uint64_t ubo_hash = vka_walk_ubo_hash(ubo, ubo_mask);
@@ -220,10 +240,20 @@ static inline void vka_walk_memo4_put(vka_walk_meta4 *m, vka_walk_slot *slots,
         slots[slot].ubo[idx] = ubo[idx];
     }
     if (n > 0) memcpy(slots[slot].r, r, (size_t)n * sizeof(vka_res));
+    if (mk) slots[slot].mk = *mk; else memset(&slots[slot].mk, 0, sizeof slots[slot].mk);
     set->e[way] = (vka_walk_meta_ent){
         sh_u, bs_u, sh_key, s_ssbo, s_tex, ubo_hash, dev_align,
         ssbo_align, ubo_mask, st, (uint8_t)n, (uint8_t)(pool != 0), fl, 1, texu_elem
     };
+}
+
+static inline void vka_walk_memo4_put(vka_walk_meta4 *m, vka_walk_slot *slots,
+                                      uintptr_t sh_u, uintptr_t bs_u, uint64_t sh_key, uint8_t st,
+                                      uint64_t s_ssbo, uint64_t s_tex, const vka_range ubo[16], uint16_t ubo_mask,
+                                      uint32_t ssbo_align, uint64_t dev_align, uint8_t texu_elem,
+                                      const vka_res *r, int n, int pool, uint8_t fl) {
+    vka_walk_memo4_put_ext(m, slots, sh_u, bs_u, sh_key, st, s_ssbo, s_tex, ubo,
+                           ubo_mask, ssbo_align, dev_align, texu_elem, r, n, pool, fl, NULL);
 }
 
 #endif

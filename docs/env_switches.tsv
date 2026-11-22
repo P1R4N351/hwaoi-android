@@ -819,6 +819,7 @@ DM_VK_VIN_FAST	switch	`1` (default) / `0` 16x4 multi-material vertex input cache
 DM_VK_VIN_SKIP	switch	`0` (Android, live: the next submission, 1) the vertex input descriptions are built and the vertex buffers bound (and compared) at every draw instead of being kept while the vertex shader, the attribute / stream / buffer records and the placed segments stay the same
 DM_VK_WALK_FAST	switch	`1` (default) / `0` 64x4 multi-material stage binding walk front-memo, 256x4 shader trait cache & O(1) resource hazard summary flags (`vka_draw.c` / `vka_walk_fast.h`)
 DM_VK_WB_FOLLOW	switch	`0` stops uploading a GPU-written linear texture's storage after the CPU writes it (the copy-back case of vka_wbfollow.h: Mario Tennis Fever's glyph cache); default 1
+DM_VK_WK_PREP_FAST	switch	`0` disables 64-bit per-stage resource walk masks, 16-bit vertex-buffer mask tracking, 64-bit render-pass attachment bloom filter, 256-bucket region-write tile index, and 64-slot copy-back wait list (`vka_walk_fast.h`, `vka_draw.c`, `vka_tex.c`, default `1`)
 DM_VK_WORKER	switch	`0` (Android, restart, on) submissions and presents are replayed inline on the game's thread instead of on the replay worker thread
 DM_VK_WORKER_FAST	switch	`0` disables the inline command-handle/wait-snapshot buffers, `qs_sub` worker slab pool, single-mask sync scanner, and waiter-gated condition-variable wakes in `vka_worker.c` (default `1`)
 DM_VK_WORKER_FRAMES	switch	`=<n>` (Android, restart, default 1) the replay worker may be at most n presents behind the game

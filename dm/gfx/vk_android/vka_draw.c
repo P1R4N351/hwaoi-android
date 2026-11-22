@@ -27,6 +27,7 @@
 #include "vka_rp_mod_fast.h"
 #include "vka_view_ub_fast.h"
 #include "vka_treg_ub_fast.h"
+#include "vka_wk_prep_fast.h"
 _Static_assert(sizeof(((vka_dstate *)0)->ubo_dirty) == 32 && VKA_NSTAGE == 8 && sizeof(p_scissor) == 16, "inst_fast sizes");
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
@@ -165,7 +166,12 @@ int vka_state_op(vka_dstate *d, uint32_t op, const void *a) {
     case OP_BIND_VATTR: if (vka_state_apply_vattr(fast, g_vattr_clear, d->attr, &d->nattr, a)) { d->s_vfmt = vka_stamp(); d->bind_gen++; } break;
     case OP_BIND_VSTREAM: if (vka_state_apply_vstream(fast, d->stream, &d->nstream, a)) { d->s_vfmt = vka_stamp(); d->bind_gen++; } break;
     case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf t; const p_bind_vbuf *b = vbuf_rec(op, a, &t);
-        if (vka_state_apply_vbuf(fast, d->vbuf, b)) { d->s_vbuf = vka_stamp(); d->bind_gen++; } break; }
+        if (vka_state_apply_vbuf(fast, d->vbuf, b)) {
+            uint16_t nz = 0u;
+            for (int vi = 0; vi < b->n && b->first + vi < 16; vi++) if (d->vbuf[b->first + vi].address) nz |= (uint16_t)(1u << (b->first + vi));
+            d->vbuf_nz_mask = vka_vbuf_mask_patch(d->vbuf_nz_mask, b->first, b->n, nz);
+            d->s_vbuf = vka_stamp(); d->bind_gen++;
+        } break; }
     case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf t; const p_bind_buf *b = bind_buf_rec(op, a, &t);
         if (vka_state_apply_ubo(fast, &d->b, d->ubo_dirty, b) && b->stage == 5) d->s_ubo5 = vka_stamp(); break; }
     case OP_BIND_SSBO: { const p_bind_buf *b = a;
@@ -1620,7 +1626,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
     return 1;
 }
 // Each stage's bindings, walked once a draw or dispatch (walk_all): the images first used are made from them (make_images), then set 0 is written from them (bind_sets)
-static struct { int n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint8_t fl[VKA_NSTAGE]; char why[VKA_NSTAGE][200]; vka_res r[VKA_NSTAGE][512]; } g_wk;
+static struct { int n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint8_t fl[VKA_NSTAGE]; vka_wk_masks_t mk[VKA_NSTAGE]; char why[VKA_NSTAGE][200]; vka_res r[VKA_NSTAGE][512]; } g_wk;
 static vka_walk_sh_memo4 *g_walk_sh4;
 static vka_walk_meta4 *g_walk_m4;
 static vka_walk_slot *g_walk_slots;
@@ -1637,21 +1643,21 @@ static void walk_stage_one(const vka_dstate *d, int st, vka_shader *s) {
     uint16_t um = 0;
     int cacheable = g_walk_sh4 && g_walk_m4 && g_walk_slots && d->s_ssbo[st] && d->s_tex[st] &&
                     vka_walk_shader_traits(g_walk_sh4, s->e, s->b, &um);
-    if (cacheable && vka_walk_memo4_find(g_walk_m4, g_walk_slots, (uintptr_t)s->e, (uintptr_t)s->b, s->e->key,
+    if (cacheable && vka_walk_memo4_find_ext(g_walk_m4, g_walk_slots, (uintptr_t)s->e, (uintptr_t)s->b, s->e->key,
             (uint8_t)st, d->s_ssbo[st], d->s_tex[st], d->b.ubo[st], um, sa, V.sb_align, (uint8_t)(vka_texu_elem != 0),
-            g_wk.r[st], &g_wk.n[st], &g_wk.pool[st], &g_wk.fl[st])) return;
+            g_wk.r[st], &g_wk.n[st], &g_wk.pool[st], &g_wk.fl[st], &g_wk.mk[st])) return;
     g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, sa, V.sb_align, rd_cb, NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
-    g_wk.fl[st] = vka_walk_summarize(g_wk.r[st], g_wk.n[st]);
+    g_wk.fl[st] = vka_walk_summarize_masks(g_wk.r[st], g_wk.n[st], &g_wk.mk[st]);
     if (cacheable && g_wk.n[st] >= 0 && g_wk.n[st] <= VKA_WALK_MAX_RES)
-        vka_walk_memo4_put(g_walk_m4, g_walk_slots, (uintptr_t)s->e, (uintptr_t)s->b, s->e->key,
+        vka_walk_memo4_put_ext(g_walk_m4, g_walk_slots, (uintptr_t)s->e, (uintptr_t)s->b, s->e->key,
             (uint8_t)st, d->s_ssbo[st], d->s_tex[st], d->b.ubo[st], um, sa, V.sb_align, (uint8_t)(vka_texu_elem != 0),
-            g_wk.r[st], g_wk.n[st], g_wk.pool[st], g_wk.fl[st]);
+            g_wk.r[st], g_wk.n[st], g_wk.pool[st], g_wk.fl[st], &g_wk.mk[st]);
 }
 static void walk_all(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
     uint64_t t0_ = g_prof ? cntvct() : 0;
     vka_texu_elem = VKA_ENV("DM_VK_TEXU_ELEM", 1);   // see vka_bind.h (live, A/B)
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        vka_shader *s = sh[st]; g_wk.n[st] = 0; g_wk.pool[st] = 0; g_wk.fl[st] = 0;
+        vka_shader *s = sh[st]; g_wk.n[st] = 0; g_wk.pool[st] = 0; g_wk.fl[st] = 0; g_wk.mk[st].ready = 0u;
         if (s) walk_stage_one(d, st, s);
     }
     if (g_prof) g_ps[0] += cntvct() - t0_;
@@ -1668,21 +1674,32 @@ static void tex_masks(vka_shader *const sh[VKA_NSTAGE], uint64_t tu[5], uint64_t
         int st = st_of[j]; vka_shader *s = sh[st]; if (!s || !(g_wk.fl[st] & VKA_WF_FLOAT_TEX)) continue;
         int rg = vka_shader_tex_range(s); if (rg < 0 || rg >= 5) continue;
         vka_res *r = g_wk.r[st]; uint64_t um = 0, sm = 0, fm = 0, lo = (uint64_t)rg * DMSH_VK_STAGE_BINDINGS;
-        for (int i = 0; i < g_wk.n[st]; i++) {
-            if ((r[i].what != VKA_R_TEX && r[i].what != VKA_R_IMG) || !r[i].tid || (r[i].dim & (DMSH_VK_DIM_SINT | DMSH_VK_DIM_UINT))) continue;
-            if (r[i].desc != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && r[i].desc != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
-            if (r[i].binding < lo || r[i].binding >= lo + 64) continue;
-            int c = vka_tex_id_class_rec(r[i].tid); uint64_t bit = 1ull << (r[i].binding - lo);
-            if (r[i].elem) fm |= bit;   // (an array binding keeps its float type)
-            if (c == 1) um |= bit; else if (c == 2) sm |= bit; else fm |= bit;
+        int fast_m = vka_wk_prep_fast_on() && g_wk.mk[st].ready;
+        uint64_t fm_it = fast_m ? g_wk.mk[st].float_tex_m : 0u;
+        for (int i = 0; fast_m ? (fm_it != 0u) : (i < g_wk.n[st]); ) {
+            if (fast_m) { i = (int)__builtin_ctzll(fm_it); fm_it &= fm_it - 1u; }
+            else { if ((r[i].what != VKA_R_TEX && r[i].what != VKA_R_IMG) || !r[i].tid || (r[i].dim & (DMSH_VK_DIM_SINT | DMSH_VK_DIM_UINT))) { i++; continue; } }
+            if (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+                if (r[i].binding >= lo && r[i].binding < lo + 64) {
+                    int c = vka_tex_id_class_rec(r[i].tid); uint64_t bit = 1ull << (r[i].binding - lo);
+                    if (r[i].elem) fm |= bit;
+                    if (c == 1) um |= bit; else if (c == 2) sm |= bit; else fm |= bit;
+                }
+            }
+            if (!fast_m) i++;
         }
         uint64_t mixed = (um & sm) | ((um | sm) & fm); um &= ~mixed; sm &= ~mixed;
         if (!(um | sm)) continue;
-        vka_texmod_key tk = {DMSH_VK_MOD_BASE, 0, 0, 0, 0, -1, um, sm};   // (the rewrite's check on the base module; the pipeline's own module is made in pstate_fill)
+        vka_texmod_key tk = {DMSH_VK_MOD_BASE, 0, 0, 0, 0, -1, um, sm};
         if (!vka_shader_tex_module(s, &tk)) continue;
         tu[rg] |= um; ts[rg] |= sm;
-        for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].binding >= lo && r[i].binding < lo + 64 && ((um | sm) >> (r[i].binding - lo) & 1))
-            r[i].dim |= um >> (r[i].binding - lo) & 1 ? DMSH_VK_DIM_UINT : DMSH_VK_DIM_SINT;
+        uint64_t tim = fast_m ? g_wk.mk[st].tex_img_m : 0u;
+        for (int i = 0; fast_m ? (tim != 0u) : (i < g_wk.n[st]); ) {
+            if (fast_m) { i = (int)__builtin_ctzll(tim); tim &= tim - 1u; }
+            if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].binding >= lo && r[i].binding < lo + 64 && ((um | sm) >> (r[i].binding - lo) & 1))
+                r[i].dim |= um >> (r[i].binding - lo) & 1 ? DMSH_VK_DIM_UINT : DMSH_VK_DIM_SINT;
+            if (!fast_m) i++;
+        }
     }
 }
 // Writes set 0 from the walk (walk_all, just before) and binds it (and set 1 for shaders that read the pools). c0: where the compute stage's c0 went (an indirect dispatch copies its counts there)
@@ -1882,20 +1899,31 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
     return sets_push(lay, bp, any_pool);
 }
 // Images first used by a draw (from the walk, walk_all), or remade with storage use (vka_tex.c img_storage_upgrade): dry = only whether there is one
+static int make_images_stage(int st, int dry) {
+    const vka_res *r = g_wk.r[st]; int any = 0;
+    int fast_m = vka_wk_prep_fast_on() && g_wk.mk[st].ready;
+    uint64_t m1 = fast_m ? g_wk.mk[st].tex_img_m : 0u;
+    for (int i = 0; fast_m ? (m1 != 0u) : (i < g_wk.n[st]); ) {
+        if (fast_m) { i = (int)__builtin_ctzll(m1); m1 &= m1 - 1u; }
+        if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].tid && (vka_tex_id_pending_rec(r[i].tid, r[i].dim) || (r[i].what == VKA_R_IMG && vka_tex_id_storage_pending(r[i].tid)))) {
+            any = 1; if (dry) return 1;
+            vka_tex_id_view(r[i].tid, g_cb, r[i].dim, wbf_view_of_binding(r[i].what == VKA_R_IMG, r[i].flags, DMSH_VK_BF_RW), NULL);
+        }
+        if (!fast_m) i++;
+    }
+    uint64_t m2 = fast_m ? g_wk.mk[st].tex_only_m : 0u;
+    for (int i = 0; fast_m ? (m2 != 0u) : (i < g_wk.n[st]); ) {
+        if (fast_m) { i = (int)__builtin_ctzll(m2); m2 &= m2 - 1u; }
+        if (r[i].what == VKA_R_TEX && r[i].tid && vka_tbuf_pending(r[i].tid, r[i].dim)) { any = 1; if (dry) return 1; vka_tbuf_refresh(r[i].tid, r[i].dim, g_cb); }
+        if (!fast_m) i++;
+    }
+    return any;
+}
 static int make_images(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], int dry) {
     (void)d; int any = 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
         if (!sh[st] || !(g_wk.fl[st] & (VKA_WF_TEX_IMG | VKA_WF_TBUF))) continue;
-        const vka_res *r = g_wk.r[st];
-        for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG) && r[i].tid
-                                                 && (vka_tex_id_pending_rec(r[i].tid, r[i].dim) || (r[i].what == VKA_R_IMG && vka_tex_id_storage_pending(r[i].tid)))) {   // (an image remade with storage use copies its content: outside the pass)
-            any = 1; if (dry) return 1;
-            vka_tex_id_view(r[i].tid, g_cb, r[i].dim, wbf_view_of_binding(r[i].what == VKA_R_IMG, r[i].flags, DMSH_VK_BF_RW), NULL);
-        }
-        for (int i = 0; i < g_wk.n[st]; i++) if (r[i].what == VKA_R_TEX && r[i].tid && vka_tbuf_pending(r[i].tid, r[i].dim)) {   // a buffer texture read as an image: its copy (vka_tbuf.c), outside the pass
-            any = 1; if (dry) return 1;
-            vka_tbuf_refresh(r[i].tid, r[i].dim, g_cb);
-        }
+        if (make_images_stage(st, dry)) { any = 1; if (dry) return 1; }
     }
     return any;
 }
@@ -1920,7 +1948,9 @@ static int bar_hazard(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) {
         if (g_wk.pool[st] || g_wk.n[st] < 0) return 1;
         if (!(g_wk.fl[st] & (VKA_WF_TEX_IMG | VKA_WF_TBUF))) continue;
         const vka_res *r = g_wk.r[st];
-        for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_TBUF) && r[i].tid && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim)) return 1;
+        if (vka_wk_prep_fast_on() && g_wk.mk[st].ready) {
+            for (uint64_t m = g_wk.mk[st].tex_tbuf_m; m; m &= m - 1u) { int i = (int)__builtin_ctzll(m); if (vka_tex_id_in_pass_rec(r[i].tid, r[i].dim)) return 1; }
+        } else for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_TBUF) && r[i].tid && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim)) return 1;
     }
     return 0;
 }
@@ -1928,7 +1958,9 @@ static int depth_sampled(vka_shader *const sh[VKA_NSTAGE], const vka_dstate *d) 
     for (int st = 0; st < VKA_NSTAGE; st++) {
         if (!sh[st] || (st == 1 && d->rast_discard) || !(g_wk.fl[st] & (VKA_WF_TEX_IMG | VKA_WF_TBUF))) continue;
         const vka_res *r = g_wk.r[st];
-        for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_TBUF) && r[i].tid && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim) == 2) return 1;
+        if (vka_wk_prep_fast_on() && g_wk.mk[st].ready) {
+            for (uint64_t m = g_wk.mk[st].tex_tbuf_m; m; m &= m - 1u) { int i = (int)__builtin_ctzll(m); if (vka_tex_id_in_pass_rec(r[i].tid, r[i].dim) == 2) return 1; }
+        } else for (int i = 0; i < g_wk.n[st]; i++) if ((r[i].what == VKA_R_TEX || r[i].what == VKA_R_TBUF) && r[i].tid && vka_tex_id_in_pass_rec(r[i].tid, r[i].dim) == 2) return 1;
     }
     return 0;
 }
@@ -1944,18 +1976,26 @@ static int ub_hazard(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], int 
             static int n_gm; if (n_gm++ < 8) VLOG("pass ended: a draw with raw global memory access while inline uniform updates are deferred (%d so far)", n_gm);
             return 1;
         }
-        if (g_wk.fl[st] & VKA_WF_BUF) for (int i = 0; i < g_wk.n[st]; i++) {
-            if (r[i].what != VKA_R_BUF) continue;
-            if (r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                if (ub_overlaps(r[i].addr, r[i].size ? r[i].size : V.sb_range)) return 1;
-            } else if (r[i].desc == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-                uint64_t sz = !r[i].size || r[i].size > V.ub_range ? (r[i].size ? V.ub_range : (65536 < V.ub_range ? 65536 : V.ub_range)) : r[i].size;
-                if (ub_overlaps(r[i].addr, sz) && !vka_tex_gw_read(r[i].addr, sz, NULL)) return 1;
+        if (g_wk.fl[st] & VKA_WF_BUF) {
+            int fast_m = vka_wk_prep_fast_on() && g_wk.mk[st].ready;
+            uint64_t bm = fast_m ? g_wk.mk[st].buf_m : 0u;
+            for (int i = 0; fast_m ? (bm != 0u) : (i < g_wk.n[st]); ) {
+                if (fast_m) { i = (int)__builtin_ctzll(bm); bm &= bm - 1u; }
+                if (r[i].what == VKA_R_BUF) {
+                    if (r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) { if (ub_overlaps(r[i].addr, r[i].size ? r[i].size : V.sb_range)) return 1; }
+                    else if (r[i].desc == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                        uint64_t sz = !r[i].size || r[i].size > V.ub_range ? (r[i].size ? V.ub_range : (65536 < V.ub_range ? 65536 : V.ub_range)) : r[i].size;
+                        if (ub_overlaps(r[i].addr, sz) && !vka_tex_gw_read(r[i].addr, sz, NULL)) return 1;
+                    }
+                }
+                if (!fast_m) i++;
             }
         }
     }
     if (!mesh) {
-        for (int st = 0; st < 16; st++) if (d->vbuf[st].address && ub_overlaps(d->vbuf[st].address, d->vbuf[st].size ? d->vbuf[st].size : 65536)) return 1;
+        if (vka_wk_prep_fast_on()) {
+            for (uint32_t m = d->vbuf_nz_mask; m; m &= m - 1u) { int st = __builtin_ctz(m); if (ub_overlaps(d->vbuf[st].address, d->vbuf[st].size ? d->vbuf[st].size : 65536)) return 1; }
+        } else for (int st = 0; st < 16; st++) if (d->vbuf[st].address && ub_overlaps(d->vbuf[st].address, d->vbuf[st].size ? d->vbuf[st].size : 65536)) return 1;
         if (di && di->ibuf) {
             size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
             if (ub_overlaps(di->ibuf, di->ind ? 65536 : isz * (uint64_t)(di->count > 0 ? di->count : 1))) return 1;
@@ -2209,7 +2249,9 @@ static int inst_same_draw(const isnap *s, VkBuffer ib, VkDeviceSize io, VkIndexT
     if (!s->valid || s->ib != ib || s->io != io || s->it != it || s->cnt != (uint32_t)di->count || s->bv != di->base_vertex) return 0;
     if (s->nb != VI.nb || s->na != VI.na || s->used != VI.used || s->zb != VI.zb || s->zero != VI.zero) return 0;
     if (memcmp(s->b, VI.b, VI.nb * sizeof *VI.b) || memcmp(s->a, VI.a, VI.na * sizeof *VI.a)) return 0;
-    for (int st = 0; st < 16; st++) if (VI.used >> st & 1 && (s->va[st] != d->vbuf[st].address || s->vs[st] != d->vbuf[st].size)) return 0;
+    if (vka_wk_prep_fast_on()) {
+        for (uint32_t m = VI.used & 0xffffu; m; m &= m - 1u) { int st = __builtin_ctz(m); if (s->va[st] != d->vbuf[st].address || s->vs[st] != d->vbuf[st].size) return 0; }
+    } else for (int st = 0; st < 16; st++) if (VI.used >> st & 1 && (s->va[st] != d->vbuf[st].address || s->vs[st] != d->vbuf[st].size)) return 0;
     return 1;
 }
 // g_w against snapshot s: 2 = the same but for one vertex uniform write and one pixel uniform write moved by the same amount (*wv, *wp, *delta); 0 = otherwise.
@@ -3178,19 +3220,29 @@ int vka_is_ndve_key(uint64_t k) {
 static VkPipeline img_retype(vka_shader *cs, const vka_layout *lay, VkPipeline p) {
     if (!VKA_ENV("DM_VK_IMG_RETYPE", 1) || !(g_wk.fl[5] & VKA_WF_FLOAT_TEX)) return p;
     vka_res *r = g_wk.r[5]; uint64_t um = 0, sm = 0, fm = 0;
-    for (int i = 0; i < g_wk.n[5]; i++) {
+    int fast_m = vka_wk_prep_fast_on() && g_wk.mk[5].ready;
+    uint64_t fm_it = fast_m ? g_wk.mk[5].float_tex_m : 0u;
+    for (int i = 0; fast_m ? (fm_it != 0u) : (i < g_wk.n[5]); ) {
+        if (fast_m) { i = (int)__builtin_ctzll(fm_it); fm_it &= fm_it - 1u; }
         int img = r[i].what == VKA_R_IMG && r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        int tex = r[i].what == VKA_R_TEX && (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);   // (a texture: its fetches and samples)
-        if (!(img || tex) || r[i].binding >= 64 || (r[i].dim & (DMSH_VK_DIM_SINT | DMSH_VK_DIM_UINT))) continue;
-        int c = r[i].tid ? vka_tex_id_class_rec(r[i].tid) : 0; uint64_t bit = 1ull << r[i].binding;
-        if (r[i].elem) c = 0;   // (an array binding keeps its float type)
-        if (c == 1) um |= bit; else if (c == 2) sm |= bit; else fm |= bit;
+        int tex = r[i].what == VKA_R_TEX && (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+        if ((img || tex) && r[i].binding < 64 && !(r[i].dim & (DMSH_VK_DIM_SINT | DMSH_VK_DIM_UINT))) {
+            int c = r[i].tid ? vka_tex_id_class_rec(r[i].tid) : 0; uint64_t bit = 1ull << r[i].binding;
+            if (r[i].elem) c = 0;
+            if (c == 1) um |= bit; else if (c == 2) sm |= bit; else fm |= bit;
+        }
+        if (!fast_m) i++;
     }
-    uint64_t mixed = (um & sm) | ((um | sm) & fm); um &= ~mixed; sm &= ~mixed;   // (an array binding with elements of more than one class keeps its float type)
+    uint64_t mixed = (um & sm) | ((um | sm) & fm); um &= ~mixed; sm &= ~mixed;
     if (!(um | sm)) return p;
     VkPipeline q = vka_cs_pipeline_img(cs, lay, um, sm);
     if (!q) return p;
-    for (int i = 0; i < g_wk.n[5]; i++) if ((r[i].what == VKA_R_IMG || r[i].what == VKA_R_TEX) && r[i].binding < 64 && ((um | sm) >> r[i].binding & 1)) r[i].dim |= um >> r[i].binding & 1 ? DMSH_VK_DIM_UINT : DMSH_VK_DIM_SINT;
+    uint64_t tim = fast_m ? g_wk.mk[5].tex_img_m : 0u;
+    for (int i = 0; fast_m ? (tim != 0u) : (i < g_wk.n[5]); ) {
+        if (fast_m) { i = (int)__builtin_ctzll(tim); tim &= tim - 1u; }
+        if ((r[i].what == VKA_R_IMG || r[i].what == VKA_R_TEX) && r[i].binding < 64 && ((um | sm) >> r[i].binding & 1)) r[i].dim |= um >> r[i].binding & 1 ? DMSH_VK_DIM_UINT : DMSH_VK_DIM_SINT;
+        if (!fast_m) i++;
+    }
     return q;
 }
 // ---------- FSR 1 in place of a game's neural upscaler (DM_VK_NDSR) ----------

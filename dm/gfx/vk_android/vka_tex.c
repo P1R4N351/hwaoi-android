@@ -35,6 +35,7 @@
 #include "vka_tbuf_vl_fast.h"
 #include "vka_mem_sparse_fast.h"
 #include "vka_treg_ub_fast.h"
+#include "vka_wk_prep_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -238,7 +239,10 @@ static vka_img **g_live; static int g_nlive, g_livecap; static uint64_t g_live_g
 #define VKA_LIVE_T vka_img
 #include "vka_livemap.h"
 static vkl_index g_lvx;   // (under g_tmu)
-static void live_add(vka_img *im) { if (vkl_add(&g_live, &g_nlive, &g_livecap, &g_lvx, im)) g_live_gen++; }   // caller holds g_tmu
+static vka_wbf_wait_list_t g_wbf_list;
+static inline void wbf_wait_add_locked(vka_img *im) { if (im && vka_wk_prep_fast_on()) vka_wbf_list_add(&g_wbf_list, im, &im->wbf_ix); }
+static inline void wbf_wait_del_locked(vka_img *im) { if (im && im->wbf_ix) vka_wbf_list_del(&g_wbf_list, &im->wbf_ix); }
+static void live_add(vka_img *im) { if (vkl_add(&g_live, &g_nlive, &g_livecap, &g_lvx, im)) g_live_gen++; }
 enum { EDGE_HOT_CAP = 256 };
 static vka_img *g_edge_hot[EDGE_HOT_CAP]; static int g_nedge_hot;   // tracked images whose shared boundary pages stay writable (under g_tmu)
 static _Atomic uint64_t g_edge_skips, g_edge_unpins;
@@ -257,7 +261,7 @@ static void edge_hot_del(vka_img *im) {
     if (i < g_nedge_hot) { g_edge_hot[i] = last; __atomic_store_n(&last->edge_ix, i + 1, __ATOMIC_RELAXED); }
     __atomic_store_n(&im->edge_ix, 0, __ATOMIC_RELAXED);
 }
-static void live_del(vka_img *im) { edge_hot_del(im); if (vkl_del(g_live, &g_nlive, &g_lvx, im)) g_live_gen++; }   // caller holds g_tmu; nothing when im is not live
+static void live_del(vka_img *im) { wbf_wait_del_locked(im); edge_hot_del(im); if (vkl_del(g_live, &g_nlive, &g_lvx, im)) g_live_gen++; }
 static vka_img *live_first(const uint8_t *mem, int *k) { return vkl_first(g_live, g_nlive, &g_lvx, mem, k); }   // the live images whose storage starts at mem: the first, then live_next
 static vka_img *live_next(const vka_img *im, const uint8_t *mem, int *k) { return vkl_next(g_live, g_nlive, &g_lvx, im, mem, k); }
 static vksm g_cpuw;   // (under g_tmu) serials the CPU wrote before their image existed (a set: vksm with no images)
@@ -3000,8 +3004,13 @@ static VkComponentSwizzle swz1(int n) { return n >= 0 && n <= 5 ? (VkComponentSw
 // levels below (nvn_mtl.m fb_prepare, "Mip-chain pass sampling the level it renders" in docs/reference/rendering.md). DKB fills its environment cube's mip chain level by level,
 // each drawn from the one above through a view of the whole chain; sampling the attached level is a feedback loop Vulkan leaves undefined (on Adreno: NaN texels, which bloom
 // spread into white blotches and black speckles over the whole level)
-static vka_img *g_fb_im[9]; static uint32_t g_fb_lv[9]; static int g_nfb;
-void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n) { g_nfb = n > 9 ? 9 : n; for (int i = 0; i < g_nfb; i++) { g_fb_im[i] = ims[i]; g_fb_lv[i] = levels[i]; } }
+static vka_img *g_fb_im[9]; static uint32_t g_fb_lv[9]; static int g_nfb; static vka_fb_filter_t g_fb_flt;
+void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n) {
+    uintptr_t ptrs[9];
+    g_nfb = n > 9 ? 9 : (n < 0 ? 0 : n);
+    for (int i = 0; i < g_nfb; i++) { g_fb_im[i] = ims[i]; g_fb_lv[i] = levels[i]; ptrs[i] = (uintptr_t)ims[i]; }
+    vka_fb_filter_set(&g_fb_flt, ptrs, g_nfb);
+}
 static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int storage, VkFormat ovr) {
     vka_fmt f; const view_t *v = e->has_v ? &e->v : NULL;
     if (!vka_fmt_of(v && v->set_format ? v->format : e->t.d.format, &f)) f = im->f;
@@ -3014,7 +3023,7 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     if (l0 >= im->levels || a0 >= im->layers) return VK_NULL_HANDLE;
     if (l0 + nl > im->levels) nl = im->levels - l0;
     if (a0 + na > im->layers) na = im->layers - a0;
-    if (vt_want >= 0 && !storage) for (int i = 0; i < g_nfb; i++) if (g_fb_im[i] == im && g_fb_lv[i] > l0 && g_fb_lv[i] < l0 + nl) {
+    if (vt_want >= 0 && !storage && (!vka_wk_prep_fast_on() || vka_fb_may_contain(&g_fb_flt, (uintptr_t)im))) for (int i = 0; i < g_nfb; i++) if (g_fb_im[i] == im && g_fb_lv[i] > l0 && g_fb_lv[i] < l0 + nl) {
         static _Atomic int n; if (!atomic_exchange(&n, 1)) VLOG("a pass samples the texture it renders (serial %llu level %u) through levels %u+%u: sampled through the levels below it", (unsigned long long)im->serial, g_fb_lv[i], l0, nl);
         nl = g_fb_lv[i] - l0; }
     int tgt = v && v->set_target ? v->target : e->t.d.target;
@@ -3199,7 +3208,11 @@ VkImageView vka_tex_id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage
     if (layout) *layout = VK_IMAGE_LAYOUT_GENERAL;
     return id_view(id, cb, dim, storage, NULL, VK_FORMAT_UNDEFINED);
 }
-static int in_fb(const vka_img *im) { for (int i = 0; i < g_nfb; i++) if (g_fb_im[i] == im) return 1; return 0; }   // (a view of a pass's own target is cut to its other levels: view_of)
+static int in_fb(const vka_img *im) {
+    if (!g_nfb || (vka_wk_prep_fast_on() && !vka_fb_may_contain(&g_fb_flt, (uintptr_t)im))) return 0;
+    for (int i = 0; i < g_nfb; i++) if (g_fb_im[i] == im) return 1;
+    return 0;
+}
 // Texture ID id stands for an image the open pass draws into (any level): 1 = colour attachment, 2 = depth / stencil attachment, 0 = neither. A draw sampling it after a
 // game barrier inside the pass (or sampling depth after SetRenderTargets continued the pass) needs the pass ended first (vka_draw.c). An ID whose image is not made yet is
 // not one (the pass's attachments were made when it opened; make_images ends the pass for a new one anyway)
@@ -3612,7 +3625,7 @@ static int prepare_one_unpinned(vka_img *im, VkCommandBuffer cb, int check_inter
     }
     if (!wbf_follows(im->gpu_owned, img_wb_kind(im) && g_wbf_on, im->wb_pending, im->wb_fence, done)) {
         if (g_wbf_on && im->gpu_owned && img_wb_kind(im) && (im->wb_pending || done < im->wb_fence)) {
-            *g_wbf_wait = 1; im->wbf_waiting = 1; (*g_wbf_waits)++;
+            *g_wbf_wait = 1; im->wbf_waiting = 1; wbf_wait_add_locked(im); (*g_wbf_waits)++;
         }
         return 0;
     }
@@ -3638,32 +3651,91 @@ static int prepare_one_unpinned(vka_img *im, VkCommandBuffer cb, int check_inter
     upload_tracked_range(im, cb, lo, hi, wbf, *g_wbf_waits, g_wbf_up);
     return 0;
 }
+static int prepare_one_video_locked(vka_img *im, VkCommandBuffer cb, uint64_t ve) {
+    if (!im->is_video && im->mem && im->vep != ve) {
+        uint32_t vs = 0; im->vep = ve;
+        if (dm_codec_is_video_mem(im->mem, im->L.size, &vs)) {
+            im->is_video = 1; im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+            if (!im->d.stride) im->d.stride = vs;
+            im->track = 1; __atomic_store_n(&im->gpu_owned, 0, __ATOMIC_RELEASE); gpu_own_note(0);
+            mark_serial_treg_linear_locked(im->serial, vs);
+            VLOG("texture serial %llu: late video pool detection in prepare, marked linear (stride %u)", (unsigned long long)im->serial, vs);
+        }
+    }
+    if (im->is_video && im->mem) {
+        uint64_t vg = dm_codec_video_gen(im->mem);
+        if (vg != im->vgen) { im->vgen = vg; tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem; upload(im, &t, cb); g_reup++; return 1; }
+    }
+    return 0;
+}
+static void prepare_one_live_img_locked(vka_img *im, VkCommandBuffer cb, uint64_t ve, int full_scan,
+                                        int g_wbf_on, uint64_t done, int *wbf_wait, uint64_t *wbf_waits, uint64_t *wbf_up) {
+    if (!wbf_visit(full_scan, im->wbf_waiting)) return;
+    im->wbf_waiting = 0;
+    if (img_pool_dead(im) || prepare_one_video_locked(im, cb, ve)) return;
+    if (im->vbind && im->mem) { if (nvn_sparse_since(im->vpool, (uint64_t)(uintptr_t)im->mem, im->L.size, im->vgen, im->stamp)) sparse_bind(im, cb, 0); return; }
+    if (im->vtrack && !im->gpu_owned && im->mem) {
+        if (!nvn_sparse_since(im->vpool, (uint64_t)(uintptr_t)im->mem, im->L.size, im->vgen, im->stamp)) return;
+        sparse_refresh(im, cb); if (g_reup++ < 8) VLOG("sparse texture serial %llu %ux%u format %#x: its mappings or pages changed, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format); return;
+    }
+    if (!im->track || !im->mem) return;
+    if (im->edge_unpinned) { prepare_one_unpinned(im, cb, 1, g_wbf_on, done, wbf_wait, wbf_waits, wbf_up); return; }
+    if (!wbf_follows(im->gpu_owned, img_wb_kind(im) && g_wbf_on, im->wb_pending, im->wb_fence, done)) {
+        if (g_wbf_on && im->gpu_owned && img_wb_kind(im) && (im->wb_pending || done < im->wb_fence)) { *wbf_wait = 1; im->wbf_waiting = 1; wbf_wait_add_locked(im); (*wbf_waits)++; }
+        return;
+    }
+    int wbf = im->gpu_owned; uint64_t size = im->L.size;
+    if (!im->span) im->span = nvn_dirty_span(im->mem, size);
+    if (!nvn_dirty_since_span(im->span, im->mem, size, im->stamp) || img_edges_clean(im)) return;
+    size_t lo, hi; if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) return;
+    upload_tracked_range(im, cb, lo, hi, wbf, *wbf_waits, wbf_up);
+}
+static void wbf_prepare_scan_locked(VkCommandBuffer cb, uint64_t ve, int full_scan, int g_wbf_on,
+                                    uint64_t done, int *wbf_wait, uint64_t *wbf_waits, uint64_t *wbf_up) {
+    if (!full_scan && vka_wk_prep_fast_on() && !g_wbf_list.overflow) {
+        vka_img *snap[VKA_WBF_WAIT_CAP]; uint32_t n = g_wbf_list.n;
+        for (uint32_t i = 0u; i < n; i++) snap[i] = (vka_img *)g_wbf_list.ims[i];
+        vka_wbf_list_clear(&g_wbf_list);
+        for (uint32_t i = 1u; i < n; i++) {
+            vka_img *cur = snap[i]; uint32_t j = i;
+            while (j > 0u && snap[j - 1u]->live_ix > cur->live_ix) { snap[j] = snap[j - 1u]; j--; }
+            snap[j] = cur;
+        }
+        for (uint32_t i = 0u; i < n; i++) prepare_one_live_img_locked(snap[i], cb, ve, full_scan, g_wbf_on, done, wbf_wait, wbf_waits, wbf_up);
+        return;
+    }
+    vka_wbf_list_clear(&g_wbf_list);
+    for (int i = 0; i < g_nlive; i++) prepare_one_live_img_locked(g_live[i], cb, ve, full_scan, g_wbf_on, done, wbf_wait, wbf_waits, wbf_up);
+}
+static int regw_overlap_fast_locked(const vka_regw_idx_t *idx, uint64_t tmask, const tex_region_write_t *w) {
+    int j = vka_regw_first_cand(idx, (uint64_t)(uintptr_t)w->im, w->level, w->layer, tmask);
+    for (; j >= 0; j = vka_regw_next_cand(idx, j, tmask)) if (reg_write_overlap(&g_reg_writes[j], w)) return 1;
+    return 0;
+}
 static int tex_reg_writes_flush_locked(VkCommandBuffer cb) {
-    int any_rw = 0, vufast = vka_view_ub_fast_on();
+    static vka_regw_idx_t regw_idx;
+    int any_rw = 0, vufast = vka_view_ub_fast_on(), wpfast = vka_wk_prep_fast_on() && g_nreg_writes <= (int)VKA_REGW_CAP;
     uint64_t rw_bloom = 0u;
+    if (wpfast && g_nreg_writes > 0) vka_regw_idx_reset(&regw_idx);
     for (int i = 0; i < g_nreg_writes; i++) {
-        tex_region_write_t *w = &g_reg_writes[i];
-        vka_img *im = w->im;
-        uint64_t rbit = vufast ? vka_regw_bloom_bit((uint64_t)(uintptr_t)im, w->level, w->layer) : 0u;
+        tex_region_write_t *w = &g_reg_writes[i]; vka_img *im = w->im;
         if (!im->gpu_owned && !img_pool_dead(im)) {
-            vka_span s;
+            vka_span s; uint64_t tm = wpfast ? vka_regw_tile_mask(w->x, w->y, w->w, w->h) : 0u;
+            uint64_t rbit = (!wpfast && vufast) ? vka_regw_bloom_bit((uint64_t)(uintptr_t)im, w->level, w->layer) : 0u;
             if (vka_scratch(w->size, 16, &s)) {
-                if (!vufast || (rw_bloom & rbit)) {
-                    for (int j = 0; j < i; j++) if (reg_write_overlap(&g_reg_writes[j], w)) { vka_barrier(cb); break; }
-                }
+                if (wpfast) { if (regw_overlap_fast_locked(&regw_idx, tm, w)) vka_barrier(cb); }
+                else if (!vufast || (rw_bloom & rbit)) { for (int j = 0; j < i; j++) if (reg_write_overlap(&g_reg_writes[j], w)) { vka_barrier(cb); break; } }
                 memcpy(s.ptr, w->data, w->size);
                 VkBufferImageCopy c = {.bufferOffset = s.off, .imageSubresource = {im->aspect, w->level, w->layer, 1}, .imageOffset = {w->x, w->y, w->z}, .imageExtent = {w->w, w->h, 1}};
                 vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
                 w->copied = 1; any_rw = 1;
-                if (vufast) rw_bloom |= rbit;
-                atomic_fetch_add_explicit(&g_up_bytes, w->size, memory_order_relaxed);
-                g_reup++;
-                static int n_rw_log;
-                if (n_rw_log++ < 16) VLOG("region write serial %llu: %ux%u at [%d,%d] level %u layer %u (%zu bytes copied to image)", (unsigned long long)im->serial, w->w, w->h, w->x, w->y, w->level, w->layer, w->size);
+                if (wpfast) vka_regw_insert(&regw_idx, i, (uint64_t)(uintptr_t)im, w->level, w->layer, tm);
+                else if (vufast) rw_bloom |= rbit;
+                atomic_fetch_add_explicit(&g_up_bytes, w->size, memory_order_relaxed); g_reup++;
+                static int n_rw_log; if (n_rw_log++ < 16) VLOG("region write serial %llu: %ux%u at [%d,%d] level %u layer %u (%zu bytes copied to image)", (unsigned long long)im->serial, w->w, w->h, w->x, w->y, w->level, w->layer, w->size);
             } else redo_add_locked(im);
         }
-        free(w->data);
-        unref_locked(im);
+        free(w->data); unref_locked(im);
     }
     g_nreg_writes = 0;
     return any_rw;
@@ -3750,61 +3822,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
     int full_scan = now != seen || vnow != vseen || vid_new;   // (else the scan runs only for the images that waited for a copy-back: vka_wbfollow.h wbf_visit)
     if (full_scan || g_wbf_wait) {
         seen = now; vseen = vnow; vw_seen = vw; ve_seen = ve; g_wbf_wait = 0;
-        for (int i = 0; i < g_nlive; i++) {
-            vka_img *im = g_live[i];
-            if (!wbf_visit(full_scan, im->wbf_waiting)) continue;
-            im->wbf_waiting = 0;   // (set again below while it still waits)
-            if (img_pool_dead(im)) continue;
-            if (!im->is_video && im->mem && im->vep != ve) {
-                uint32_t vs = 0; im->vep = ve;
-                if (dm_codec_is_video_mem(im->mem, im->L.size, &vs)) {
-                    im->is_video = 1;
-                    im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
-                    if (!im->d.stride) im->d.stride = vs;
-                    im->track = 1;
-                    __atomic_store_n(&im->gpu_owned, 0, __ATOMIC_RELEASE); gpu_own_note(0);
-                    mark_serial_treg_linear_locked(im->serial, vs);
-                    VLOG("texture serial %llu: late video pool detection in prepare, marked linear (stride %u)", (unsigned long long)im->serial, vs);
-                }
-            }
-            if (im->is_video && im->mem) {
-                uint64_t vg = dm_codec_video_gen(im->mem);
-                if (vg != im->vgen) {
-                    im->vgen = vg;
-                    tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
-                    upload(im, &t, cb);
-                    g_reup++;
-                    continue;
-                }
-            }
-            if (im->vbind && im->mem) { if (nvn_sparse_since(im->vpool, (uint64_t)(uintptr_t)im->mem, im->L.size, im->vgen, im->stamp)) sparse_bind(im, cb, 0); continue; }   // (GPU-written: binds only)
-            if (im->vtrack && !im->gpu_owned && im->mem) {
-                if (!nvn_sparse_since(im->vpool, (uint64_t)(uintptr_t)im->mem, im->L.size, im->vgen, im->stamp)) continue;
-                sparse_refresh(im, cb);
-                if (g_reup++ < 8) VLOG("sparse texture serial %llu %ux%u format %#x: its mappings or pages changed, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format);
-                continue;
-            }
-            if (!im->track || !im->mem) continue;
-            // A GPU-written image's content is the GPU's, except a linear one's once its copy-back has run: then the CPU's later writes to the storage are uploaded (vka_wbfollow.h:
-            // Mario Tennis Fever clears its 8192x2048 R8 glyph cache on the GPU and rasterizes glyphs into it on the CPU; skipped, every text box was blank). While the copy-back
-            // is queued or on the GPU the image waits, and the scan runs again at the next prepare even if the CPU writes nothing more (g_wbf_wait)
-            if (im->edge_unpinned) {
-                prepare_one_unpinned(im, cb, 1, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
-                continue;
-            }
-            if (!wbf_follows(im->gpu_owned, img_wb_kind(im) && g_wbf_on, im->wb_pending, im->wb_fence, done)) {
-                if (g_wbf_on && im->gpu_owned && img_wb_kind(im) && (im->wb_pending || done < im->wb_fence)) { g_wbf_wait = 1; im->wbf_waiting = 1; g_wbf_waits++; }
-                continue;
-            }
-            int wbf = im->gpu_owned;   // (counted below once its pages were found written: DM_VK_WB_FOLLOW's line)
-            uint64_t size = im->L.size;
-            if (!im->span) im->span = nvn_dirty_span(im->mem, size);
-            if (!nvn_dirty_since_span(im->span, im->mem, size, im->stamp)) continue;
-            if (img_edges_clean(im)) continue;
-            size_t lo, hi;
-            if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
-            upload_tracked_range(im, cb, lo, hi, wbf, g_wbf_waits, &g_wbf_up);
-        }
+        wbf_prepare_scan_locked(cb, ve, full_scan, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
     } else if (g_nedge_hot) {
         for (int i = g_nedge_hot - 1; i >= 0; i--)
             prepare_one_unpinned(g_edge_hot[i], cb, 0, g_wbf_on, done, &g_wbf_wait, &g_wbf_waits, &g_wbf_up);
