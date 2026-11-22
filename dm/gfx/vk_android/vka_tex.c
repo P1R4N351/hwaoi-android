@@ -32,6 +32,7 @@
 #include "vka_gw_fast.h"
 #include "vka_view_fast.h"
 #include "vka_view_ub_fast.h"
+#include "vka_tbuf_vl_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -414,7 +415,7 @@ static int same_shape(const vka_img *a, const tex_t *t, const vka_fmt *f, int le
 // own format, as before)
 typedef struct { VkFormat a, b; uint32_t w, h; } vlearn;
 enum { NVL = 64 };
-static vlearn g_vl[NVL]; static int g_nvl, g_vl_loaded; static char g_vl_path[1024]; static pthread_mutex_t g_vlmu = PTHREAD_MUTEX_INITIALIZER;
+static vlearn g_vl[NVL]; static int g_nvl, g_vl_loaded; static vka_vl_index_t g_vl_idx; static char g_vl_path[1024]; static pthread_mutex_t g_vlmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VL_PER_IMAGE = VKFL_MAX };   // learned formats one image takes at most (vka_img.fl.x)   // under g_vlmu
 static int vl_bytes(VkFormat v) {   // bytes per texel of an uncompressed colour (kind 0..2) format of the textures (an image's own format or its sRGB view format), else 0
     int fast = vka_view_ub_fast_on(), cached = 0;
@@ -447,10 +448,12 @@ static void vl_load(void) {   // caller holds g_vlmu
     while (g_nvl < NVL && fgets(ln, sizeof ln, f)) {
         unsigned a, b, w, h; char more;
         if (sscanf(ln, "%u %u %u %u %c", &a, &b, &w, &h, &more) != 4 || (!w) != (!h) || !vl_pair_ok((VkFormat)a, (VkFormat)b)) { dropped++; continue; }
-        int dup = 0, same = 0;
-        for (int i = 0; i < g_nvl; i++) { dup |= g_vl[i].a == (VkFormat)a && g_vl[i].b == (VkFormat)b && g_vl[i].w == w && g_vl[i].h == h; same += g_vl[i].a == (VkFormat)a && g_vl[i].w == w && g_vl[i].h == h; }
+        int dup = 0, same = 0, fast = vka_tbuf_vl_fast_on();
+        if (fast) dup = vka_vl_idx_has_or_count(&g_vl_idx, (int32_t)a, (int32_t)b, w, h, &same);
+        else for (int i = 0; i < g_nvl; i++) { dup |= g_vl[i].a == (VkFormat)a && g_vl[i].b == (VkFormat)b && g_vl[i].w == w && g_vl[i].h == h; same += g_vl[i].a == (VkFormat)a && g_vl[i].w == w && g_vl[i].h == h; }
         if (dup || same >= VL_PER_IMAGE) { dropped++; continue; }
         g_vl[g_nvl++] = (vlearn){(VkFormat)a, (VkFormat)b, w, h};
+        if (fast) vka_vl_idx_add(&g_vl_idx, (int32_t)a, (int32_t)b, w, h, (uint8_t)(g_nvl - 1));
     }
     fclose(f);
     if (g_nvl || dropped) VLOG("learned view formats %s: %d pairs (images of those formats and sizes take the second format in their format list)%s", g_vl_path, g_nvl,
@@ -462,21 +465,31 @@ static void vl_load(void) {   // caller holds g_vlmu
 // its RGBA8, R11G11B10 and RGB9E5 targets as r32ui images for atomics and packed writes), and dynamic resolution gives the target a new size every few frames: a pair keyed
 // by the size missed at each one, and the pass read and wrote through the target's own format (or nothing)
 static int vl_formats(VkFormat a, uint32_t w, uint32_t h, int img, VkFormat *out, int max) {   // caller holds g_vlmu
-    if (!VKA_ENV("DM_VK_VIEW_LEARN", 1)) return 0;
-    vl_load(); int n = 0;
-    for (int i = 0; i < g_nvl && n < max; i++) if (g_vl[i].a == a && ((g_vl[i].w == w && g_vl[i].h == h) || (img && !g_vl[i].w && !g_vl[i].h))) { int dup = 0; for (int k = 0; k < n; k++) dup |= out[k] == g_vl[i].b; if (!dup) out[n++] = g_vl[i].b; }   // (vl_learn and vl_load keep at most VL_PER_IMAGE a format and size)
+    if (!VKA_ENV("DM_VK_VIEW_LEARN", 1) || max <= 0) return 0;
+    vl_load();
+    if (vka_tbuf_vl_fast_on()) {
+        int32_t tmp[16]; int cap = max < 16 ? max : 16;
+        int n = vka_vl_idx_formats(&g_vl_idx, (int32_t)a, w, h, img, tmp, cap);
+        for (int i = 0; i < n; i++) out[i] = (VkFormat)tmp[i];
+        return n;
+    }
+    int n = 0;
+    for (int i = 0; i < g_nvl && n < max; i++) if (g_vl[i].a == a && ((g_vl[i].w == w && g_vl[i].h == h) || (img && !g_vl[i].w && !g_vl[i].h))) { int dup = 0; for (int k = 0; k < n; k++) dup |= out[k] == g_vl[i].b; if (!dup) out[n++] = g_vl[i].b; }
     return n;
 }
 static int vl_learn(VkFormat a, VkFormat b, uint32_t w, uint32_t h) {   // caller holds g_vlmu; 1 = new
     if (!VKA_ENV("DM_VK_VIEW_LEARN", 1) || !vl_pair_ok(a, b)) return 0;
     vl_load();
-    int same = 0;
-    for (int i = 0; i < g_nvl; i++) { if (g_vl[i].a == a && g_vl[i].b == b && g_vl[i].w == w && g_vl[i].h == h) return 0; same += g_vl[i].a == a && g_vl[i].w == w && g_vl[i].h == h; }
+    int dup = 0, same = 0, fast = vka_tbuf_vl_fast_on();
+    if (fast) dup = vka_vl_idx_has_or_count(&g_vl_idx, (int32_t)a, (int32_t)b, w, h, &same);
+    else for (int i = 0; i < g_nvl; i++) { if (g_vl[i].a == a && g_vl[i].b == b && g_vl[i].w == w && g_vl[i].h == h) return 0; same += g_vl[i].a == a && g_vl[i].w == w && g_vl[i].h == h; }
+    if (dup) return 0;
     if (g_nvl == NVL || same >= VL_PER_IMAGE) {
         static int nr; if (nr++ < 4) VRED("learned view formats: VkFormat %d as a view of VkFormat %d (%ux%u) not learned: %s", b, a, w, h, same >= VL_PER_IMAGE ? "that image format and size has 4 already" : "the table is full (64 pairs)");
         return 0;
     }
     g_vl[g_nvl++] = (vlearn){a, b, w, h};
+    if (fast) vka_vl_idx_add(&g_vl_idx, (int32_t)a, (int32_t)b, w, h, (uint8_t)(g_nvl - 1));
     vl_save();
     return 1;
 }

@@ -11,6 +11,7 @@
 // Not done: a buffer texture bound as a storage image (its writes would have to go back to the memory); it reads and writes nothing (logged)
 #include "vka.h"
 #include "vka_tbuf_fast.h"
+#include "vka_tbuf_vl_fast.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -30,6 +31,9 @@ static _Atomic uint64_t g_timg_wgen = 1;
 static vka_tbuf_view_memo4 g_vmemo;
 static vka_tbuf_img_memo4 g_imemo;
 static vka_tbuf_fmt_memo g_fmemo;
+static vka_tbuf_vmap_t g_tb_vmap;
+static vka_tbuf_imap_t g_tb_imap;
+static vka_timg_wfilter_t g_timg_wf;
 static inline int tbuf_is_owner(void) {
     uintptr_t me = (uintptr_t)pthread_self(), none = 0u;
     uintptr_t cur = atomic_load_explicit(&g_tbuf_owner, memory_order_relaxed);
@@ -69,22 +73,32 @@ static void destroy_view(void *a) { vk.vkDestroyBufferView(V.dev, (VkBufferView)
 static void retire_view(VkBufferView v) { if (v) vka_after(vka_fence_last(), destroy_view, (void *)v); }
 // DM_VK_TBUF (live; A/B): 1 (default) binds buffer textures as above, 2 leaves the storage texel buffers unbound (shaders read buffer textures but write none), 0 binds none (as before)
 static int tbuf_mode(void) { return VKA_ENV("DM_VK_TBUF", 1); }
+static void tb_vmap_rebuild(void) {
+    vka_tbuf_vmap_clear(&g_tb_vmap);
+    for (int i = 0; i < g_nv; i++)
+        vka_tbuf_vmap_put(&g_tb_vmap, (uint64_t)(uintptr_t)g_v[i].buf, (uint64_t)g_v[i].off, (uint64_t)g_v[i].range, (int32_t)g_v[i].fmt, (uint16_t)i);
+}
 static VkBufferView tbuf_view_hit_or_make(int id, int writes, uint32_t tver0, uint64_t ep0,
                                            int fast_own, const tb_t *t, VkBuffer buf, VkDeviceSize off,
                                            VkDeviceSize range, VkFormat fmt) {
     uint64_t now = vka_frame();
     pthread_mutex_lock(&g_mu);
     uint32_t gen = atomic_load(&vka_seg_gen);
-    if (gen != g_vgen) { for (int i = 0; i < g_nv; i++) retire_view(g_v[i].v); g_nv = 0; g_vgen = gen; atomic_fetch_add_explicit(&g_v_evict, 1u, memory_order_release); }
-    int slot = -1; VkBufferView v = VK_NULL_HANDLE;
-    for (int i = 0; i < g_nv; i++) if (g_v[i].buf == buf && g_v[i].off == off && g_v[i].range == range && g_v[i].fmt == fmt) { slot = i; g_v[i].last = now; atomic_store_explicit(&g_v_last[i], now, memory_order_relaxed); v = g_v[i].v; break; }
+    if (gen != g_vgen) { for (int i = 0; i < g_nv; i++) retire_view(g_v[i].v); g_nv = 0; g_vgen = gen; vka_tbuf_vmap_clear(&g_tb_vmap); atomic_fetch_add_explicit(&g_v_evict, 1u, memory_order_release); }
+    int slot = -1, fast_map = vka_tbuf_vl_fast_on(); VkBufferView v = VK_NULL_HANDLE; uint16_t mslot = 0u;
+    if (fast_map && vka_tbuf_vmap_find(&g_tb_vmap, (uint64_t)(uintptr_t)buf, (uint64_t)off, (uint64_t)range, (int32_t)fmt, &mslot) && (int)mslot < g_nv) {
+        slot = (int)mslot; g_v[slot].last = now; atomic_store_explicit(&g_v_last[slot], now, memory_order_relaxed); v = g_v[slot].v;
+    } else if (!fast_map) {
+        for (int i = 0; i < g_nv; i++) if (g_v[i].buf == buf && g_v[i].off == off && g_v[i].range == range && g_v[i].fmt == fmt) { slot = i; g_v[i].last = now; atomic_store_explicit(&g_v_last[i], now, memory_order_relaxed); v = g_v[i].v; break; }
+    }
     if (!v) {
         VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf, .format = fmt, .offset = off, .range = range};
         VkResult r = vk.vkCreateBufferView(V.dev, &ci, NULL, &v);
         if (r) { pthread_mutex_unlock(&g_mu); static _Atomic int k; if (atomic_fetch_add(&k, 1) < 8) VRED("buffer texture ID %d: vkCreateBufferView (VkFormat %d, %llu bytes) failed (%d): not bound", id, fmt, (unsigned long long)range, r); return VK_NULL_HANDLE; }
-        slot = g_nv < NVIEW ? g_nv++ : 0;
-        if (slot == 0 && g_nv == NVIEW) { uint64_t bl = atomic_load_explicit(&g_v_last[0], memory_order_relaxed); for (int i = 1; i < NVIEW; i++) { uint64_t cl = atomic_load_explicit(&g_v_last[i], memory_order_relaxed); if (cl < bl) { bl = cl; slot = i; } } retire_view(g_v[slot].v); atomic_fetch_add_explicit(&g_v_evict, 1u, memory_order_release); }
+        int ev = g_nv == NVIEW; slot = ev ? 0 : g_nv++;
+        if (ev) { uint64_t bl = atomic_load_explicit(&g_v_last[0], memory_order_relaxed); for (int i = 1; i < NVIEW; i++) { uint64_t cl = atomic_load_explicit(&g_v_last[i], memory_order_relaxed); if (cl < bl) { bl = cl; slot = i; } } retire_view(g_v[slot].v); atomic_fetch_add_explicit(&g_v_evict, 1u, memory_order_release); }
         g_v[slot] = (tview){buf, off, range, fmt, v, now}; atomic_store_explicit(&g_v_last[slot], now, memory_order_relaxed);
+        if (fast_map) { if (ev) tb_vmap_rebuild(); else vka_tbuf_vmap_put(&g_tb_vmap, (uint64_t)(uintptr_t)buf, (uint64_t)off, (uint64_t)range, (int32_t)fmt, (uint16_t)slot); }
         static int noted; if (!noted++) VLOG("buffer textures: bound as texel buffers over guest memory (first: texture ID %d, %u elements, VkFormat %d)", id, t->elems, fmt);
     }
     pthread_mutex_unlock(&g_mu);
@@ -129,6 +143,7 @@ typedef struct { uint64_t addr, bytes, last, copied_frame; uint32_t elems, w, h;
 static timg g_i[NIMG]; static _Atomic int g_ni;
 void vka_tbuf_wrote(uint64_t addr, uint64_t n) {
     if (!atomic_load_explicit(&g_ni, memory_order_relaxed)) return;
+    if (vka_tbuf_vl_fast_on() && !vka_timg_wf_may_overlap(&g_timg_wf, addr, n)) return;
     pthread_mutex_lock(&g_mu);
     int dirtied = 0;
     for (int i = 0; i < g_ni; i++) if (addr < g_i[i].addr + g_i[i].bytes && g_i[i].addr < addr + n) { g_i[i].dirty = 1; dirtied = 1; }
@@ -150,7 +165,29 @@ static int shape(uint8_t dim, int *is2d) {
     if (d == 0 || d == 1) { *is2d = d == 1; return 1; }
     return 0;
 }
+static void timg_maps_rebuild(void) {
+    vka_tbuf_imap_clear(&g_tb_imap); vka_timg_wf_clear(&g_timg_wf);
+    for (int i = 0; i < g_ni; i++) {
+        vka_tbuf_imap_put(&g_tb_imap, g_i[i].addr, g_i[i].elems, (int32_t)g_i[i].format, (uint8_t)(g_i[i].is2d != 0), (uint16_t)i);
+        vka_timg_wf_add(&g_timg_wf, g_i[i].addr, g_i[i].bytes);
+    }
+}
+static timg *timg_store_slot(timg x) {
+    int ev = g_ni == NIMG, slot = ev ? 0 : g_ni++;
+    if (ev) { uint64_t bl = atomic_load_explicit(&g_i_last[0], memory_order_relaxed); for (int i = 1; i < NIMG; i++) { uint64_t cl = atomic_load_explicit(&g_i_last[i], memory_order_relaxed); if (cl < bl) { bl = cl; slot = i; } } retire_img(&g_i[slot]); atomic_fetch_add_explicit(&g_i_evict, 1u, memory_order_release); }
+    g_i[slot] = x; atomic_store_explicit(&g_i_last[slot], 0u, memory_order_relaxed);
+    if (vka_tbuf_vl_fast_on()) {
+        if (ev) timg_maps_rebuild();
+        else { vka_tbuf_imap_put(&g_tb_imap, x.addr, x.elems, (int32_t)x.format, (uint8_t)(x.is2d != 0), (uint16_t)slot); vka_timg_wf_add(&g_timg_wf, x.addr, x.bytes); }
+    }
+    return &g_i[slot];
+}
 static timg *img_find(const tb_t *t, int is2d) {   // (g_mu held)
+    if (vka_tbuf_vl_fast_on()) {
+        uint16_t slot = 0u;
+        if (vka_tbuf_imap_find(&g_tb_imap, t->addr, t->elems, (int32_t)t->format, (uint8_t)(is2d != 0), &slot) && (int)slot < g_ni) return &g_i[slot];
+        return NULL;
+    }
     for (int i = 0; i < g_ni; i++) if (g_i[i].addr == t->addr && g_i[i].elems == t->elems && g_i[i].format == t->format && g_i[i].is2d == is2d) return &g_i[i];
     return NULL;
 }
@@ -185,10 +222,7 @@ static timg *img_make(const tb_t *t, int is2d) {   // (g_mu held)
         x.laid = 0; timg *c = malloc(sizeof *c); if (c) { *c = x; destroy_img(c); }
         return NULL;
     }
-    int slot = g_ni < NIMG ? g_ni++ : 0;
-    if (slot == 0 && g_ni == NIMG) { uint64_t bl = atomic_load_explicit(&g_i_last[0], memory_order_relaxed); for (int i = 1; i < NIMG; i++) { uint64_t cl = atomic_load_explicit(&g_i_last[i], memory_order_relaxed); if (cl < bl) { bl = cl; slot = i; } } retire_img(&g_i[slot]); atomic_fetch_add_explicit(&g_i_evict, 1u, memory_order_release); }
-    g_i[slot] = x; atomic_store_explicit(&g_i_last[slot], 0u, memory_order_relaxed);
-    return &g_i[slot];
+    return timg_store_slot(x);
 }
 static inline void tbuf_img_warm(int id, int is2d, uint32_t tver0, uint64_t fr, uint64_t wg0, uint64_t ep0, VkImageView v, int slot) {
     if (v && tver0 && slot >= 0 && vka_tex_id_tver(id) == tver0 &&

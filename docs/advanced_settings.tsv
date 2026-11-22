@@ -774,6 +774,7 @@ DM_VK_SWAP_RB	developer	Diagnostics			text			both
 DM_VK_SYNCLOG	developer	Diagnostics			text			both							
 DM_VK_TBUF	developer	Graphics			text			both							
 DM_VK_TBUF_FAST	developer	Graphics			text			both							
+DM_VK_TBUF_VL_FAST	developer	Performance			text			both							
 DM_VK_TEST_HANG	developer	Diagnostics			text			both							
 DM_VK_TEXU_ELEM	developer	Diagnostics			text			both							
 DM_VK_TEX_FAST	developer	Performance			text			both							

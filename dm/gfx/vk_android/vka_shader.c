@@ -15,6 +15,7 @@
 #include "vka_layerreq.h"
 #include "vka_shader_fast.h"
 #include "vka_rp_mod_fast.h"
+#include "vka_tbuf_vl_fast.h"
 #include "plat/plat.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -264,6 +265,22 @@ int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
 static PFN_vkCreateShaderModule g_csm_next; static PFN_vkDestroyShaderModule g_dsm_next;
 typedef struct { VkShaderModule early, late; int kind; } pfb_twin;
 static pfb_twin *g_tw; static size_t g_ntw, g_twcap; static pthread_mutex_t g_twmu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t g_tw_gen = 1;
+static vka_pfb_map_t g_pfb_map; static int g_pfb_map_over;
+static void pfb_twin_record(VkShaderModule early, VkShaderModule *lm, int kind) {
+    if (!*lm) return;
+    pthread_mutex_lock(&g_twmu);
+    if (g_ntw == g_twcap) { size_t nc = g_twcap ? 2 * g_twcap : 256; pfb_twin *n = realloc(g_tw, nc * sizeof *n); if (n) { g_tw = n; g_twcap = nc; } }
+    if (g_ntw < g_twcap) {
+        uint32_t idx = (uint32_t)g_ntw;
+        g_tw[g_ntw++] = (pfb_twin){early, *lm, kind};
+        if (vka_tbuf_vl_fast_on() && !g_pfb_map_over) {
+            if (g_pfb_map.count < 768u) vka_pfb_map_put(&g_pfb_map, (uint64_t)(uintptr_t)early, (uint64_t)(uintptr_t)*lm, kind, idx);
+            else g_pfb_map_over = 1;
+        }
+        atomic_fetch_add_explicit(&g_tw_gen, 1, memory_order_release); *lm = VK_NULL_HANDLE;
+    }
+    pthread_mutex_unlock(&g_twmu);
+}
 static _Atomic uint64_t g_pfb_mods, g_pfb_sites, g_pfb_early, g_pfb_blind;
 static VkResult VKAPI_CALL csm_pfb(VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *m) {
     unsigned fl = vka_tex_pfb_flags();
@@ -285,10 +302,7 @@ static VkResult VKAPI_CALL csm_pfb(VkDevice d, const VkShaderModuleCreateInfo *c
                                                             DMSH_VK_SPEC_ALPHA_FUNC, &ln, &ls, &lk, err, sizeof err);
         VkShaderModule lm = VK_NULL_HANDLE;
         if (l) { c2.codeSize = ln * 4; c2.pCode = l; if (g_csm_next(d, &c2, a, &lm)) lm = VK_NULL_HANDLE; free(l); }
-        pthread_mutex_lock(&g_twmu);
-        if (lm && g_ntw == g_twcap) { size_t nc = g_twcap ? 2 * g_twcap : 256; pfb_twin *n = realloc(g_tw, nc * sizeof *n); if (n) { g_tw = n; g_twcap = nc; } }
-        if (lm && g_ntw < g_twcap) { g_tw[g_ntw++] = (pfb_twin){*m, lm, kind}; atomic_fetch_add_explicit(&g_tw_gen, 1, memory_order_release); lm = VK_NULL_HANDLE; }
-        pthread_mutex_unlock(&g_twmu);
+        pfb_twin_record(*m, &lm, kind);
         if (lm || !l) {   // no twin: the module without the mode serves every pipeline (late tests: correct, slower)
             if (lm) g_dsm_next(d, lm, a);
             g_dsm_next(d, *m, a); *m = VK_NULL_HANDLE;
@@ -305,7 +319,14 @@ static VkResult VKAPI_CALL csm_pfb(VkDevice d, const VkShaderModuleCreateInfo *c
 static void VKAPI_CALL dsm_pfb(VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) {
     VkShaderModule late = VK_NULL_HANDLE;
     if (m) { pthread_mutex_lock(&g_twmu);
-             for (size_t i = 0; i < g_ntw; i++) if (g_tw[i].early == m) { late = g_tw[i].late; g_tw[i] = g_tw[--g_ntw]; atomic_fetch_add_explicit(&g_tw_gen, 1, memory_order_release); break; }
+             if (vka_tbuf_vl_fast_on() && !g_pfb_map_over) {
+                 uint64_t lu = 0u; uint32_t idx = 0u;
+                 if (vka_pfb_map_del(&g_pfb_map, (uint64_t)(uintptr_t)m, &lu, &idx) && idx < g_ntw) {
+                     late = (VkShaderModule)(uintptr_t)lu; g_tw[idx] = g_tw[--g_ntw];
+                     if (idx < g_ntw) vka_pfb_map_set_idx(&g_pfb_map, (uint64_t)(uintptr_t)g_tw[idx].early, idx);
+                     atomic_fetch_add_explicit(&g_tw_gen, 1, memory_order_release);
+                 }
+             } else for (size_t i = 0; i < g_ntw; i++) if (g_tw[i].early == m) { late = g_tw[i].late; g_tw[i] = g_tw[--g_ntw]; atomic_fetch_add_explicit(&g_tw_gen, 1, memory_order_release); break; }
              pthread_mutex_unlock(&g_twmu); }
     if (late) g_dsm_next(d, late, a);
     g_dsm_next(d, m, a);
@@ -324,7 +345,10 @@ VkShaderModule vka_shader_pfb_pick(VkShaderModule m, int a2c, int alpha_func) {
     VkShaderModule r = m, late = VK_NULL_HANDLE;
     pthread_mutex_lock(&g_twmu);
     if (t) gen = atomic_load_explicit(&g_tw_gen, memory_order_relaxed);
-    for (size_t i = 0; i < g_ntw; i++) if (g_tw[i].early == m) {
+    if (vka_tbuf_vl_fast_on() && !g_pfb_map_over) {
+        uint64_t lu = 0u;
+        if (vka_pfb_map_find(&g_pfb_map, (uint64_t)(uintptr_t)m, &lu, &kind)) { late = (VkShaderModule)(uintptr_t)lu; if (a2c || (kind == 2 && alpha_func)) r = late; }
+    } else for (size_t i = 0; i < g_ntw; i++) if (g_tw[i].early == m) {
         late = g_tw[i].late; kind = g_tw[i].kind;
         if (a2c || (kind == 2 && alpha_func)) r = late;
         break;
