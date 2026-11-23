@@ -54,8 +54,10 @@ final class WarriorsCompanionDraw {
         p.setColor(m.borderColor());
         c.drawLine(0f, 92f, LOGIC_W, 92f, p);
 
-        drawCrest(c, 52f, 46f, 22f, m.primaryColor(), m.gameKind == WarriorsCompanionModel.GAME_AOC);
-        drawText(c, m.headerTitle(), 90f, 54f, 24f, 0xFFF2F5F7, true, Paint.Align.LEFT);
+        boolean aoc = m.gameKind == WarriorsCompanionModel.GAME_AOC;
+        drawCrest(c, 50f, 50f, 21f, m.primaryColor(), aoc);
+        drawText(c, aoc ? "SHEIKAH SLATE" : "ZONAI PAD", 86f, 44f, 21f, 0xFFF2F5F7, true, Paint.Align.LEFT);
+        drawText(c, aoc ? "AGE OF CALAMITY" : "AGE OF IMPRISONMENT", 86f, 67f, 14f, m.primaryColor(), true, Paint.Align.LEFT);
 
         for (int i = 0; i < WarriorsCompanionModel.TAB_COUNT; i++) {
             float l = 476f + i * 154f;
