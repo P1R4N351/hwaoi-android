@@ -54,38 +54,11 @@ final class WarriorsCompanionDraw {
         p.setColor(m.borderColor());
         c.drawLine(0f, 92f, LOGIC_W, 92f, p);
 
-        boolean aoc = m.gameKind == WarriorsCompanionModel.GAME_AOC;
-        drawCrest(c, 50f, 50f, 21f, m.primaryColor(), aoc);
-        drawText(c, aoc ? "SHEIKAH SLATE" : "ZONAI PAD", 86f, 44f, 21f, 0xFFF2F5F7, true, Paint.Align.LEFT);
-        drawText(c, aoc ? "AGE OF CALAMITY" : "AGE OF IMPRISONMENT", 86f, 67f, 14f, m.primaryColor(), true, Paint.Align.LEFT);
-
         for (int i = 0; i < WarriorsCompanionModel.TAB_COUNT; i++) {
-            float l = 476f + i * 154f;
+            float l = 24f + i * 302f;
             boolean sel = m.activeTab() == i;
-            drawButton(c, l, 18f, l + 146f, 82f, m, sel, sel ? m.primaryColor() : m.borderColor(),
-                    WarriorsCompanionModel.tabName(i), null, 20f);
-        }
-        int sc = m.writeSafe ? 0xFF34D399 : (m.moviePlaying ? 0xFFF59E0B : 0xFFEF4444);
-        String st = m.moviePlaying ? "MOVIE" : m.hostPaused ? "PAUSED" : m.writeSafe ? "LIVE" : "WAIT";
-        String fps = m.fps > 0.5f ? String.format(Locale.ROOT, "%.0f FPS", m.fps) : "-- FPS";
-        drawPill(c, 1094f, 18f, 1216f, 82f, 0xFF0A0D12, sc, st, fps);
-    }
-
-    private void drawCrest(Canvas c, float cx, float cy, float r, int col, boolean starGear) {
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(2.6f);
-        p.setColor(col);
-        c.drawCircle(cx, cy, r, p);
-        if (starGear) {
-            for (int i = 0; i < 8; i++) {
-                double a = i * Math.PI / 4.0;
-                c.drawLine(cx + (float) Math.cos(a) * r * 0.65f, cy + (float) Math.sin(a) * r * 0.65f,
-                        cx + (float) Math.cos(a) * r * 1.15f, cy + (float) Math.sin(a) * r * 1.15f, p);
-            }
-        } else {
-            p.setColor(0xFFE8B84B);
-            c.drawCircle(cx, cy, r * 0.52f, p);
-            c.drawLine(cx - r * 0.8f, cy, cx + r * 0.8f, cy, p);
+            drawButton(c, l, 14f, l + 286f, 78f, m, sel, sel ? m.primaryColor() : m.borderColor(),
+                    WarriorsCompanionModel.tabName(i), null, 22f);
         }
     }
 
@@ -100,8 +73,8 @@ final class WarriorsCompanionDraw {
     }
 
     private void drawRadar(Canvas c, WarriorsCompanionModel m, float cx, float cy, float R) {
-        drawText(c, "BATTLEFIELD RADAR \u00b7 " + (int) m.radiusMeters() + "m", 44f, 146f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
-        drawText(c, String.format(Locale.ROOT, "INERTIAL STICK VECTOR  HDG %03d\u00b0", Math.round(m.yawDeg) % 360),
+        drawText(c, "RADAR \u00b7 " + (int) m.radiusMeters() + "m", 44f, 146f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, String.format(Locale.ROOT, "%03d\u00b0", ((Math.round(m.yawDeg) % 360) + 360) % 360),
                 716f, 146f, 18f, 0xFF94A3B8, false, Paint.Align.RIGHT);
 
         p.setStyle(Paint.Style.FILL);
@@ -182,18 +155,18 @@ final class WarriorsCompanionDraw {
 
     private void drawRadarFooter(Canvas c, WarriorsCompanionModel m) {
         drawButton(c, 24f, 952f, 194f, 1048f, m, false, m.borderColor(),
-                "ZOOM " + (int) m.radiusMeters() + "m", "CYCLE RANGE", 19f);
+                "ZOOM " + (int) m.radiusMeters() + "m", null, 19f);
         drawButton(c, 204f, 952f, 374f, 1048f, m, m.headingUp, m.primaryColor(),
-                m.headingUp ? "HEADING-UP" : "NORTH-UP", "ORIENTATION", 19f);
+                m.headingUp ? "HEADING UP" : "NORTH UP", null, 19f);
         drawButton(c, 384f, 952f, 554f, 1048f, m, true, m.secondaryColor(),
-                "DROP " + WarriorsCompanionModel.pinPreset(m.pinPresetIdx), "PINS " + m.pinCount() + "/8", 19f);
+                "PIN " + WarriorsCompanionModel.pinPreset(m.pinPresetIdx), null, 19f);
         drawButton(c, 564f, 952f, 736f, 1048f, m, false, 0xFF7F1D1D,
-                "CLEAR PINS", "REMOVE ALL", 19f);
+                "CLEAR", null, 19f);
     }
 
     private void drawTagPalette(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 756f, 108f, 1216f, 290f, m);
-        drawText(c, "QUICK TACTICAL PINS", 774f, 142f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "PINS", 774f, 142f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
         for (int i = 0; i < 5; i++) {
             int col = i % 3, row = i / 3;
             float l = 774f + col * 144f, t = 160f + row * 60f;
@@ -205,7 +178,7 @@ final class WarriorsCompanionDraw {
 
     private void drawPinList(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 756f, 306f, 1216f, 626f, m);
-        drawText(c, "ACTIVE WAYPOINTS (" + m.pinCount() + "/8)", 774f, 340f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "WAYPOINTS  " + m.pinCount() + "/8", 774f, 340f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
         int row = 0;
         for (int i = 0; i < WarriorsCompanionModel.PIN_CAP && row < 6; i++) {
             if (!m.pinActive[i]) continue;
@@ -217,13 +190,13 @@ final class WarriorsCompanionDraw {
             row++;
         }
         if (row == 0) {
-            drawText(c, "Tap a tag above to mark current position", 986f, 488f, 19f, 0xFF64748B, false, Paint.Align.CENTER);
+            drawText(c, "None", 986f, 488f, 19f, 0xFF64748B, false, Paint.Align.CENTER);
         }
     }
 
     private void drawStopwatchCard(Canvas c, WarriorsCompanionModel m, long nowMs) {
         drawCard(c, 756f, 642f, 1216f, 836f, m);
-        drawText(c, "BATTLE STOPWATCH", 774f, 676f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "TIMER", 774f, 676f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
         drawText(c, m.formatTimer(nowMs), 986f, 744f, 44f, 0xFFFFFFFF, true, Paint.Align.CENTER);
         drawButton(c, 774f, 766f, 980f, 822f, m, m.timerRunning(), m.primaryColor(),
                 m.timerRunning() ? "PAUSE" : "START", null, 20f);
@@ -232,21 +205,21 @@ final class WarriorsCompanionDraw {
 
     private void drawKeepCard(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 756f, 852f, 1216f, 1048f, m);
-        drawText(c, "KEEPS / OBJECTIVES", 774f, 886f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "KEEPS", 774f, 886f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
         drawText(c, String.valueOf(m.keepCount), 986f, 954f, 44f, m.secondaryColor(), true, Paint.Align.CENTER);
         drawButton(c, 774f, 978f, 868f, 1034f, m, false, m.borderColor(), "-1", null, 22f);
         drawButton(c, 878f, 978f, 972f, 1034f, m, false, m.primaryColor(), "+1", null, 22f);
         drawButton(c, 982f, 978f, 1076f, 1034f, m, false, m.secondaryColor(), "+10", null, 22f);
-        drawButton(c, 1086f, 978f, 1198f, 1034f, m, false, 0xFF7F1D1D, "ZERO", null, 19f);
+        drawButton(c, 1086f, 978f, 1198f, 1034f, m, false, 0xFF7F1D1D, "RESET", null, 19f);
     }
 
     private void drawCommandTab(Canvas c, WarriorsCompanionModel m) {
-        drawText(c, "PARTY SWITCHER  (ZERO-PAUSE D-PAD)", 24f, 138f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "PARTY", 24f, 138f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
         for (int i = 0; i < 4; i++) {
             float l = 24f + i * 300f;
             boolean sel = m.activeParty == i;
             drawButton(c, l, 152f, l + 292f, 290f, m, sel, sel ? m.primaryColor() : m.borderColor(),
-                    "WARRIOR " + (i + 1), WarriorsCompanionModel.partyDirLabel(i), 26f);
+                    String.valueOf(i + 1), WarriorsCompanionModel.partyDirLabel(i), 28f);
         }
         drawDeckCard(c, m, 24f, 310f, 610f, 842f, true);
         drawDeckCard(c, m, 630f, 310f, 1216f, 842f, false);
@@ -256,8 +229,8 @@ final class WarriorsCompanionDraw {
     private void drawDeckCard(
         Canvas c, WarriorsCompanionModel m, float l, float t, float r, float b, boolean rDeck) {
         drawCard(c, l, t, r, b, m);
-        String hdr = rDeck ? (m.gameKind == WarriorsCompanionModel.GAME_AOC ? "SHEIKAH RUNES  [R + FACE]" : "SYNC & ZONAI ARTS  [R + FACE]")
-                : (m.gameKind == WarriorsCompanionModel.GAME_AOC ? "ELEMENTAL RODS & HEAL  [L + FACE]" : "ZONAI DEVICES & RATION  [L + FACE]");
+        String hdr = rDeck ? (m.gameKind == WarriorsCompanionModel.GAME_AOC ? "RUNES (R)" : "ARTS (R)")
+                : (m.gameKind == WarriorsCompanionModel.GAME_AOC ? "RODS (L)" : "DEVICES (L)");
         drawText(c, hdr, l + 20f, t + 42f, 21f, rDeck ? m.primaryColor() : m.secondaryColor(), true, Paint.Align.LEFT);
         for (int i = 0; i < 4; i++) {
             int col = i & 1, row = i >> 1;
@@ -274,44 +247,37 @@ final class WarriorsCompanionDraw {
 
     private void drawUtilityStrip(Canvas c, WarriorsCompanionModel m) {
         drawButton(c, 24f, 868f, 316f, 1040f, m, m.seqActive && m.seqTag == WarriorsCompanionModel.ACT_LOCKON,
-                m.primaryColor(), "LOCK-ON", "RIGHT STICK PRESS", 24f);
+                m.primaryColor(), "LOCK-ON", "RS", 24f);
         drawButton(c, 324f, 868f, 616f, 1040f, m, m.seqActive && m.seqTag == WarriorsCompanionModel.ACT_SPECIAL,
-                m.secondaryColor(), "SPECIAL MUSOU", "FACE [A]", 24f);
+                m.secondaryColor(), "SPECIAL", "A", 24f);
         drawButton(c, 624f, 868f, 916f, 1040f, m, m.seqActive && m.seqTag == WarriorsCompanionModel.ACT_DODGE,
-                m.primaryColor(), "DODGE / CANCEL", "FACE [B]", 24f);
+                m.primaryColor(), "DODGE", "B", 24f);
         drawButton(c, 924f, 868f, 1216f, 1040f, m, m.seqActive,
-                m.seqActive ? 0xFFEF4444 : 0xFF7F1D1D, "ABORT CHORD", m.seqActive ? "CANCEL ACTIVE" : "IDLE", 24f);
+                m.seqActive ? 0xFFEF4444 : 0xFF7F1D1D, "STOP", m.seqActive ? "ACTIVE" : null, 24f);
     }
 
     private void drawGrimoireTab(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 24f, 108f, 1216f, 188f, m);
-        drawText(c, "MUSOU COMBO GRIMOIRE  (Y \u2192 X STRINGS)", 44f, 156f, 22f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "COMBOS", 44f, 156f, 22f, m.primaryColor(), true, Paint.Align.LEFT);
         drawButton(c, 680f, 118f, 990f, 178f, m, m.macroMode, m.secondaryColor(),
-                m.macroMode ? "MODE: 1-TAP MACRO" : "MODE: REFERENCE", null, 19f);
-        drawButton(c, 1006f, 118f, 1200f, 178f, m, m.seqActive, 0xFFEF4444, "ABORT", null, 20f);
+                m.macroMode ? "TAP: RUN" : "TAP: OFF", null, 19f);
+        String stopLbl = m.seqActive ? ("STOP " + (m.seqStep + 1) + "/" + Math.max(1, m.seqCount)) : "STOP";
+        drawButton(c, 1006f, 118f, 1200f, 178f, m, m.seqActive, 0xFFEF4444, stopLbl, null, 20f);
 
         for (int i = 0; i < 6; i++) {
             int col = i % 3, row = i / 3;
-            float l = 24f + col * 402f, t = 208f + row * 372f;
+            float l = 24f + col * 402f, t = 212f + row * 408f;
             boolean active = m.seqActive && m.seqTag == (WarriorsCompanionModel.ACT_COMBO_BASE + i);
-            drawComboCard(c, m, i, l, t, l + 388f, t + 352f, active);
+            drawComboCard(c, m, i, l, t, l + 388f, t + 384f, active);
         }
-        drawCard(c, 24f, 966f, 1216f, 1048f, m);
-        String msg = m.seqActive ? String.format(Locale.ROOT, "EXECUTING TAG %d  (STEP %d / %d)  \u2014  MANUAL PRESS ABORTS",
-                m.seqTag, m.seqStep + 1, Math.max(1, m.seqCount))
-                : "Manual A / B / X / Y / L / R presses immediately abort any running macro chord.";
-        drawText(c, msg, 620f, 1016f, 20f, m.seqActive ? m.secondaryColor() : 0xFF94A3B8, m.seqActive, Paint.Align.CENTER);
     }
 
     private void drawComboCard(
         Canvas c, WarriorsCompanionModel m, int idx, float l, float t, float r, float b, boolean active) {
         drawCardHighlight(c, l, t, r, b, m, active ? m.secondaryColor() : m.borderColor(), active);
-        drawText(c, WarriorsCompanionModel.comboTitle(idx), l + 24f, t + 54f, 34f, m.primaryColor(), true, Paint.Align.LEFT);
-        drawText(c, WarriorsCompanionModel.comboRole(idx), r - 20f, t + 50f, 20f, 0xFFF8FAFC, true, Paint.Align.RIGHT);
-        drawComboNodes(c, m, idx, l + 36f, t + 184f, active);
-        drawText(c, WarriorsCompanionModel.comboChain(idx), (l + r) * 0.5f, t + 286f, 24f, 0xFFCBD5E1, false, Paint.Align.CENTER);
-        String hint = m.macroMode ? (active ? "RUNNING..." : "TAP TO EXECUTE") : "INSPECT ONLY";
-        drawText(c, hint, (l + r) * 0.5f, t + 328f, 18f, active ? m.secondaryColor() : 0xFF64748B, active, Paint.Align.CENTER);
+        drawText(c, WarriorsCompanionModel.comboTitle(idx), l + 24f, t + 56f, 34f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, WarriorsCompanionModel.comboRole(idx), r - 22f, t + 52f, 20f, 0xFFF8FAFC, true, Paint.Align.RIGHT);
+        drawComboNodes(c, m, idx, l + 36f, t + 210f, active);
     }
 
     private void drawComboNodes(
@@ -340,10 +306,10 @@ final class WarriorsCompanionDraw {
 
     private void drawSparklineCard(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 24f, 108f, 740f, 560f, m);
-        drawText(c, "FRAME PACING & SPARKLINE", 46f, 146f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "FPS", 46f, 146f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
         String headline = m.fps > 0.5f
-                ? String.format(Locale.ROOT, "%.1f FPS   \u00b7   %.1f ms", m.fps, m.frameMs)
-                : "--.- FPS   \u00b7   --.- ms";
+                ? String.format(Locale.ROOT, "%.1f FPS  \u00b7  %.1f ms", m.fps, m.frameMs)
+                : "-- FPS";
         drawText(c, headline, 46f, 210f, 38f, 0xFFFFFFFF, true, Paint.Align.LEFT);
 
         float gx = 46f, gy = 250f, gw = 670f, gh = 270f;
@@ -371,42 +337,37 @@ final class WarriorsCompanionDraw {
 
     private void drawEngineCard(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 756f, 108f, 1216f, 560f, m);
-        drawText(c, "ENGINE & PRESENTATION STATE", 778f, 146f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
-        String tid = m.gameKind == WarriorsCompanionModel.GAME_AOC ? "01002B00111A2000 (1.3.0)" : "04003F40232DE000 (v196608)";
-        drawKvRow(c, 778f, 1196f, 210f, "TITLE ID", tid, 0xFFF1F5F9);
-        drawKvRow(c, 778f, 1196f, 270f, "STATUS", m.writeSafe ? "READY / ACTIVE" : m.moviePlaying ? "CUTSCENE MOVIE" : "WAITING", m.primaryColor());
-        drawKvRow(c, 778f, 1196f, 330f, "PRESENTED", String.valueOf(m.presents), 0xFFF1F5F9);
-        drawKvRow(c, 778f, 1196f, 390f, "VIDEO DECODER", m.moviePlaying ? "ACTIVE (AUTO-DIM)" : "IDLE", m.moviePlaying ? m.secondaryColor() : 0xFF94A3B8);
-        drawKvRow(c, 778f, 1196f, 450f, "PHYSICAL INPUT", m.inputActive ? "LIVE SIGNAL" : "IDLE", m.inputActive ? 0xFF34D399 : 0xFF94A3B8);
-        drawKvRow(c, 778f, 1196f, 510f, "RENDER PATH", "Procedural Canvas (Zero Assets)", 0xFF94A3B8);
+        drawText(c, "GAME", 778f, 146f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
+        String st = m.moviePlaying ? "VIDEO" : m.hostPaused ? "PAUSED" : m.writeSafe ? "READY" : "WAIT";
+        drawKvRow(c, 778f, 1196f, 220f, "STATE", st, m.primaryColor());
+        drawKvRow(c, 778f, 1196f, 295f, "FRAMES", String.valueOf(m.presents), 0xFFF1F5F9);
+        drawKvRow(c, 778f, 1196f, 370f, "INPUT", m.inputActive ? "ACTIVE" : "IDLE", m.inputActive ? 0xFF34D399 : 0xFF94A3B8);
+        String tid = m.gameKind == WarriorsCompanionModel.GAME_AOC ? "01002B00111A2000" : "04003F40232DE000";
+        drawKvRow(c, 778f, 1196f, 445f, "TITLE", tid, 0xFF94A3B8);
     }
 
     private void drawSaveCard(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 24f, 580f, 610f, 1048f, m);
-        drawText(c, "SAVE DATA LEDGER", 46f, 618f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
-        drawKvRow(c, 46f, 590f, 690f, "STORE BLOB", m.saveFileName(), 0xFFF8FAFC);
-        drawKvRow(c, 46f, 590f, 760f, "SESSION COMMITS", String.valueOf(m.saveCommits), m.secondaryColor());
-        String age = m.lastSaveAgeS < 0 ? "No commit this session" : (m.lastSaveAgeS + "s ago");
-        drawKvRow(c, 46f, 590f, 830f, "LAST AUTOSAVE", age, 0xFFF1F5F9);
-        drawKvRow(c, 46f, 590f, 900f, "STORAGE STATE", m.saveBusy ? "WRITING..." : "IDLE / DURABLE", m.saveBusy ? 0xFFF59E0B : 0xFF34D399);
+        drawText(c, "SAVES", 46f, 618f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawKvRow(c, 46f, 590f, 695f, "FILE", m.saveFileName(), 0xFFF8FAFC);
+        drawKvRow(c, 46f, 590f, 780f, "SAVED", String.valueOf(m.saveCommits), m.secondaryColor());
+        String last = m.saveBusy ? "Saving" : (m.lastSaveAgeS < 0 ? "\u2014" : (m.lastSaveAgeS + "s ago"));
+        drawKvRow(c, 46f, 590f, 865f, "LAST", last, m.saveBusy ? 0xFFF59E0B : 0xFFF1F5F9);
     }
 
     private void drawBifrostCard(Canvas c, WarriorsCompanionModel m) {
         drawCard(c, 630f, 580f, 1216f, 1048f, m);
-        drawText(c, "COMPANION & BIFROST SYNC", 652f, 618f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
+        drawText(c, "DISPLAY", 652f, 618f, 20f, m.primaryColor(), true, Paint.Align.LEFT);
         drawButton(c, 652f, 650f, 1194f, 742f, m, m.autoDim, m.primaryColor(),
-                "CUTSCENE AUTO-DIM: " + (m.autoDim ? "ON" : "OFF"), "TAP TO TOGGLE MOVIE DIMMING", 21f);
-        drawKvRow(c, 652f, 1196f, 800f, "STICK LED THEME", m.bifrostLookDesc(), m.secondaryColor());
-        drawKvRow(c, 652f, 1196f, 870f, "AMOLED ORBIT", String.format(Locale.ROOT, "(%d, %d) px / 60s", m.orbitDx(), m.orbitDy()), 0xFF94A3B8);
-        drawKvRow(c, 652f, 1196f, 940f, "COMPLIANCE", "MIT Clean-Room / Host-Safe", 0xFF34D399);
+                "AUTO-DIM VIDEO: " + (m.autoDim ? "ON" : "OFF"), null, 21f);
+        drawKvRow(c, 652f, 1196f, 820f, "LED", m.bifrostLookDesc(), m.secondaryColor());
     }
 
     private void drawDimVeil(Canvas c, WarriorsCompanionModel m) {
         p.setStyle(Paint.Style.FILL);
         p.setColor(0xC2050608);
         c.drawRect(0f, 92f, LOGIC_W, LOGIC_H, p);
-        drawPill(c, 430f, 480f, 810f, 600f, m.cardColor(), m.secondaryColor(),
-                "CUTSCENE \u00b7 AUTO-DIM", "INPUT CHORDS LOCKED");
+        drawPill(c, 480f, 490f, 760f, 590f, m.cardColor(), m.secondaryColor(), "VIDEO", null);
     }
 
     private void drawCard(Canvas c, float l, float t, float r, float b, WarriorsCompanionModel m) {

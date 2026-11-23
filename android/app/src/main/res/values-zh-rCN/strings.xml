@@ -1353,7 +1353,6 @@
     <string name="game_stick_leds_bifrost">摇杆灯效 (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">在 AYN Thor 上随心心、暂停界面与时之笛变化（启动时生效）</string>
     <string name="game_stick_leds_bifrost_off">由 Bifrost 自行控制 AYN Thor 摇杆灯效</string>
-    <string name="game_companion_hud">副屏伴侣 HUD</string>
-    <string name="game_companion_drawer">副屏伴侣抽屉（战术雷达、指令与连招图鉴）</string>
-    <string name="game_companion_display4_note">检测到内置副屏 Display 4 时自动显示</string>
+    <string name="game_companion_hud">副屏</string>
+    <string name="game_companion_drawer">在主屏幕显示</string>
 </resources>

@@ -560,7 +560,6 @@ final class SidePanel extends FrameLayout {
             drawer.setChecked(ga.companionDrawerOpen());
             drawer.setOnCheckedChangeListener((b, on) -> ga.companionDrawer(on));
             box.addView(drawer);
-            note(Tx.s(R.string.game_companion_display4_note));
         }
         final boolean allHidden = Prefs.clean(act);
         Button clean = actionButton(Tx.s(allHidden ? R.string.game_show_everything : R.string.game_hide_everything_clean_picture), false);

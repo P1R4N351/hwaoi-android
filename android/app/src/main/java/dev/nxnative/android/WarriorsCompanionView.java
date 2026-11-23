@@ -62,10 +62,10 @@ final class WarriorsCompanionView extends View {
     }
 
     private boolean handleHeaderTap(float lx, float ly) {
-        if (ly < 18f || ly > 82f) return false;
+        if (ly < 10f || ly > 86f) return false;
         for (int i = 0; i < WarriorsCompanionModel.TAB_COUNT; i++) {
-            float left = 476f + i * 154f;
-            if (lx >= left && lx <= left + 146f) {
+            float left = 24f + i * 302f;
+            if (lx >= left && lx <= left + 286f) {
                 model.selectTab(i);
                 actions.onTabSelected(i);
                 return true;
@@ -162,8 +162,8 @@ final class WarriorsCompanionView extends View {
             if (lx >= 1006f && lx <= 1200f) { actions.onAbortChord(); return true; }
         }
         for (int i = 0; i < 6; i++) {
-            float bl = 24f + (i % 3) * 402f, bt = 208f + (i / 3) * 372f;
-            if (lx >= bl && lx <= bl + 388f && ly >= bt && ly <= bt + 352f) {
+            float bl = 24f + (i % 3) * 402f, bt = 212f + (i / 3) * 408f;
+            if (lx >= bl && lx <= bl + 388f && ly >= bt && ly <= bt + 384f) {
                 if (model.macroMode) actions.onFireAction(WarriorsCompanionModel.ACT_COMBO_BASE + i);
                 return true;
             }

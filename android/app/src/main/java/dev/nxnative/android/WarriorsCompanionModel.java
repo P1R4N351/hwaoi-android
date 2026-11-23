@@ -200,20 +200,17 @@ public final class WarriorsCompanionModel {
     public int borderColor() { return gameKind == GAME_AOC ? 0xFF28374A : 0xFF332F28; }
     public int primaryColor() { return gameKind == GAME_AOC ? 0xFF38BDF8 : 0xFF5AC8B8; }
     public int secondaryColor() { return gameKind == GAME_AOC ? 0xFFEAB308 : 0xFFE8B84B; }
-    public String headerTitle() {
-        return gameKind == GAME_AOC ? "SHEIKAH SLATE \u00b7 AGE OF CALAMITY" : "ZONAI PAD \u00b7 AGE OF IMPRISONMENT";
-    }
-    public String saveFileName() { return gameKind == GAME_AOC ? "svdt \u00b7 1.0 MiB" : "DATA.BIN \u00b7 8.0 MiB"; }
+    public String saveFileName() { return gameKind == GAME_AOC ? "svdt" : "DATA.BIN"; }
     public String bifrostLookDesc() {
-        return gameKind == GAME_AOC ? "Sheikah Cyan / Gold" : "Zonai Jade / Amber";
+        return gameKind == GAME_AOC ? "Cyan / Gold" : "Jade / Amber";
     }
 
     public static String tabName(int t) {
         switch (t) {
-            case TAB_TACTICAL: return "TACTICAL";
-            case TAB_COMMAND: return "COMMAND";
-            case TAB_GRIMOIRE: return "GRIMOIRE";
-            case TAB_LEDGER: return "LEDGER";
+            case TAB_TACTICAL: return "RADAR";
+            case TAB_COMMAND: return "ACTIONS";
+            case TAB_GRIMOIRE: return "COMBOS";
+            case TAB_LEDGER: return "STATUS";
             default: return "";
         }
     }
@@ -232,13 +229,13 @@ public final class WarriorsCompanionModel {
     public static String rDeckTitle(int kind, int slot) {
         if (kind == GAME_AOC) {
             switch (slot) {
-                case 0: return "Remote Bombs"; case 1: return "Stasis";
+                case 0: return "Bombs"; case 1: return "Stasis";
                 case 2: return "Cryonis"; default: return "Magnesis";
             }
         }
         switch (slot) {
-            case 0: return "Sync Strike"; case 1: return "Zonai Art X";
-            case 2: return "Zonai Art B"; default: return "Unique Art A";
+            case 0: return "Sync"; case 1: return "Art X";
+            case 2: return "Art B"; default: return "Art A";
         }
     }
 
@@ -246,12 +243,12 @@ public final class WarriorsCompanionModel {
         if (kind == GAME_AOC) {
             switch (slot) {
                 case 0: return "Fire Rod"; case 1: return "Ice Rod";
-                case 2: return "Lightning Rod"; default: return "Apple Heal";
+                case 2: return "Lightning"; default: return "Heal";
             }
         }
         switch (slot) {
-            case 0: return "Flame Device"; case 1: return "Frost Device";
-            case 2: return "Shock Device"; default: return "Quick Ration";
+            case 0: return "Flame"; case 1: return "Frost";
+            case 2: return "Shock"; default: return "Ration";
         }
     }
 
@@ -264,8 +261,8 @@ public final class WarriorsCompanionModel {
 
     public static String partyDirLabel(int slot) {
         switch (slot) {
-            case 0: return "\u2191 D-UP"; case 1: return "\u2192 D-RIGHT";
-            case 2: return "\u2193 D-DOWN"; default: return "\u2190 D-LEFT";
+            case 0: return "\u2191 UP"; case 1: return "\u2192 RIGHT";
+            case 2: return "\u2193 DOWN"; default: return "\u2190 LEFT";
         }
     }
 
@@ -275,17 +272,9 @@ public final class WarriorsCompanionModel {
 
     public static String comboRole(int idx) {
         switch (idx) {
-            case 0: return "UNIQUE STRONG"; case 1: return "LAUNCHER";
-            case 2: return "STUN / BREAK"; case 3: return "CROWD SWEEP";
-            case 4: return "ELEMENT VORTEX"; default: return "DUAL FINISHER";
-        }
-    }
-
-    public static String comboChain(int idx) {
-        switch (idx) {
-            case 0: return "X"; case 1: return "Y \u00b7 X";
-            case 2: return "Y \u00b7 Y \u00b7 X"; case 3: return "Y \u00b7 Y \u00b7 Y \u00b7 X";
-            case 4: return "Y \u00b7 Y \u00b7 Y \u00b7 Y \u00b7 X"; default: return "Y \u00b7 Y \u00b7 Y \u00b7 Y \u00b7 Y \u00b7 X";
+            case 0: return "STRONG"; case 1: return "LAUNCH";
+            case 2: return "STUN"; case 3: return "SWEEP";
+            case 4: return "VORTEX"; default: return "FINISHER";
         }
     }
 

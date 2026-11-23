@@ -1374,7 +1374,6 @@
     <string name="game_stick_leds_bifrost">Підсвітка стіків (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">Відстежувати серця, меню паузи та окарину на AYN Thor (під час запуску)</string>
     <string name="game_stick_leds_bifrost_off">Залишити керування підсвіткою AYN Thor самому Bifrost</string>
-    <string name="game_companion_hud">HUD компаньйона</string>
-    <string name="game_companion_drawer">Панель компаньйона (Тактичний радар, Команди та Ґримуар)</string>
-    <string name="game_companion_display4_note">Автоматично показується на вбудованому екрані Display 4 за наявності</string>
+    <string name="game_companion_hud">Другий екран</string>
+    <string name="game_companion_drawer">Показати на головному екрані</string>
 </resources>

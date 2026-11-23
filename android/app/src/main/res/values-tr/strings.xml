@@ -1360,7 +1360,6 @@
     <string name="game_stick_leds_bifrost">Çubuk LED\'leri (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">AYN Thor\'da kalpleri, duraklatma menüsünü ve Okarinayı izle (başlatmada)</string>
     <string name="game_stick_leds_bifrost_off">AYN Thor çubuk LED\'lerini Bifrost\'un kendi denetimine bırak</string>
-    <string name="game_companion_hud">Yardımcı HUD</string>
-    <string name="game_companion_drawer">Yardımcı HUD çekmecesi (Taktik Radar, Komut ve Grimoire)</string>
-    <string name="game_companion_display4_note">Takılıysa yerleşik Display 4 ekranında otomatik gösterilir</string>
+    <string name="game_companion_hud">İkinci ekran</string>
+    <string name="game_companion_drawer">Ana ekranda göster</string>
 </resources>

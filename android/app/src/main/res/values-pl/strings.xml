@@ -1374,7 +1374,6 @@
     <string name="game_stick_leds_bifrost">Diody drążków (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">Śledź serca, menu pauzy i Okarynę na AYN Thor (od uruchomienia)</string>
     <string name="game_stick_leds_bifrost_off">Pozostaw diody drążków AYN Thor pod własną kontrolą Bifrost</string>
-    <string name="game_companion_hud">Ekran towarzysza</string>
-    <string name="game_companion_drawer">Szuflada towarzysza (Radar taktyczny, Polecenia i Grymuar)</string>
-    <string name="game_companion_display4_note">Automatycznie wyświetlane na wbudowanym ekranie Display 4, gdy jest dostępny</string>
+    <string name="game_companion_hud">Drugi ekran</string>
+    <string name="game_companion_drawer">Pokaż na głównym ekranie</string>
 </resources>

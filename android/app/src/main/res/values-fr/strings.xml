@@ -1367,7 +1367,6 @@
     <string name="game_stick_leds_bifrost">LED des sticks (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">Suivre les cœurs, le menu pause et l\'Ocarina sur AYN Thor (au lancement)</string>
     <string name="game_stick_leds_bifrost_off">Laisser Bifrost gérer les LED des sticks sur AYN Thor</string>
-    <string name="game_companion_hud">ATH compagnon</string>
-    <string name="game_companion_drawer">Tiroir compagnon (Radar tactique, Commandes et Grimoire)</string>
-    <string name="game_companion_display4_note">Affiché automatiquement sur l’écran intégré Display 4 lorsqu’il est présent</string>
+    <string name="game_companion_hud">Second écran</string>
+    <string name="game_companion_drawer">Afficher sur l’écran principal</string>
 </resources>
