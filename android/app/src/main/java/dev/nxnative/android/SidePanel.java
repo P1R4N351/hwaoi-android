@@ -724,7 +724,9 @@ final class SidePanel extends FrameLayout {
         sb.append(value);
         sb.setSpan(new android.text.style.ForegroundColorSpan(TEXT_SEC), s, sb.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         map.setText(sb);
-        map.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, Ui.icon(act, R.drawable.ic_chevron, FOCUS), null);
+        android.graphics.drawable.Drawable chev = act.getDrawable(R.drawable.ic_chevron);
+        if (chev != null) { chev = chev.mutate(); chev.setTint(FOCUS); }
+        map.setCompoundDrawablesRelativeWithIntrinsicBounds(null, null, chev, null);
         box.addView(map, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         return map;
     }
