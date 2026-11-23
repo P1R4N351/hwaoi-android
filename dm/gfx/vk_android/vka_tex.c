@@ -37,6 +37,7 @@
 #include "vka_treg_ub_fast.h"
 #include "vka_wk_prep_fast.h"
 #include "vka_wset_vin_fast.h"
+#include "vka_spill_gw_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -243,7 +244,8 @@ static vkl_index g_lvx;   // (under g_tmu)
 static vka_wbf_wait_list_t g_wbf_list;
 static inline void wbf_wait_add_locked(vka_img *im) { if (im && vka_wk_prep_fast_on()) vka_wbf_list_add(&g_wbf_list, im, &im->wbf_ix); }
 static inline void wbf_wait_del_locked(vka_img *im) { if (im && im->wbf_ix) vka_wbf_list_del(&g_wbf_list, &im->wbf_ix); }
-static void live_add(vka_img *im) { if (vkl_add(&g_live, &g_nlive, &g_livecap, &g_lvx, im)) g_live_gen++; }
+static vka_pool_bloom_t g_live_pool_bloom;
+static void live_add(vka_img *im) { if (vkl_add(&g_live, &g_nlive, &g_livecap, &g_lvx, im)) { g_live_gen++; if (im->pool) vka_pool_bloom_add(&g_live_pool_bloom, (uintptr_t)im->pool); } }
 enum { EDGE_HOT_CAP = 256 };
 static vka_img *g_edge_hot[EDGE_HOT_CAP]; static int g_nedge_hot;   // tracked images whose shared boundary pages stay writable (under g_tmu)
 static _Atomic uint64_t g_edge_skips, g_edge_unpins;
@@ -262,7 +264,7 @@ static void edge_hot_del(vka_img *im) {
     if (i < g_nedge_hot) { g_edge_hot[i] = last; __atomic_store_n(&last->edge_ix, i + 1, __ATOMIC_RELAXED); }
     __atomic_store_n(&im->edge_ix, 0, __ATOMIC_RELAXED);
 }
-static void live_del(vka_img *im) { wbf_wait_del_locked(im); edge_hot_del(im); if (vkl_del(g_live, &g_nlive, &g_lvx, im)) g_live_gen++; }
+static void live_del(vka_img *im) { wbf_wait_del_locked(im); edge_hot_del(im); if (vkl_del(g_live, &g_nlive, &g_lvx, im)) { g_live_gen++; if (!g_nlive) vka_pool_bloom_store(&g_live_pool_bloom, 0u); } }
 static vka_img *live_first(const uint8_t *mem, int *k) { return vkl_first(g_live, g_nlive, &g_lvx, mem, k); }   // the live images whose storage starts at mem: the first, then live_next
 static vka_img *live_next(const vka_img *im, const uint8_t *mem, int *k) { return vkl_next(g_live, g_nlive, &g_lvx, im, mem, k); }
 static vksm g_cpuw;   // (under g_tmu) serials the CPU wrote before their image existed (a set: vksm with no images)
@@ -867,11 +869,13 @@ enum { GW_COPY, GW_FILL, GW_UPDATE, GW_OPAQUE };
 typedef struct { uint64_t lo, hi, src, seq, fence; uint32_t kind, value; uint8_t *data; } gw_t;
 static gw_t *g_gw; static int g_ngw, g_gwcap; static uint64_t g_gwseq = 1, g_gw_over, g_gw_late;
 static vka_gw_summary g_gw_sum;
+static uint64_t g_gw_min_fence = UINT64_MAX; static uint32_t g_gw_unsealed_cnt;
 static void gw_sum_rebuild_locked(void) {
-    uint32_t cnt = 0, hcnt = 0;
+    uint32_t cnt = 0, hcnt = 0, ucnt = 0; uint64_t minf = UINT64_MAX;
     uint64_t mlo = 0, mhi = 0, blm = 0, hlo = 0, hhi = 0, hblm = 0;
     for (int i = 0; i < g_ngw; i++) {
         const gw_t *w = &g_gw[i];
+        if (w->fence) vka_gw_min_fence_note(&minf, w->fence); else ucnt++;
         if (!cnt || w->lo < mlo) mlo = w->lo;
         if (!cnt || w->hi > mhi) mhi = w->hi;
         blm |= vka_gw_bloom_mask(w->lo, w->hi); cnt++;
@@ -881,28 +885,42 @@ static void gw_sum_rebuild_locked(void) {
             hblm |= vka_gw_bloom_mask(w->lo, w->hi); hcnt++;
         }
     }
+    g_gw_min_fence = minf; g_gw_unsealed_cnt = ucnt;
     vka_gw_sum_publish(&g_gw_sum, cnt, mlo, mhi, blm, hcnt, hlo, hhi, hblm);
+}
+static int gw_try_dedup_locked(int kind, uint64_t dst, uint64_t n, const void *data, int lo) {
+    if (kind == GW_OPAQUE && g_ngw > 0 && !g_gw[g_ngw - 1].fence && g_gw[g_ngw - 1].kind == GW_OPAQUE &&
+        g_gw[g_ngw - 1].lo == dst && g_gw[g_ngw - 1].hi == dst + n) { g_gw[g_ngw - 1].seq = g_gwseq++; return 1; }
+    if (kind == GW_OPAQUE) for (int i = g_ngw - 1; i >= lo && !g_gw[i].fence; i--) {
+        if (g_gw[i].kind == GW_OPAQUE && g_gw[i].lo == dst && g_gw[i].hi == dst + n) {
+            gw_t w = g_gw[i]; if (i < g_ngw - 1) memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw);
+            w.seq = g_gwseq++; g_gw[g_ngw - 1] = w; return 1;
+        }
+    } else if (kind == GW_UPDATE) for (int i = g_ngw - 1; i >= lo && !g_gw[i].fence; i--) {
+        if (g_gw[i].kind == GW_COPY) break;
+        if (g_gw[i].kind == GW_UPDATE && g_gw[i].lo == dst && g_gw[i].hi == dst + n && g_gw[i].data) {
+            memcpy(g_gw[i].data, data, (size_t)n);
+            gw_t w = g_gw[i]; if (i < g_ngw - 1) memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw);
+            w.seq = g_gwseq++; g_gw[g_ngw - 1] = w; return 1;
+        }
+        if (g_gw[i].lo < dst + n && dst < g_gw[i].hi) break;
+    }
+    return 0;
 }
 static void gw_add(int kind, uint64_t dst, uint64_t n, uint64_t src, uint32_t value, const void *data) {
     if (!n) return;
     vka_tbuf_wrote(dst, n);   // (images of buffer textures over it are copied again at their next use)
     pthread_mutex_lock(&g_tmu);
     if (g_ngw == g_gwcap) { g_gwcap = g_gwcap ? 2 * g_gwcap : 256; g_gw = realloc(g_gw, (size_t)g_gwcap * sizeof *g_gw); }
-    if (kind == GW_OPAQUE)   // the same range again in this submission (a storage buffer bound by draw after draw): one entry, at the newest place
-        for (int i = g_ngw - 1; i >= 0 && i >= g_ngw - 16 && !g_gw[i].fence; i--) if (g_gw[i].kind == GW_OPAQUE && g_gw[i].lo == dst && g_gw[i].hi == dst + n) {
-            gw_t w = g_gw[i]; if (i < g_ngw - 1) memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w; pthread_mutex_unlock(&g_tmu); return; }
-    if (kind == GW_UPDATE)   // the same inline update range again in this submission (Splatoon Raiders' 1,550 occlusion queries: 11,010 updates to 7 ranges): overwrite in place
-        for (int i = g_ngw - 1; i >= 0 && i >= g_ngw - 16 && !g_gw[i].fence; i--) {
-            if (g_gw[i].kind == GW_COPY) break;
-            if (g_gw[i].kind == GW_UPDATE && g_gw[i].lo == dst && g_gw[i].hi == dst + n && g_gw[i].data) {
-                memcpy(g_gw[i].data, data, (size_t)n);
-                gw_t w = g_gw[i]; if (i < g_ngw - 1) memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w;
-                pthread_mutex_unlock(&g_tmu); return;
-            }
-            if (g_gw[i].lo < dst + n && dst < g_gw[i].hi) break;
+    int fast = vka_spill_gw_fast_on();
+    if (kind == GW_OPAQUE || kind == GW_UPDATE) {
+        if (!fast || vka_gw_can_dedup(g_gw_unsealed_cnt)) {
+            int lo = fast ? vka_gw_dedup_window(g_ngw, g_gw_unsealed_cnt) : (g_ngw > 16 ? g_ngw - 16 : 0);
+            if (gw_try_dedup_locked(kind, dst, n, data, lo)) { pthread_mutex_unlock(&g_tmu); return; }
         }
+    }
     uint8_t *cp = NULL; if (kind == GW_UPDATE && (cp = malloc(n))) memcpy(cp, data, n); else if (kind == GW_UPDATE) kind = GW_OPAQUE;
-    g_gw[g_ngw++] = (gw_t){dst, dst + n, src, g_gwseq++, 0, (uint32_t)kind, value, cp};
+    g_gw[g_ngw++] = (gw_t){dst, dst + n, src, g_gwseq++, 0, (uint32_t)kind, value, cp}; g_gw_unsealed_cnt++;
     vka_gw_sum_add(&g_gw_sum, dst, dst + n, kind == GW_OPAQUE || kind == GW_COPY);
     pthread_mutex_unlock(&g_tmu);
 }
@@ -935,11 +953,11 @@ static void gml_entry(void *arg, int k) {   // the bitmap: table entry k (1 + th
     if (k - 1 >= c->nchunks) return;
     uint64_t a = c->lo[k - 1], b = c->hi[k - 1];
     for (int j = g_ngw - 1; j >= 0 && j >= g_ngw - 32; j--) if (g_gw[j].kind == GW_OPAQUE && g_gw[j].lo <= a && g_gw[j].hi >= b) return;
-    gw_grow(); g_gw[g_ngw++] = (gw_t){a, b, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; vka_gw_sum_add(&g_gw_sum, a, b, 1); g_gml_pages += (b - a) >> 12;
+    gw_grow(); g_gw[g_ngw++] = (gw_t){a, b, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; vka_gw_min_fence_note(&g_gw_min_fence, c->fence); vka_gw_sum_add(&g_gw_sum, a, b, 1); g_gml_pages += (b - a) >> 12;
 }
 static void gml_page(void *arg, uint64_t a) {   // the page-hash set of an older ABI: the 4 KiB page at a was written
     gml_ctx *c = arg;
-    gw_grow(); g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; vka_gw_sum_add(&g_gw_sum, a, a + 4096, 1); g_gml_pages++;
+    gw_grow(); g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, c->fence, GW_OPAQUE, 0, NULL}; vka_gw_min_fence_note(&g_gw_min_fence, c->fence); vka_gw_sum_add(&g_gw_sum, a, a + 4096, 1); g_gml_pages++;
 }
 static void gml_poll(void) {   // caller holds g_tmu
     uint64_t done = vka_done();
@@ -1046,7 +1064,10 @@ static void watch_scan(VkCommandBuffer cb) {   // caller holds g_tmu and nvn_poo
 }
 void vka_tex_gw_commit(uint64_t fence) {   // the writes recorded since the last commit belong to this submission
     pthread_mutex_lock(&g_tmu);
-    for (int i = g_ngw - 1; i >= 0 && !g_gw[i].fence; i--) g_gw[i].fence = fence;
+    if (!vka_spill_gw_fast_on() || g_gw_unsealed_cnt) {
+        for (int i = g_ngw - 1; i >= 0 && !g_gw[i].fence; i--) g_gw[i].fence = fence;
+        if (fence) { vka_gw_min_fence_note(&g_gw_min_fence, fence); g_gw_unsealed_cnt = 0u; }
+    }
     for (int i = 0; i < GML_N; i++) if (g_gml[i].used && !g_gml[i].fence) g_gml[i].fence = fence;
     pthread_mutex_unlock(&g_tmu);
 }
@@ -2170,7 +2191,7 @@ static vka_img *tex_get_create_locked(const tex_t *t, VkCommandBuffer cb, int *t
                 if (im->serial != t->serial) vka_treg_sidx_mark_multi(&g_treg_sidx, (uintptr_t)im);
                 im->serial = t->serial;
             }
-            if (t->pool && (im->pool != t->pool || revived)) { uint64_t fin = nvn_pool_fin(), g = nvn_pool_live(t->pool, NULL, NULL); if (g) { im->pool = t->pool; im->pfin = fin; im->pgen = g; } } }
+            if (t->pool && (im->pool != t->pool || revived)) { uint64_t fin = nvn_pool_fin(), g = nvn_pool_live(t->pool, NULL, NULL); if (g) { im->pool = t->pool; im->pfin = fin; im->pgen = g; vka_pool_bloom_add(&g_live_pool_bloom, (uintptr_t)t->pool); } } }
         if (!im) im = level_child(t, &f);   // (a texture over mip levels of a live image: that image)
         if (im && !im->par) big_share(im, t);   // (another texture object of the same storage and shape: DM_VK_BIGIMG_MB diagnostic)
         uint32_t vmin = 0, base = sparse_sampled(t, &f) ? sparse_base(t->pool, t->mem, &t->d, &t->L, &vmin) : 0;
@@ -2249,20 +2270,21 @@ void vka_tex_drop(vka_img *im) {
 vka_img *vka_tex_ref(vka_img *im) { if (im) { pthread_mutex_lock(&g_tmu); im->refs++; im->holds++; img_touch_rec(im); } pthread_mutex_unlock(&g_tmu); return im; }
 void vka_tex_drop_pool(const void *pool) {
     if (!pool) return;
+    int sfast = vka_spill_gw_fast_on();
+    if (sfast && !vka_pool_bloom_may(&g_live_pool_bloom, (uintptr_t)pool)) return;
     pthread_mutex_lock(&g_tmu);
     int ndrop = 0;
     uint64_t bytes_dropped = 0;
     for (int i = 0; i < g_nlive; ) {
         vka_img *im = g_live[i];
         if (im->pool == pool) {
-            bytes_dropped += im->m.size;
-            ndrop++;
-            map_del_im(im);
-            im->refs = 1;
-            unref_locked(im);
-        } else {
-            i++;
-        }
+            bytes_dropped += im->m.size; ndrop++; map_del_im(im); im->refs = 1; unref_locked(im);
+        } else i++;
+    }
+    if (ndrop && sfast) {
+        uint64_t bm = 0u;
+        for (int i = 0; i < g_nlive; i++) if (g_live[i]->pool) bm |= vka_pool_bloom_bits((uintptr_t)g_live[i]->pool);
+        vka_pool_bloom_store(&g_live_pool_bloom, bm);
     }
     pthread_mutex_unlock(&g_tmu);
     if (ndrop) {
@@ -3760,9 +3782,11 @@ static void tex_gw_hit_locked(vka_img *im, const gw_t *w, VkCommandBuffer cb) {
 }
 static void tex_gw_reupload_locked(VkCommandBuffer cb) {
     static vka_img **by; static uint64_t *by_addr, *by_sz, *by_mend; static int bycap, nall; static uint64_t by_gen = ~0ull;
-    int nby = 0, k = 0, any = 0, keep = VKA_ENV("DM_VK_GW_SORT_KEEP", 1) != 0, fast = vka_wset_vin_fast_on();
+    int nby = 0, k = 0, any = 0, keep = VKA_ENV("DM_VK_GW_SORT_KEEP", 1) != 0, fast = vka_wset_vin_fast_on(), sfast = vka_spill_gw_fast_on();
     uint64_t maxsz = 0, done = vka_done();
+    if (sfast && !vka_gw_has_landed(g_gw_min_fence, done)) return;
     for (int i = 0; i < g_ngw && !any; i++) any = g_gw[i].fence && g_gw[i].fence <= done;
+    if (sfast && !any) return;
     if (any) {
         if (bycap < g_nlive) { bycap = g_nlive + 256; by = realloc(by, (size_t)bycap * sizeof *by); by_addr = realloc(by_addr, (size_t)bycap * sizeof *by_addr); by_sz = realloc(by_sz, (size_t)bycap * sizeof *by_sz); by_mend = realloc(by_mend, (size_t)bycap * sizeof *by_mend); by_gen = ~0ull; }
         if (keep) {

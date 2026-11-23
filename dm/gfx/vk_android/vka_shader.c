@@ -17,6 +17,7 @@
 #include "vka_rp_mod_fast.h"
 #include "vka_tbuf_vl_fast.h"
 #include "vka_mem_sparse_fast.h"
+#include "vka_spill_gw_fast.h"
 #include "plat/plat.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -901,6 +902,17 @@ int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask) {
     VkShaderModule m = vka_shader_fout_module(s, umask, smask);
     return m && m != vka_shader_module(s, DMSH_VK_MOD_BASE);
 }
+static void sh_init_btraits(vka_shader *s) {
+    if (!s || !s->e) return;
+    vka_sh_btraits_t bt = {0u, 0u};
+    for (unsigned i = 0u; s->b && i < s->e->bind_count; i++) {
+        const dmsh_vk_bind *b = &s->b[i];
+        int wr = (b->flags & (DMSH_VK_BF_RW | DMSH_VK_BF_ATOMIC | DMSH_VK_BF_NOSLOT)) || b->kind == DMSH_VK_KIND_GMEM_LOG || b->kind == DMSH_VK_KIND_UNKNOWN;
+        vka_sh_btraits_step(&bt, b->kind == DMSH_VK_KIND_SHARED_SPILL, b->bytes, wr);
+    }
+    s->sh_bflags = bt.flags ? bt.flags : VKA_SH_BF_READY;
+    s->spill_bytes = bt.spill_bytes;
+}
 // A new shader of key from L (not in the table yet)
 static vka_shader *make_new(const vka_shlib *L, uint64_t key) {
     vka_shader *s = calloc(1, sizeof *s); if (!s) return NULL;
@@ -909,7 +921,7 @@ static vka_shader *make_new(const vka_shlib *L, uint64_t key) {
     const char *why = NULL; char err[256] = "";
     if (!e) why = "not in the shader library";
     else {
-        s->e = e; s->b = vka_shlib_binds(L, e); s->chash = vka_shlib_entry_hash(L, e);
+        s->e = e; s->b = vka_shlib_binds(L, e); s->chash = vka_shlib_entry_hash(L, e); sh_init_btraits(s);
         why = refusal(L, e);
         const dmsh_vk_module *m = why ? NULL : vka_shlib_module(L, e, DMSH_VK_MOD_BASE);
         if (!why && !m) why = "no base module";

@@ -21,6 +21,7 @@
 #include "vka_scr_fast.h"
 #define VKA_EXEC_HAVE_OPS 1
 #include "vka_exec_fast.h"
+#include "vka_spill_gw_fast.h"
 
 typedef struct { uint64_t serial; p_set_rt rt; int has_rt; p_scissor sc; int has_sc; int64_t copy_stride, copy_img_stride; int rc_skip; vka_dstate d; } qstate;   // what a queue keeps between submissions (d: the draw state, vka_draw.c)
 static qstate S;
@@ -1625,7 +1626,8 @@ VkBuffer vka_qdx_ib(void) {
     if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &mem) || vk.vkBindBufferMemory(V.dev, b, mem, 0) || vk.vkMapMemory(V.dev, mem, 0, sz, 0, &p))
         return qdx_ib_fail(b, mem);
     uint32_t *ix = (uint32_t *)p;
-    for (uint32_t q = 0; q < QDX_MAX_QUADS; q++) {
+    if (vka_spill_gw_fast_on()) vka_fill_quad_ib_u32(ix, QDX_MAX_QUADS);
+    else for (uint32_t q = 0; q < QDX_MAX_QUADS; q++) {
         uint32_t v = q * 4;
         ix[q * 6 + 0] = v; ix[q * 6 + 1] = v + 1; ix[q * 6 + 2] = v + 2;
         ix[q * 6 + 3] = v; ix[q * 6 + 4] = v + 2; ix[q * 6 + 5] = v + 3;

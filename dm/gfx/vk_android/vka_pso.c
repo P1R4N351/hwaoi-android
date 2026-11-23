@@ -12,6 +12,7 @@
 #include "vka_pso_key_fast.h"
 #include "vka_psogate.h"
 #include "vka_pso_cache.h"
+#include "vka_spill_gw_fast.h"
 #include "vk_prewarm_seed.h"   // the profile's seed list (dm/games/<id>/vk_prewarm.bin; dm/games/game.py seed): dm_vk_prewarm_seed, dm_vk_prewarm_seed_len (0: none)
 #include "../nvn/nvn_mtl.h"
 #include <stdlib.h>
@@ -997,7 +998,9 @@ void vka_gpl_line(char *out, size_t n) {
 static pthread_mutex_t g_pw_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *g_pw_buf; static size_t g_pw_len, g_pw_cap; static uint32_t g_pw_n; static int g_pw_dirty;   // every record (loaded, then new), under g_pw_mu
 static uint64_t *g_pw_set; static size_t g_pw_setcap, g_pw_setn;   // their hashes
+_Static_assert(sizeof(pwrec) == 48 && offsetof(pwrec, klen) == 4 && offsetof(pwrec, key) == 8, "pwrec layout");
 static uint8_t *g_pw_load; static size_t g_pw_load_len; static uint32_t g_pw_load_n;   // the loaded records, read by the prewarm threads (not changed after pw_load)
+static vka_pw_sh_idx_t g_pw_sh_idx;
 static _Atomic uint32_t g_pw_next, g_pw_next_mesh, g_pw_tix, g_pw_done, g_pw_made, g_pw_had, g_pw_bad; static int g_pw_threads; static uint64_t g_pw_t0; static uint32_t g_pw_seed_n;
 static size_t pw_size(const pwrec *r) { return vka_pw_size(r); }
 static int pw_set_add(uint64_t h) {   // 1 = new
@@ -1073,7 +1076,9 @@ static void pw_load(void) {
         if (seed < 0) VRED("prewarm seed of the profile (vk_prewarm.bin, %u bytes): %s, not used: dm/tools/vk_prewarm.py makes it again from a run of this host", (unsigned)dm_vk_prewarm_seed_len, sw);
         else { g_pw_seed_n = (uint32_t)seed; if (seed) g_pw_dirty = 1; }   // (kept in this device's list from now on: the next save writes them)
     }
-    g_pw_load = malloc(g_pw_len ? g_pw_len : 1); if (g_pw_load) { memcpy(g_pw_load, g_pw_buf, g_pw_len); g_pw_load_len = g_pw_len; g_pw_load_n = g_pw_n; }
+    g_pw_load = malloc(g_pw_len ? g_pw_len : 1);
+    if (g_pw_load) { memcpy(g_pw_load, g_pw_buf, g_pw_len); g_pw_load_len = g_pw_len; g_pw_load_n = g_pw_n;
+        vka_pw_sh_idx_build(&g_pw_sh_idx, g_pw_load, g_pw_load_len, sizeof(pwrec), offsetof(pwrec, klen)); }
     pthread_mutex_unlock(&g_pw_mu);
     VLOG("prewarm list %s: %u pipeline keys (%d of earlier runs on this device, %d more from the profile's seed list%s)", g_pw_path, g_pw_load_n, own > 0 ? own : 0, seed > 0 ? seed : 0,
          !dm_vk_prewarm_seed_len ? ": the profile has none" : seed < 0 ? ": not used" : "");
@@ -1110,33 +1115,45 @@ static void pw_mark_bad(size_t off) {   // the record at off of the loaded list:
 // cannot help, only GPL or a faster compile); fields named = the list held a pipeline of the same shaders in another state (a state the key keeps that earlier runs did
 // not meet, or a field the key should not keep because the pipeline does not depend on it)
 // where: " on the frame path", or " in the background" for an asynchronous one (DM_VK_PSO_ASYNC; ms then counts from the miss)
+static const struct { const char *name; size_t lo, hi; } g_pw_fields[] = {
+    {"colour formats", offsetof(vka_gkey, cfmt), offsetof(vka_gkey, dfmt)}, {"depth format", offsetof(vka_gkey, dfmt), offsetof(vka_gkey, sfmt)},
+    {"stencil format", offsetof(vka_gkey, sfmt), offsetof(vka_gkey, ncolor)}, {"colour count", offsetof(vka_gkey, ncolor), offsetof(vka_gkey, samples)},
+    {"samples", offsetof(vka_gkey, samples), offsetof(vka_gkey, topo)}, {"topology", offsetof(vka_gkey, topo), offsetof(vka_gkey, poly_mode)},
+    {"polygon mode", offsetof(vka_gkey, poly_mode), offsetof(vka_gkey, depth_clamp)}, {"depth clamp", offsetof(vka_gkey, depth_clamp), offsetof(vka_gkey, a2c)},
+    {"alpha to coverage", offsetof(vka_gkey, a2c), offsetof(vka_gkey, logic_en)}, {"logic op", offsetof(vka_gkey, logic_en), offsetof(vka_gkey, gl_depth)},
+    {"GL depth", offsetof(vka_gkey, gl_depth), offsetof(vka_gkey, fs_variant)}, {"fragment variant", offsetof(vka_gkey, fs_variant), offsetof(vka_gkey, alpha_func)},
+    {"alpha func", offsetof(vka_gkey, alpha_func), offsetof(vka_gkey, gs_fx)}, {"geometry claim", offsetof(vka_gkey, gs_fx), offsetof(vka_gkey, vin_u)},
+    {"vertex input retype", offsetof(vka_gkey, vin_u), offsetof(vka_gkey, tex_u)}, {"texture retype", offsetof(vka_gkey, tex_u), offsetof(vka_gkey, att)},
+    {"blend", offsetof(vka_gkey, att), offsetof(vka_gkey, vin_static)}, {"static vertex input", offsetof(vka_gkey, vin_static), sizeof(vka_gkey)}};
+static void pw_explain_rec(const pwrec *r, const uint8_t *kb, const vka_gkey *k, uint32_t klen, int *best, unsigned *bestmask) {
+    enum { NF = sizeof g_pw_fields / sizeof g_pw_fields[0] };
+    vka_gkey rk; memset(&rk, 0, sizeof rk); memcpy(&rk, kb, r->klen < sizeof rk ? r->klen : sizeof rk);
+    const uint8_t *a = (const uint8_t *)&rk, *b = (const uint8_t *)k; int nd = 0; unsigned mask = 0u;
+    for (int f = 0; f < NF; f++) {
+        size_t hi = g_pw_fields[f].hi < klen ? g_pw_fields[f].hi : klen;
+        if (g_pw_fields[f].lo < hi && memcmp(a + g_pw_fields[f].lo, b + g_pw_fields[f].lo, hi - g_pw_fields[f].lo)) { nd++; mask |= 1u << f; }
+    }
+    if (*best < 0 || nd < *best) { *best = nd; *bestmask = mask; }
+}
 static void pw_explain(int kind, vka_shader *const sh[5], const vka_gkey *k, uint32_t klen, double ms, int linked, const char *where) {
     static _Atomic int nlog; int lim = VKA_ENV("DM_VK_PREWARM_WHY", 64);
     if (!g_pw_load || atomic_load(&nlog) >= lim || atomic_fetch_add(&nlog, 1) >= lim) return;
-    static const struct { const char *name; size_t lo, hi; } F[] = {
-        {"colour formats", offsetof(vka_gkey, cfmt), offsetof(vka_gkey, dfmt)}, {"depth format", offsetof(vka_gkey, dfmt), offsetof(vka_gkey, sfmt)},
-        {"stencil format", offsetof(vka_gkey, sfmt), offsetof(vka_gkey, ncolor)}, {"colour count", offsetof(vka_gkey, ncolor), offsetof(vka_gkey, samples)},
-        {"samples", offsetof(vka_gkey, samples), offsetof(vka_gkey, topo)}, {"topology", offsetof(vka_gkey, topo), offsetof(vka_gkey, poly_mode)},
-        {"polygon mode", offsetof(vka_gkey, poly_mode), offsetof(vka_gkey, depth_clamp)}, {"depth clamp", offsetof(vka_gkey, depth_clamp), offsetof(vka_gkey, a2c)},
-        {"alpha to coverage", offsetof(vka_gkey, a2c), offsetof(vka_gkey, logic_en)}, {"logic op", offsetof(vka_gkey, logic_en), offsetof(vka_gkey, gl_depth)},
-        {"GL depth", offsetof(vka_gkey, gl_depth), offsetof(vka_gkey, fs_variant)}, {"fragment variant", offsetof(vka_gkey, fs_variant), offsetof(vka_gkey, alpha_func)},
-        {"alpha func", offsetof(vka_gkey, alpha_func), offsetof(vka_gkey, gs_fx)}, {"geometry claim", offsetof(vka_gkey, gs_fx), offsetof(vka_gkey, vin_u)},
-        {"vertex input retype", offsetof(vka_gkey, vin_u), offsetof(vka_gkey, tex_u)}, {"texture retype", offsetof(vka_gkey, tex_u), offsetof(vka_gkey, att)}, {"blend", offsetof(vka_gkey, att), offsetof(vka_gkey, vin_static)},
-        {"static vertex input", offsetof(vka_gkey, vin_static), sizeof(vka_gkey)}};
-    enum { NF = sizeof F / sizeof F[0] };
+    enum { NF = sizeof g_pw_fields / sizeof g_pw_fields[0] };
     uint64_t want[5]; for (int i = 0; i < 5; i++) want[i] = sh[i] ? sh[i]->key : 0;
-    int same_sh = 0, best = -1; unsigned bestmask = 0;
-    for (size_t o = 0; o + sizeof(pwrec) <= g_pw_load_len;) {
+    int same_sh = 0, best = -1; unsigned bestmask = 0u;
+    if (vka_spill_gw_fast_on() && g_pw_sh_idx.ready) {
+        for (uint32_t c = vka_pw_sh_idx_first(&g_pw_sh_idx, (uint8_t)kind, want); c; c = g_pw_sh_idx.next[c - 1u]) {
+            size_t o = g_pw_sh_idx.offs[c - 1u]; pwrec r; memcpy(&r, g_pw_load + o, sizeof r);
+            if (r.kind != kind || memcmp(r.key, want, sizeof want)) continue;
+            same_sh++; pw_explain_rec(&r, g_pw_load + o + sizeof r, k, klen, &best, &bestmask);
+        }
+    } else for (size_t o = 0; o + sizeof(pwrec) <= g_pw_load_len;) {
         pwrec r; memcpy(&r, g_pw_load + o, sizeof r); const uint8_t *kb = g_pw_load + o + sizeof r; o += pw_size(&r);
         if (r.kind != kind || memcmp(r.key, want, sizeof want)) continue;
-        same_sh++;
-        vka_gkey rk; memset(&rk, 0, sizeof rk); memcpy(&rk, kb, r.klen < sizeof rk ? r.klen : sizeof rk);
-        const uint8_t *a = (const uint8_t *)&rk, *b = (const uint8_t *)k; int nd = 0; unsigned mask = 0;
-        for (int f = 0; f < NF; f++) { size_t hi = F[f].hi < klen ? F[f].hi : klen; if (F[f].lo < hi && memcmp(a + F[f].lo, b + F[f].lo, hi - F[f].lo)) { nd++; mask |= 1u << f; } }
-        if (best < 0 || nd < best) { best = nd; bestmask = mask; }
+        same_sh++; pw_explain_rec(&r, kb, k, klen, &best, &bestmask);
     }
     char d[256] = ""; size_t q = 0;
-    for (int f = 0; f < NF && q < sizeof d; f++) if (bestmask >> f & 1) q += (size_t)snprintf(d + q, sizeof d - q, "%s%s", q ? ", " : "", F[f].name);
+    for (int f = 0; f < NF && q < sizeof d; f++) if (bestmask >> f & 1) q += (size_t)snprintf(d + q, sizeof d - q, "%s%s", q ? ", " : "", g_pw_fields[f].name);
     if (!same_sh) VLOG("pipeline made%s (%.1f ms%s), not in the prewarm list: no record with these shaders (%s %016llx fs %016llx; first met in this run)", where,
                        ms, linked ? ", linked" : "", kind == VKA_PW_MESH ? "mesh" : "vs", (unsigned long long)want[0], (unsigned long long)want[1]);
     else VLOG("pipeline made%s (%.1f ms%s), not in the prewarm list: %d records with these shaders, the nearest differs in %s", where,
@@ -1509,6 +1526,11 @@ static void cs_queue(gval *g, vka_shader *cs, const vka_layout *lay) {
     atomic_fetch_add(&g_as_queued, 1);
     pthread_mutex_lock(&g_as_mu); *g_as_tail = j; g_as_tail = &j->next; pthread_cond_signal(&g_as_cv); pthread_mutex_unlock(&g_as_mu);
 }
+static int cs_has_spill(const vka_shader *cs) {
+    if (vka_spill_gw_fast_on() && (cs->sh_bflags & VKA_SH_BF_READY)) return (cs->sh_bflags & VKA_SH_BF_SPILL) != 0;
+    for (unsigned i = 0; i < cs->e->bind_count; i++) if (cs->b[i].kind == DMSH_VK_KIND_SHARED_SPILL) return 1;
+    return 0;
+}
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made, uint64_t umask, uint64_t smask, int frame) {
     *made = 0; vka_pso_wait = 0;
     if (VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(cs->key)) return VK_NULL_HANDLE;
@@ -1544,7 +1566,7 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
         if (V.cache_ctl && !(smax && cs->e->shared > smax)) {   // the cache-only try (one over the shared memory limit: cs_build says why it is not made)
             uint32_t pin = (cs->e->flags & DMSH_VK_F_SUBGROUP) ? vka_shader_sg_pin(DMSH_VK_STAGE_CS) : 0;
             VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rsg = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = pin};
-            int spill = 0; for (unsigned i = 0; i < cs->e->bind_count; i++) if (cs->b[i].kind == DMSH_VK_KIND_SHARED_SPILL) spill = 1;
+            int spill = cs_has_spill(cs);
             VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .flags = (spill ? VK_PIPELINE_CREATE_DISPATCH_BASE_BIT : 0) | VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT,
                 .layout = lay->layout, .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin ? &rsg : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = csm, .pName = "main"}};
             VkPipeline p = VK_NULL_HANDLE; uint64_t t0 = now_ns();
@@ -1574,8 +1596,7 @@ static void cs_build(gval *g, vka_shader *cs, const vka_layout *lay, VkShaderMod
     uint64_t t0 = now_ns();
     uint32_t pin = (cs->e->flags & DMSH_VK_F_SUBGROUP) ? vka_shader_sg_pin(DMSH_VK_STAGE_CS) : 0;
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rsg = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = pin};
-    int spill = 0;   // shared memory in the spill buffer (vka_draw.c spill_dispatch): dispatched in parts with a base workgroup
-    for (unsigned i = 0; i < cs->e->bind_count; i++) if (cs->b[i].kind == DMSH_VK_KIND_SHARED_SPILL) spill = 1;
+    int spill = cs_has_spill(cs);   // shared memory in the spill buffer (vka_draw.c spill_dispatch): dispatched in parts with a base workgroup
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .flags = spill ? VK_PIPELINE_CREATE_DISPATCH_BASE_BIT : 0, .layout = lay->layout,
         .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin ? &rsg : NULL, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = csm, .pName = "main"}};
     VkPipeline p = VK_NULL_HANDLE; VkResult r; int over = 0;

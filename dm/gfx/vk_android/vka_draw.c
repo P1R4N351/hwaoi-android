@@ -29,6 +29,7 @@
 #include "vka_treg_ub_fast.h"
 #include "vka_wk_prep_fast.h"
 #include "vka_wset_vin_fast.h"
+#include "vka_spill_gw_fast.h"
 _Static_assert(sizeof(((vka_dstate *)0)->ubo_dirty) == 32 && VKA_NSTAGE == 8 && sizeof(p_scissor) == 16, "inst_fast sizes");
 uint64_t vka_mem_gen(void);
 static vka_addrm4 *g_addrm4;
@@ -1451,6 +1452,7 @@ static int gmem_map(VkDescriptorBufferInfo *bi) {
 // count apart run at once, which in-order workgroup launch makes very likely but Vulkan does not promise)
 static vka_span g_spill; static VkDeviceSize g_spill_cap, g_spill_range;
 static uint32_t spill_bytes(const vka_shader *cs) {
+    if (vka_spill_gw_fast_on() && (cs->sh_bflags & VKA_SH_BF_READY)) return cs->spill_bytes;
     for (unsigned i = 0; i < cs->e->bind_count; i++) if (cs->b[i].kind == DMSH_VK_KIND_SHARED_SPILL) return cs->b[i].bytes;
     return 0;
 }
@@ -2697,7 +2699,11 @@ static int prepass_draw(const vka_dstate *d, const p_set_rt *rt, int has_rt, con
 }
 // A task or mesh shader of the draw writes guest memory (vka_prepass.h)
 static int mesh_writes(vka_shader *const *sh) {
-    for (int st = 6; st <= 7; st++) if (sh[st] && vkpp_binds_write(sh[st]->b, sh[st]->e->bind_count)) return 1;
+    int fast = vka_spill_gw_fast_on();
+    for (int st = 6; st <= 7; st++) if (sh[st]) {
+        if (fast && (sh[st]->sh_bflags & VKA_SH_BF_READY)) { if (sh[st]->sh_bflags & VKA_SH_BF_WRITES) return 1; }
+        else if (vkpp_binds_write(sh[st]->b, sh[st]->e->bind_count)) return 1;
+    }
     return 0;
 }
 // A cut prepass draw (mesh_cut -1) whose task or mesh shader writes guest memory is still run, with rasterizer discard: its writes happen, nothing is rasterized. Ocarina of

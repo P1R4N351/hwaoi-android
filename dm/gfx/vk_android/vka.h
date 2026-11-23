@@ -446,6 +446,8 @@ typedef struct vka_shader {
     struct vka_memu_sh *memu_d;         // a task / mesh shader drawn through compute: its layout and compute / vertex forms (vka_memu.c), made at its first draw
     uint8_t memu;                       // such a form itself: 1 a task / mesh shader as compute (the arena, records and push constant in its layout), 2 a generated vertex shader (the arena)
     uint8_t iface_flags;                // cached NDSR/vegetation interface flags (vka_wset_vin_fast.h)
+    uint8_t sh_bflags;                  // cached spill/write binding traits (vka_spill_gw_fast.h)
+    uint32_t spill_bytes;               // cached DMSH_VK_KIND_SHARED_SPILL slice bytes (vka_spill_gw_fast.h)
     uint64_t chash;                     // its library entry's hash (vka_shlib_entry_hash), for the pipeline cache's stamp (vka_pso.c); 0 = not in the library
 } vka_shader;
 // An instanced variant's key (vka_draw.c's instanced runs): its base shader's key XOR this. It is no key of the shader library, and the variant depends on the uniform
