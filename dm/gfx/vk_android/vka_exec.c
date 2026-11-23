@@ -22,6 +22,7 @@
 #define VKA_EXEC_HAVE_OPS 1
 #include "vka_exec_fast.h"
 #include "vka_spill_gw_fast.h"
+#include "vka_copy_wb_fast.h"
 
 typedef struct { uint64_t serial; p_set_rt rt; int has_rt; p_scissor sc; int has_sc; int64_t copy_stride, copy_img_stride; int rc_skip; vka_dstate d; } qstate;   // what a queue keeps between submissions (d: the draw state, vka_draw.c)
 static qstate S;
@@ -804,25 +805,26 @@ static uint64_t g_cur_fence;   // the fence of the submission being replayed, re
 // the order they were recorded, and go with the first signal that covers their fence, so they land only after their GPU work
 typedef struct { uint64_t fence; pop *ops; int n; } carry_t;
 enum { NCARRY = 64 };
-static carry_t g_carry[NCARRY]; static int g_ncarry;
+static carry_t g_carry[NCARRY]; static int g_ncarry; static uint64_t g_carry_min_fence = UINT64_MAX;
 static pop *carry_take(uint64_t fence, uint64_t signal, pop *ops, int *n) {
     if (!signal) {
         // A counter report's segment timestamp (kind 2, v: its query in the slot's range, q0: the slot's use) is read when the effects run, which can be after the slot is
         // reused (it waits for its own fence, not the timeline): sh_save keeps the slot's results at its reuse. (Before 2026-11-12 such a report took the completion time, the
         // same for every report carried to one signal: a game reading the GPU time between two of them read 0 ms, Ocarina of Time's dynamic resolution with the GPU waits on)
-        if (g_ncarry < NCARRY) { g_carry[g_ncarry++] = (carry_t){fence, ops, *n}; *n = 0; return NULL; }
+        if (g_ncarry < NCARRY) { g_carry[g_ncarry++] = (carry_t){fence, ops, *n}; vka_carry_min_note(&g_carry_min_fence, fence); *n = 0; return NULL; }
         VRED_ONCE("completion effects of more than %d unsignalled commits: dropped (events and counter reports not written)", NCARRY);   // (vka_qsched.h keeps it to QS_DEFER_MAX)
         free(ops); *n = 0; return NULL;
     }
-    int tot = *n, k = 0;
+    if (vka_copy_wb_fast_on() && !vka_carry_has_due(g_ncarry, g_carry_min_fence, signal)) return ops;
+    int tot = *n, k = 0; uint64_t mf = UINT64_MAX;
     for (int i = 0; i < g_ncarry; i++) if (g_carry[i].fence <= signal) tot += g_carry[i].n;
     if (tot == *n) return ops;
     pop *all = malloc((size_t)tot * sizeof *all); int m = 0;
     for (int i = 0; i < g_ncarry; i++) {
         if (g_carry[i].fence <= signal) { if (g_carry[i].n) memcpy(all + m, g_carry[i].ops, (size_t)g_carry[i].n * sizeof *all); m += g_carry[i].n; free(g_carry[i].ops); }
-        else g_carry[k++] = g_carry[i];
+        else { vka_carry_min_note(&mf, g_carry[i].fence); g_carry[k++] = g_carry[i]; }
     }
-    g_ncarry = k;
+    g_ncarry = k; g_carry_min_fence = mf;
     if (*n) memcpy(all + m, ops, (size_t)*n * sizeof *all);
     free(ops); *n = tot; return all;
 }
@@ -1150,6 +1152,32 @@ static VkImageAspectFlags copy_aspect(const vka_img *im, const char *what) {
     VRED_ONCE("%s of a packed depth-stencil texture (format %#x) is not on Vulkan yet: NVN's buffer layout interleaves what Vulkan copies by aspect", what, im->d.format);
     return 0;
 }
+static void copy_bt_bounce_buf(VkCommandBuffer cb, VkBuffer sb, VkDeviceSize so, size_t srow, size_t simg,
+                               VkBuffer db, VkDeviceSize doff, size_t drow, size_t dimg,
+                               size_t wb, size_t rows, int nz) {
+    if (!vka_copy_wb_fast_on()) {
+        for (int z = 0; z < nz; z++) for (size_t y = 0; y < rows; y++) {
+            VkBufferCopy bc = {so + (size_t)z * simg + y * srow, doff + (size_t)z * dimg + y * drow, wb}; vk.vkCmdCopyBuffer(cb, sb, db, 1, &bc);
+        }
+        return;
+    }
+    vka_copy3d_plan_t p = vka_copy3d_plan(wb, rows, (size_t)nz, srow, simg, drow, dimg);
+    if (!p.units) return;
+    if (p.units == 1u) { VkBufferCopy bc = {so, doff, p.unit_bytes}; vk.vkCmdCopyBuffer(cb, sb, db, 1, &bc); return; }
+    VkBufferCopy batch[64]; int nb = 0;
+    if (p.units == (size_t)nz && nz > 1) {
+        for (int z = 0; z < nz; z++) {
+            batch[nb++] = (VkBufferCopy){so + (size_t)z * simg, doff + (size_t)z * dimg, p.unit_bytes};
+            if (nb == 64 || z == nz - 1) { vk.vkCmdCopyBuffer(cb, sb, db, (uint32_t)nb, batch); nb = 0; }
+        }
+        return;
+    }
+    for (int z = 0; z < nz; z++) for (size_t y = 0; y < rows; y++) {
+        batch[nb++] = (VkBufferCopy){so + (size_t)z * simg + y * srow, doff + (size_t)z * dimg + y * drow, wb};
+        if (nb == 64) { vk.vkCmdCopyBuffer(cb, sb, db, 64u, batch); nb = 0; }
+    }
+    if (nb) vk.vkCmdCopyBuffer(cb, sb, db, (uint32_t)nb, batch);
+}
 // Buffer ↔ texture: c->src is the buffer's guest address. Rows are SetCopyRowStride bytes apart (tightly packed without it), layers / slices SetCopyImageStride
 static void copy_bt(const p_copy_b2t *c, int to_tex) {
     if (!c->tex) return;
@@ -1174,7 +1202,7 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
     if (bounce) {
         size_t wb = (size_t)((c->r.width + f->bw - 1) / f->bw) * f->bpb;
         if (!vka_scratch(wb * rows * (size_t)nz, al * 16, &s)) return;
-        if (to_tex) for (int z = 0; z < nz; z++) for (size_t y = 0; y < rows; y++) { VkBufferCopy bc = {o + z * img + y * row, s.off + (z * rows + y) * wb, wb}; vk.vkCmdCopyBuffer(g_cb, b, s.buf, 1, &bc); }
+        if (to_tex) copy_bt_bounce_buf(g_cb, b, o, row, img, s.buf, s.off, wb, wb * rows, wb, rows, nz);
         if (to_tex) vka_barrier(g_cb);
         row = wb; img = wb * rows;
     }
@@ -1189,7 +1217,7 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
         if (bounce) {
             vka_barrier(g_cb);
             size_t wb = row, srow = S.copy_stride ? (size_t)S.copy_stride : wb, simg = S.copy_img_stride ? (size_t)S.copy_img_stride : srow * rows;
-            for (int z = 0; z < nz; z++) for (size_t y = 0; y < rows; y++) { VkBufferCopy bc = {s.off + (z * rows + y) * wb, o + z * simg + y * srow, wb}; vk.vkCmdCopyBuffer(g_cb, s.buf, b, 1, &bc); }
+            copy_bt_bounce_buf(g_cb, s.buf, s.off, wb, wb * rows, b, o, srow, simg, wb, rows, nz);
         }
     }
     g_stat_ops++;

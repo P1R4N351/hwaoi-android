@@ -38,6 +38,7 @@
 #include "vka_wk_prep_fast.h"
 #include "vka_wset_vin_fast.h"
 #include "vka_spill_gw_fast.h"
+#include "vka_copy_wb_fast.h"
 #include "../nvn/nvn_reg_fast.h"
 #include "vka_serial_fast.h"
 #include "vka_img_fast.h"
@@ -773,7 +774,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
 // The GPU writing an image (gpu_owned) ends its tracking, as on Metal: its content is the GPU's from then on. DM_VK_TEX_TRACK=0 uploads ST_TRACK textures once (no write protection)
 enum { ST_ZERO, ST_FILL, ST_TRACK, ST_SPARSE };
 int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
-static int mem_any(const uint8_t *p, uint64_t n) { uint64_t i = 0, v; for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; } for (; i < n; i++) if (p[i]) return 1; return 0; }
+static int mem_any(const uint8_t *p, uint64_t n) { if (vka_copy_wb_fast_on()) return vka_mem_any_fast(p, n); uint64_t i = 0, v; for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; } for (; i < n; i++) if (p[i]) return 1; return 0; }
 static uint64_t g_st_up[4], g_reup;
 // Time and bytes of uploads from guest memory (deswizzle / row copy into scratch and the copy commands), on the replay thread: the [longframe] line's "texture uploads ... MB / ms"
 // (hle_nvn.c mtl_upload_ns_take, mtl_upload_bytes; stubs that said 0 until 2026-11-03)
@@ -2496,10 +2497,10 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
         size_t pitch = (size_t)bx * f->bpb, piece = pitch * by * z;
         for (uint32_t ly = 0; ly < (linear ? 1 : im->layers); ly++) {
             vka_span s; if (!vka_scratch(piece, 16, &s)) { free(part); return; }
-            if (linear) { size_t st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch; for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, pitch); }
+            if (linear) { size_t st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch; if (vka_copy_wb_fast_on()) vka_memcpy_2d(s.ptr, pitch, src, st, pitch, by); else for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, pitch); }
             else if (nvn_deswizzle(d, lv + im->base, ly, src, s.ptr, pitch)) { VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(part); return; }   // (image level lv is texture level lv + base: a soft texture's; a sparse pool's go above)
             if (d->format >= 0x79 && d->format <= 0x94 && vka_nan_on()) {   // DM_VK_NANSCAN: all-zero blocks of ASTC textures (an all-zero ASTC block is an error block)
-                uint64_t zb = 0, nb = piece / 16; for (uint64_t k = 0; k < nb; k++) if (!mem_any(s.ptr + 16 * k, 16)) zb++;
+                uint64_t zb = 0, nb = piece / 16; if (vka_copy_wb_fast_on()) { for (uint64_t k = 0; k < nb; k++) zb += (uint64_t)vka_block16_is_zero(s.ptr + 16 * k); } else { for (uint64_t k = 0; k < nb; k++) if (!mem_any(s.ptr + 16 * k, 16)) zb++; }
                 const char *dm = getenv("DM_VK_NANSCAN_DUMP"); static _Atomic int nd;   // <format>x<w>: level 0 of such textures written to DM_TEMP (diagnostic, at most 64)
                 if (dm && lv == 0 && ly == 0 && (int)strtol(dm, NULL, 16) == d->format && (uint32_t)atoi(strchr(dm, 'x') ? strchr(dm, 'x') + 1 : "0") == im->w && atomic_fetch_add(&nd, 1) < 64) {
                     char fn[512]; snprintf(fn, sizeof fn, "%s/nan-%llu-%#x-%ux%u.blk", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)t->serial, d->format, w, h);
@@ -2540,7 +2541,7 @@ void mtl_tex_release(tex_t *t) {
 }
 // Linear textures the GPU wrote in this submission. Metal makes a linear texture on the pool buffer, so what the GPU renders there is in guest memory for the CPU to read
 // (agl reads small linear render targets back on the CPU, such as a 1x1 R16F one in Donkey Kong Bananza's level); here the image is copied back into the storage
-static vka_img **g_wb; static int g_nwb, g_wbcap;
+static vka_img **g_wb; static int g_nwb, g_wbcap; static _Atomic int g_nwb_live;
 // A linear texture whose GPU writes are copied back into its storage (vka_tex_writeback): one level-free, single-sample colour texture of plain texels
 static int img_wb_kind(const vka_img *im) { return (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1; }
 void vka_img_written_at(vka_img *im, const char *file, int line) {
@@ -2570,10 +2571,12 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
     if (img_wb_kind(im) && !im->wb_pending) {
         if (g_nwb == g_wbcap) { g_wbcap = g_wbcap ? 2 * g_wbcap : 32; g_wb = realloc(g_wb, (size_t)g_wbcap * sizeof *g_wb); }
         im->wb_pending = 1; im->refs++; g_wb[g_nwb++] = im;
+        atomic_store_explicit(&g_nwb_live, g_nwb, memory_order_release);
     }
     pthread_mutex_unlock(&g_tmu);
 }
 void vka_tex_writeback(VkCommandBuffer cb) {
+    if (vka_copy_wb_fast_on() && !vka_wb_has_live(atomic_load_explicit(&g_nwb_live, memory_order_acquire))) return;
     pthread_mutex_lock(&g_tmu);
     int any = 0;
     for (int i = 0; i < g_nwb; i++) {
@@ -2590,6 +2593,7 @@ void vka_tex_writeback(VkCommandBuffer cb) {
         unref_locked(im);
     }
     g_nwb = 0;
+    atomic_store_explicit(&g_nwb_live, 0, memory_order_release);
     pthread_mutex_unlock(&g_tmu);
 }
 int mtl_tex_gpu_owned(uint64_t serial) {   // hle_nvn.c nvn_ft_poll: the GPU has written the image (render target, copy or clear destination)
@@ -3999,7 +4003,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
                 unsigned layer = is3d ? 0 : layer0 + (unsigned)r->zoffset + (unsigned)z;
                 if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, mem, lin, lp)) { done = 0; break; }
                 const uint8_t *src = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
-                for (size_t y = 0; y < hb && y0 + y < lr; y++) memcpy(dst + z * img + y * row, src + (y0 + y) * lp + x0, wb);
+                size_t rcnt = y0 >= lr ? 0 : (hb < lr - y0 ? hb : lr - y0); if (vka_copy_wb_fast_on()) vka_memcpy_2d(dst + z * img, row, rcnt ? src + y0 * lp + x0 : src, lp, wb, rcnt); else for (size_t y = 0; y < rcnt; y++) memcpy(dst + z * img + y * row, src + (y0 + y) * lp + x0, wb);
             }
             free(lin);
         }

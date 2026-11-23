@@ -23,6 +23,7 @@
 #include "vka_place.h"
 #include "vka_qsched_fast.h"
 #include "vka_mem_sparse_fast.h"
+#include "vka_copy_wb_fast.h"
 #include "vka_gmem.h"
 #include "vka_lowram.h"
 #include "../../host/dm.h"
@@ -1418,14 +1419,19 @@ static int coalesce_pressure(void) {
     int n = atomic_load(&g_maps_n), mx = atomic_load(&g_maps_max);
     return n > 0 && mx > 0 && (int64_t)n * 100 >= (int64_t)mx * pct;
 }
+static _Atomic uint64_t g_contig_clean_gen;
 static int contiguous_segs_due(void) {
     if (!coalesce_pressure()) return 0;
+    int fast = vka_copy_wb_fast_on();
+    if (fast && !vka_contig_need_scan(atomic_load_explicit(&g_sg_gen, memory_order_acquire), atomic_load_explicit(&g_contig_clean_gen, memory_order_acquire))) return 0;
     pthread_rwlock_rdlock(&g_rw);
+    uint64_t sgen = atomic_load_explicit(&g_sg_gen, memory_order_relaxed);
     int due = 0;
     for (int i = 0; i < g_nsg - 1; i++) {
         if (g_sg[i].hi == g_sg[i + 1].lo && !g_sg[i].fd_alias && !g_sg[i + 1].fd_alias) { due = 1; break; }
     }
     pthread_rwlock_unlock(&g_rw);
+    if (fast && !due) vka_contig_note_clean(&g_contig_clean_gen, sgen);
     return due;
 }
 // The time vka_mem_join_due waited for the queue (the upload batch's flush and vka_queue_idle; cumulative ns, the replay thread's): the pace cost line puts it apart
