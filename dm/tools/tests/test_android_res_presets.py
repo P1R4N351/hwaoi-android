@@ -91,8 +91,6 @@ class Wiring(unittest.TestCase):
         self.assertIn('"Window", v -> resolution(a, g, again)', gs); self.assertIn('"3D scene", v -> scene(a, g, again)', gs)
         prefs = (SRC / 'Prefs.java').read_text(encoding='utf-8')
         self.assertIn('"res_preset"', prefs.split('GAME_SETTINGS')[1].split(';')[0], 'Reset to defaults forgets it')
-        side = (SRC / 'SidePanel.java').read_text(encoding='utf-8')
-        self.assertIn('p.resolutionLive(Prefs.startWindow(act, game()))', side, 'the in-game panel changes the preset\'s window live')
 
 
 @unittest.skipUnless(shutil.which('javac') and shutil.which('java'), 'no JDK')

@@ -406,7 +406,6 @@ ruff	dm/tools/pr_risk.py	PIE810	1	Call `startswith` once with a `tuple`
 ruff	dm/tools/recommend.py	B023	2	Function definition does not bind loop variable `k`
 ruff	dm/tools/recommend.py	B023	2	Function definition does not bind loop variable `v`
 ruff	dm/tools/sdis.py	F841	1	Local variable `lo` is assigned to but never used
-ruff	dm/tools/tests/test_android_gameorder.py	F401	1	`re` imported but unused
 ruff	dm/tools/tests/test_android_logdigest.py	RUF017	1	Avoid quadratic list summation
 ruff	dm/tools/tests/test_android_profile_options.py	F401	1	`re` imported but unused
 ruff	dm/tools/tests/test_android_samplequeue.py	F401	1	`hashlib` imported but unused

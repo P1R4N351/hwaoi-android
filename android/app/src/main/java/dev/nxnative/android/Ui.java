@@ -558,13 +558,14 @@ final class Ui {
         return r;
     }
 
-    /** The banana with a face in a leaf-green circle (Home's header) */
+    /** The AoI emblem in a carved obsidian circle (header badge) */
     static ImageView badge(Context c, int sizeDp) {
         ImageView v = new ImageView(c);
-        v.setImageDrawable(new android.graphics.drawable.InsetDrawable(c.getDrawable(R.drawable.ic_banana_happy), -0.16f));   // the banana fills more of the circle
+        v.setImageDrawable(new android.graphics.drawable.InsetDrawable(c.getDrawable(R.drawable.ic_aoi_foreground), -0.12f));
         GradientDrawable g = new GradientDrawable();
         g.setShape(GradientDrawable.OVAL);
-        g.setColor(0xFF1E5B3A);
+        g.setColor(col(c, R.color.ic_launcher_background));
+        g.setStroke(dp(c, 1), col(c, R.color.bn_card_stroke));
         v.setBackground(g);
         v.setScaleType(ImageView.ScaleType.FIT_CENTER);
         v.setLayoutParams(new LinearLayout.LayoutParams(dp(c, sizeDp), dp(c, sizeDp)));

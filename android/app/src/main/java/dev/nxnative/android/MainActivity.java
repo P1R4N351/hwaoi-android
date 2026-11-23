@@ -45,15 +45,15 @@ import java.util.Locale;
  * readable width, centered on a wide window. The activity handles rotation itself (configChanges), so a size change builds the page again (onConfigurationChanged).
  */
 public final class MainActivity extends Activity {
-    private static final int PICK_GAME = 1, PICK_PACK = 2, PICK_DLL = 3, PICK_DRIVER = 4, PICK_NUP = 5, PICK_NUP_HERE = 6, PICK_BG = 7, PICK_SND = 8;
+    static final String AOI_ID = "04003F40232DE000";
+    private static final int PICK_GAME = 1, PICK_PACK = 2, PICK_DLL = 3, PICK_DRIVER = 4, PICK_NUP = 5, PICK_NUP_HERE = 6, PICK_SND = 8;
 
     private final List<Game> games = new ArrayList<>();
     private LinearLayout gameBox;   // the game cards (refresh)
     private View accessCard;
-    private BananaBackgroundView bananas;   // the drifting bananas behind the screen
-    private TextView poppedText;   // Settings › About: "Bananas Popped: n" (null when Settings is not shown)
-    private Ui.Setting overlayRow, resRow, capRow, upsRow, sharpRow, drsRow, lsfgRow, gpuRow, updateRow, timeRow;
-    private boolean resumed, settingsPage;
+    private FrameLayout rootFrame;
+    private Ui.Setting overlayRow, upsRow, sharpRow, lsfgRow, gpuRow, updateRow;
+    private boolean resumed, settingsPage, directBooted;
     private boolean usersPage;   // the Users page (UsersUi) in place of Home
     private String usersEdit;   // the player whose own page it shows, else the page of all players
     private boolean advancedOpen;   // the Advanced page (AdvancedPage) is open over Settings or a game's page
@@ -69,27 +69,26 @@ public final class MainActivity extends Activity {
         if (saved != null) settingsPage = saved.getBoolean("settings");
         if (saved != null && saved.getString("game_settings") != null)   // a fold or unfold makes the activity again: the game's settings page stays open
             for (Game g : Game.load(this)) if (g.gameDir.equals(saved.getString("game_settings"))) { settingsGame = g; break; }
-        FrameLayout frame = new FrameLayout(this);
-        bananas = new BananaBackgroundView(this);
-        frame.addView(bananas, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        bananas.setOnPop(() -> {   // a popped banana: counted, a light tick, and Settings' counter if it shows
-            long n = Prefs.addBananaPopped(this);
-            bananas.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
-            if (poppedText != null) poppedText.setText(poppedLine(n));
-        });
-        bananas.setLook(Prefs.background(this));
-        setContentView(frame);
-        frame.getViewTreeObserver().addOnGlobalFocusChangeListener((o, n) -> {
+        if (saved == null) {
+            setIntent(gated(getIntent()));
+            if (tryDirectBoot(getIntent())) { directBooted = true; return; }
+        }
+        rootFrame = new FrameLayout(this);
+        View backdrop = new View(this);
+        backdrop.setBackgroundColor(Ui.col(this, R.color.bn_bg));
+        rootFrame.addView(backdrop, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(rootFrame);
+        rootFrame.getViewTreeObserver().addOnGlobalFocusChangeListener((o, n) -> {
             if (n == null) return;
-            if (!n.isInTouchMode()) UiSound.tick(this);   // a controller or keyboard moves the focus
-            if (n.getTag() instanceof TileInfo) selectTile(n);   // the focused tile grows and the dock says what it is
+            if (!n.isInTouchMode()) UiSound.tick(this);
+            if (n.getTag() instanceof TileInfo) selectTile(n);
             hintUpdate();
-        });   // a controller or keyboard moves the focus
-        PadFocus.watch(getWindow());   // a controller: the focus frame (PadFocus)
+        });
+        PadFocus.watch(getWindow());
         build();
-        if (saved == null) { setIntent(gated(getIntent())); fromIntent(getIntent()); }   // start() reads no_pause from getIntent() too
-        GpuGl.probe(this, () -> { if (!isFinishing() && settingsGame != null) gameSettingsAgain(); });   // the GPU's name and, before any readiness check, the system driver's facts for the recommendations
-        Updater.onStart(this);   // the release app: a newer release on GitHub opens the update popup (once per process start: not on a resume or a rotation)
+        if (saved == null) fromIntent(getIntent());
+        GpuGl.probe(this, () -> { if (!isFinishing() && settingsGame != null) gameSettingsAgain(); });
+        Updater.onStart(this);
     }
 
     @Override protected void onSaveInstanceState(Bundle out) {
@@ -178,7 +177,7 @@ public final class MainActivity extends Activity {
         if (at >= 0 && !pageRoot().isInTouchMode()) pageRoot().post(() -> { java.util.ArrayList<View> l = PadFocus.focusables(pageRoot()); if (at < l.size()) l.get(at).requestFocus(); });
     }
 
-    private View pageRoot() { return bananas.getParent() instanceof View ? (View) bananas.getParent() : bananas; }
+    private View pageRoot() { return rootFrame; }
 
     /** A controller: B goes back one level (a game's page or Settings to Home), L1 / R1 switch a game page's tabs; the rest is Android's focus (D-pad, A) */
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
@@ -188,7 +187,6 @@ public final class MainActivity extends Activity {
             return true;
         }
         if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0 && (k == KeyEvent.KEYCODE_BUTTON_A || k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER)) UiSound.select(this);
-        if (moveId != null && onHome() && moveKey(e)) return true;
         if (k == KeyEvent.KEYCODE_BUTTON_X && onHome() && !advancedOpen) {   // Hold X: the focused game's options, as a long press
             View f = getCurrentFocus();
             if (f != null && f.getTag() instanceof TileInfo && !((TileInfo) f.getTag()).work) {
@@ -240,10 +238,8 @@ public final class MainActivity extends Activity {
     /** The game's page at its top (another tab) */
     void gameSettingsTop() { if (settingsGame != null) build(); }
 
-    /** The page's ScrollView (Ui.page: the first view above the bananas) */
     private android.widget.ScrollView pageScroll() {
-        FrameLayout frame = (FrameLayout) bananas.getParent();
-        return frame.getChildCount() > 1 && frame.getChildAt(1) instanceof android.widget.ScrollView ? (android.widget.ScrollView) frame.getChildAt(1) : null;
+        return rootFrame != null && rootFrame.getChildCount() > 1 && rootFrame.getChildAt(1) instanceof android.widget.ScrollView ? (android.widget.ScrollView) rootFrame.getChildAt(1) : null;
     }
     private android.widget.ScrollView splitScroll;   // the right pane of a split page (newPane), else null
     private int scrollY() { android.widget.ScrollView s = splitScroll != null ? splitScroll : pageScroll(); return s == null ? 0 : s.getScrollY(); }
@@ -272,7 +268,6 @@ public final class MainActivity extends Activity {
     @SuppressWarnings("deprecation")
     @Override public void onBackPressed() {
         if (ReleasePage.back(this)) return;   // the release page over Home
-        if (moveId != null) { endMove(false); return; }   // a lifted game goes back to its place
         if (advancedOpen) closeAdvanced();
         else if (usersPage) { if (usersEdit != null) usersBack(); else page(false); }
         else if (settingsPage && settingsGame == null && settingsOpen >= 0 && getResources().getConfiguration().screenWidthDp < 600) { settingsOpen = -1; build(); }   // a section back to the list
@@ -280,19 +275,15 @@ public final class MainActivity extends Activity {
         else super.onBackPressed();
     }
 
-    /** (Re)builds the current page above the bananas (Ui.page: the same gutter, width and header spacing as every screen; a game's settings page wider on a wide window, for its rail) */
     private void build() {
-        FrameLayout frame = (FrameLayout) bananas.getParent();
+        FrameLayout frame = rootFrame;
+        if (frame == null) return;
         while (frame.getChildCount() > 1) frame.removeViewAt(1);
-        if (!onHome()) { moveId = null; moveOrig = null; }   // a lifted game is put back when Home is left
         boolean wide = getResources().getConfiguration().screenWidthDp >= 600;
-        boolean home = settingsGame == null && !settingsPage && !usersPage;   // Home never scrolls up or down: its games are one row that scrolls sideways
+        boolean home = settingsGame == null && !settingsPage && !usersPage;
         splitScroll = null;
-        // A wide window (a phone sideways, a tablet): Home, a game's page and Settings are full width and the page itself does not scroll; the two pages are a left column
-        // (back, the game or "Settings", the list of sections) and a right pane that scrolls on its own (newPane). The Advanced switches page keeps the scrolling page
         LinearLayout content = home || wide && !advancedOpen && !usersPage ? Ui.page(this, frame, 4000, false, true) : Ui.page(this, frame, 640);
-        poppedText = null;
-        if (settingsGame != null) for (Game x : Game.load(this)) if (x.gameDir.equals(settingsGame.gameDir)) { settingsGame = x; break; }   // its folders as they are now (Folders, Import pack)
+        if (settingsGame != null) for (Game x : Game.load(this)) if (x.gameDir.equals(settingsGame.gameDir)) { settingsGame = x; break; }
         if (advancedOpen) { accessCard = null; gameBox = null; overlayRow = null; AdvancedPage.build(this, content, advancedTitleId, advancedName, this::closeAdvanced); }
         else if (settingsGame != null) { accessCard = null; gameBox = null; overlayRow = null; GameSettings.build(this, content, settingsGame, this::gameSettingsAgain, () -> page(false)); }
         else if (usersPage) { accessCard = null; gameBox = null; overlayRow = null; UsersUi.build(this, content, usersEdit); }
@@ -303,7 +294,6 @@ public final class MainActivity extends Activity {
         hl.bottomMargin = dp(12);
         frame.addView(hint, hl);
         hintUpdate();
-        bananaTaps(frame);
         noFocusTint(frame);
         if (settingsGame != null || settingsPage || usersPage || advancedOpen) frame.post(() -> {   // a controller (not touch mode): the focus starts on the page's selected tab, else its first row (Home: refresh puts it on the first tile)
             if (frame.isInTouchMode() || getCurrentFocus() != null && frame.hasFocus()) return;
@@ -323,61 +313,6 @@ public final class MainActivity extends Activity {
         if (v instanceof ViewGroup) for (int i = 0; i < ((ViewGroup) v).getChildCount(); i++) noFocusTint(((ViewGroup) v).getChildAt(i));
     }
 
-    /**
-     * A tap on the page where nothing is (no button, no card, no text row with a background) pops the banana behind it (BananaBackgroundView.popAt). The page's
-     * ScrollView gets only the touches no child took, and this never takes one: scrolling goes on, and a drag is not a tap.
-     */
-    private void bananaTaps(FrameLayout frame) {
-        android.widget.ScrollView scroll = pageScroll();
-        if (scroll == null) return;
-        scroll.setOnTouchListener(popListener(scroll));
-    }
-
-    /**
-     * The touch listener that pops a banana at a tap where nothing is: on the page's scroll view, and on Home's sideways row, which covers the page and takes
-     * every touch (it is a scroll view too). It never takes a touch itself: scrolling goes on, and a drag is not a tap
-     */
-    private View.OnTouchListener popListener(ViewGroup root) {
-        final float slop = android.view.ViewConfiguration.get(this).getScaledTouchSlop();
-        final float[] down = new float[3];   // x, y, whether a tap may still follow (1)
-        return (v, e) -> {
-            switch (e.getActionMasked()) {
-                case android.view.MotionEvent.ACTION_DOWN:
-                    down[0] = e.getX(); down[1] = e.getY(); down[2] = emptyAt(root, e.getX(), e.getY()) ? 1 : 0;
-                    break;
-                case android.view.MotionEvent.ACTION_MOVE:
-                    if (Math.abs(e.getX() - down[0]) > slop || Math.abs(e.getY() - down[1]) > slop) down[2] = 0;
-                    break;
-                case android.view.MotionEvent.ACTION_UP:
-                    if (down[2] == 1 && e.getEventTime() - e.getDownTime() < android.view.ViewConfiguration.getLongPressTimeout()) {
-                        int[] a = new int[2], b = new int[2];
-                        v.getLocationInWindow(a);
-                        bananas.getLocationInWindow(b);
-                        bananas.popAt(e.getX() + a[0] - b[0], e.getY() + a[1] - b[1]);
-                    }
-                    down[2] = 0;
-                    break;
-                default:
-                    down[2] = 0;
-            }
-            return false;
-        };
-    }
-
-    /** No view with a background (a card, a row, a button) is at this point of the scroll view: the bananas show there */
-    private static boolean emptyAt(ViewGroup root, float x, float y) {
-        for (int i = root.getChildCount() - 1; i >= 0; i--) {
-            View c = root.getChildAt(i);
-            float cx = x + root.getScrollX() - c.getLeft(), cy = y + root.getScrollY() - c.getTop();
-            if (cx < 0 || cy < 0 || cx >= c.getWidth() || cy >= c.getHeight() || c.getVisibility() != View.VISIBLE) continue;
-            if (c.getBackground() != null) return false;
-            if (c instanceof ViewGroup && !emptyAt((ViewGroup) c, cx, cy)) return false;
-        }
-        return true;
-    }
-
-    private String poppedLine(long n) { return "Bananas Popped: " + java.text.NumberFormat.getIntegerInstance().format(n); }
-
     /** The player wiki (its pages are written and kept up to date on the project's site, so the app links to it and keeps no copy) */
     static final String WIKI_URL = "https://git.eden-emu.dev/moceure/BananaNative/wiki";
     private static String wikiUrl() { return !BuildConfig.NX_WIKI_URL.isEmpty() ? BuildConfig.NX_WIKI_URL : WIKI_URL; }
@@ -394,7 +329,6 @@ public final class MainActivity extends Activity {
         android.widget.ProgressBar pb;   // its moving bar
         ProgressRing badge, ring;   // the small corner ring (something checked or updated in the background), the big ring (the game is being prepared)
         boolean work;   // the game is being prepared (workTile): the ring shows the job's progress
-        TextView sub;   // the grid's and the list's second line (HomeLayout.caption)
         String version, workLine;   // the game's version once read; the step of the job being prepared
         TileInfo(String name, TextView st, View.OnClickListener open) { this.name = name; this.st = st; this.open = open; }
     }
@@ -518,7 +452,7 @@ public final class MainActivity extends Activity {
         if (t != null) t.setSelected(true);
         // The selected tile grows
         ViewGroup row = (ViewGroup) (t != null ? t.getParent() : old != null ? old.getParent() : null);
-        if (row == null || layoutNow != HomeLayout.ROW) return;   // only the sideways row grows the selected tile; the grid and the list have the ring
+        if (row == null) return;
         int sel = t == null ? -1 : row.indexOfChild(t);
         final float[] grow = {1.2f};   // only the selected tile is big, the others stay as they are
         for (int k = 0; k < row.getChildCount(); k++) {
@@ -722,30 +656,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton(Tx.s(R.string.common_cancel), null).show());
         theme.value(Tx.arr(R.array.arr_theme)[Prefs.theme(this)]);
         look.addView(theme.view);
-        Ui.Setting bg = new Ui.Setting(this, "🖼️", Tx.s(R.string.settings_background), null).chevron(this);
-        bg.view.setOnClickListener(v -> new PadFocus.Builder(this).setTitle(Tx.s(R.string.settings_background))
-                .setSingleChoiceItems(Tx.arr(R.array.arr_background), Prefs.background(this), (d, w) -> {
-                    d.dismiss();
-                    if (w == 2) {   // a picture: pick it first, the choice is kept once it is read
-                        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("image/*");
-                        startActivityForResult(i, PICK_BG);
-                        return;
-                    }
-                    Prefs.background(this, w);
-                    bananas.setLook(w);
-                    bg.value(Tx.arr(R.array.arr_background)[w]);
-                }).setNegativeButton(Tx.s(R.string.common_cancel), null).show());
-        bg.value(Tx.arr(R.array.arr_background)[Prefs.background(this)]);
-        look.addView(bg.view);
-        Ui.Setting lay = new Ui.Setting(this, "\uD83D\uDDC2\uFE0F", Tx.s(R.string.settings_home_layout), null).chevron(this);
-        lay.view.setOnClickListener(v -> new PadFocus.Builder(this).setTitle(Tx.s(R.string.settings_home_layout))
-                .setSingleChoiceItems(Tx.arr(R.array.arr_home_layout), HomeLayout.mode(this), (d, w) -> {
-                    d.dismiss();
-                    Prefs.homeLayout(this, w);
-                    lay.value(Tx.arr(R.array.arr_home_layout)[w]);   // Home is built again when Settings closes
-                }).setNegativeButton(Tx.s(R.string.common_cancel), null).show());
-        lay.value(Tx.arr(R.array.arr_home_layout)[HomeLayout.mode(this)]);
-        look.addView(lay.view);
+
         look.addView(new Ui.Setting(this, "🔊", Tx.s(R.string.settings_ui_sounds), null).toggle(this, Prefs.uiSounds(this), (b, on) -> { Prefs.uiSounds(this, on); if (on) UiSound.select(this); })
                 .value(Tx.s(R.string.settings_a_tick_when_the_focus)).view);
         Ui.Setting snd = new Ui.Setting(this, "🎵", Tx.s(R.string.settings_my_sound), null).chevron(this);
@@ -757,8 +668,6 @@ public final class MainActivity extends Activity {
         });
         snd.value(UiSound.custom(this).isFile() ? Tx.s(R.string.settings_your_sound) : "Built-in");
         look.addView(snd.view);
-        if (BuildConfig.DEBUG) look.addView(new Ui.Setting(this, "🧪", Tx.s(R.string.settings_sample_games), null).toggle(this, Prefs.demoGames(this), (b, on) -> { Prefs.demoGames(this, on); refresh(); })
-                .value(Tx.s(R.string.settings_test_builds_shows_sample_tiles)).view);
 
         Ui.add(content, Ui.section(this, Tx.s(R.string.common_display)), Ui.SECTION_GAP);
         LinearLayout play = settingsCard(content);
@@ -798,11 +707,7 @@ public final class MainActivity extends Activity {
                 .setNegativeButton(Tx.s(R.string.common_cancel), null).show());
         padPanel.value(padPanelLabel(Prefs.panelPad(this)));
         ctl.addView(padPanel.view);
-        resRow = new Ui.Setting(this, "🖼️", Tx.s(R.string.common_resolution), v -> gameRes()).chevron(this);
-        perf.addView(resRow.view);
-        if (!Profile.anyResolution()) resRow.view.setVisibility(View.GONE);   // no game of this APK has a window_fn or graphics_scale lever: the default would do nothing
-        capRow = new Ui.Setting(this, "⏱️", Tx.s(R.string.common_frame_rate_cap), v -> fpsCap()).chevron(this);
-        perf.addView(capRow.view);
+
         ctl.addView(new Ui.Setting(this, "📳", Tx.s(R.string.common_rumble), null).toggle(this, Prefs.rumble(this), (b, on) -> Prefs.rumbleDefault(this, on))
                 .value(Tx.s(R.string.settings_on_the_controller_or_the)).view);
         perf.addView(new Ui.Setting(this, "🚀", Tx.s(R.string.common_use_fast_cores), null).toggle(this, Prefs.pinThreads(this), (b, on) -> Prefs.pinThreadsDefault(this, on))
@@ -822,15 +727,12 @@ public final class MainActivity extends Activity {
         sharpRow = new Ui.Setting(this, "✨", Tx.s(R.string.common_fsr_sharpness), v -> pick(Tx.s(R.string.common_fsr_sharpness), Tx.arr(R.array.arr_fsr_sharp), GameUpscaler.sharpIndex(GameUpscaler.sharp(this)),
                 w -> GameUpscaler.sharpDefault(this, GameUpscaler.SHARPS[w]))).chevron(this);
         perf.addView(sharpRow.view);
-        drsRow = new Ui.Setting(this, "📐", Tx.s(R.string.common_dynamic_resolution), v -> DrsSlider.dialog(this, "", Prefs.drs(this), null, true, w -> Prefs.drsDefault(this, w),
-                this::refreshSettings)).chevron(this);
-        perf.addView(drsRow.view);
+
         lsfgRow = new Ui.Setting(this, "✨", Tx.s(R.string.settings_frame_generation), v -> frameGen()).chevron(this);
         play.addView(lsfgRow.view);   // no per-game twin (the in-game panel has it): not a default, so it stays on the page
         gpuRow = new Ui.Setting(this, "🎮", Tx.s(R.string.common_gpu_driver), v -> GpuDriver.dialog(this, PICK_DRIVER)).chevron(this);   // custom GPU drivers (GpuDriver.java)
         sys.addView(gpuRow.view);
-        timeRow = new Ui.Setting(this, "🕒", Tx.s(R.string.common_time_of_day), v -> TimeOfDay.dialog(this, this::refreshSettings)).chevron(this);   // the clock the next start gives the game (Prefs.timeOverride → DM_TIME)
-        sys.addView(timeRow.view);
+
         Ui.Setting advRow = new Ui.Setting(this, "🛠️", Tx.s(R.string.settings_advanced), null).chevron(this);   // every switch the host offers, by area, with search (AdvancedPage.java)
         advRow.view.setOnClickListener(v -> AdvancedPage.show(this, null, null, () -> advRow.value(AdvancedSettings.count(this, null) == 0 ? Tx.s(R.string.common_search_every_switch_each_starts) : Tx.n(R.plurals.common_n_set, AdvancedSettings.count(this, null), AdvancedSettings.count(this, null)))));
         advRow.value(AdvancedSettings.count(this, null) == 0 ? Tx.s(R.string.common_search_every_switch_each_starts) : Tx.n(R.plurals.common_n_set, AdvancedSettings.count(this, null), AdvancedSettings.count(this, null)));
@@ -867,8 +769,6 @@ public final class MainActivity extends Activity {
         TextView tag = Ui.chip(this, Prefs.buildTag(this));   // which build this is (also the first line of every log)
         tag.setTextIsSelectable(true);
         about.addView(tag, Ui.wrap());
-        poppedText = Ui.small(this, poppedLine(Prefs.bananasPopped(this)));   // the background's bananas pop when tapped (BananaBackgroundView)
-        Ui.add(about, poppedText, 10);
         StringBuilder ids = new StringBuilder();   // the games this build includes, so a player can tell whether it has theirs (Profile.missing points here)
         for (Profile p : Profile.all()) ids.append("\n· ").append(p.name).append(" (").append(p.titleId).append(")");   // names and title IDs, not text   // names and title IDs, not text
         TextView t = Ui.small(this, Tx.s(R.string.settings_about_games, ids) + (BuildConfig.NX_LSFG ? "" : Tx.s(R.string.settings_built_without_lsfg)));
@@ -921,26 +821,83 @@ public final class MainActivity extends Activity {
         int n = 0;
         for (String[] it : Overlay.ITEMS) if (Prefs.overlayItem(this, it[0])) n++;
         overlayRow.value(ov ? Tx.s(R.string.home_on_n_of_m_items, n, Overlay.ITEMS.length) : Tx.s(R.string.game_off));
-        resRow.value(resLabel());
-        capRow.value(capLabel(Prefs.fpsCap(this)));
         upsRow.value(Tx.arr(R.array.arr_upscaler_modes)[GameUpscaler.mode(this)]);
         sharpRow.value(GameUpscaler.sharpName(GameUpscaler.sharp(this)));
         sharpRow.view.setVisibility(GameUpscaler.mode(this) == GameUpscaler.MODE_FSR ? View.VISIBLE : View.GONE);
-        drsRow.value(Prefs.DRS_NAMES[Prefs.drs(this)]);
         lsfgRow.value(!BuildConfig.NX_LSFG ? Tx.s(R.string.home_not_in_this_build) : Lsfg.on(this) ? Tx.s(R.string.home_on_multiplier, Lsfg.multiplier(this)) + (Lsfg.find(this) == null ? Tx.s(R.string.home_lossless_dll_missing) : "") : Tx.s(R.string.game_off));
         GpuDriver.Info d = GpuDriver.selected(this);
         gpuRow.value(d == null ? Tx.s(R.string.common_system) : d.label());
-        timeRow.value(TimeOfDay.label(this));
     }
 
     @Override public void onWindowFocusChanged(boolean focus) {
         super.onWindowFocusChanged(focus);
-        if (focus) refreshSettings();   // back from a dialog (GPU driver, Folders, …)
+        if (directBooted) return;
+        if (focus) refreshSettings();
     }
 
     @Override protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
-        fromIntent(i);
+        Intent gi = gated(i);
+        setIntent(gi);
+        if (gi != null && Intent.ACTION_MAIN.equals(gi.getAction()) && gi.hasCategory(Intent.CATEGORY_LAUNCHER)
+                && !gi.getBooleanExtra("open_setup", false) && tryDirectBoot(gi)) {
+            directBooted = true;
+            return;
+        }
+        fromIntent(gi);
+    }
+
+    private boolean tryDirectBoot(Intent i) {
+        if (i != null && (i.getBooleanExtra("open_setup", false) || i.hasExtra("frontend_game") || !AdbControl.asked(i::hasExtra).isEmpty())) return false;
+        java.util.Map<String, String> rec = ExitWatch.read(this);
+        if (ExitNotice.pending(rec)) {
+            int pid = -1;
+            try { String ps = rec.get("pid"); if (ps != null) pid = Integer.parseInt(ps); } catch (NumberFormatException ignored) {}
+            if (pid <= 0 || !ExitWatch.alive(this, pid)) {
+                if (ExitWatch.cause(this, rec, false) != null) return false;
+                ExitWatch.shown(this);
+            }
+        }
+        if (Ondevice.showing() && Ondevice.tileState() != Ondevice.TILE_DONE) return false;
+        Game card = findDirectBootGame();
+        if (card == null) return false;
+        Game g = Folders.repack(this, card);
+        File gd = new File(g.gameDir), pd = new File(g.packDir);
+        if (!CopyPlan.inApp(AppStorage.root(this), g.gameDir) && !Environment.isExternalStorageManager()) return false;
+        if (Folders.goneSave(this, g) != null || gone(g) != null || SaveUi.busy(g.titleId) || PackUi.busy(g.titleId)) return false;
+        Pack p;
+        try { p = Pack.read(pd); } catch (IOException e) { return false; }
+        if (PackCheck.blocking(this, p, gd) != null) return false;
+        String lp = Pack.libraryProblem(pd, g.titleId);
+        boolean onDemand = lp != null && Pack.shadersOnDemand(pd, g.titleId, Prefs.layerEnv(this, g.titleId));
+        boolean olderPlay = lp != null && !onDemand && Pack.playableLibrary(pd, g.titleId) != null;
+        boolean legacyPlay = lp != null && !onDemand && !olderPlay && Pack.legacyLibrary(pd, g.titleId) != null;
+        if (lp != null && !onDemand && !olderPlay && !legacyPlay) return false;
+        if (lp != null && !onDemand && (olderPlay || legacyPlay) && Ondevice.isDump(gd)) Ondevice.autoUpdate(this, gd, pd, g.titleId);
+        Prefs.markLayerExplained(this, g.titleId);
+        startDirect(g, i);
+        return true;
+    }
+
+    private Game findDirectBootGame() {
+        Game best = null;
+        for (Game x : Game.load(this)) {
+            if (!AOI_ID.equalsIgnoreCase(x.titleId)) continue;
+            if (best == null || x.used > best.used) best = x;
+        }
+        return best;
+    }
+
+    private void startDirect(Game g, Intent src) {
+        Ondevice.playTakesLead(this);
+        Game.touch(this, g);
+        Intent intent = new Intent(this, GameActivity.class)
+                .putExtra("title_id", g.titleId).putExtra("name", g.name).putExtra("game", g.gameDir)
+                .putExtra("pack", g.packDir).putExtra("direct_boot", true);
+        if (src != null && src.getBooleanExtra("no_pause", false)) intent.putExtra("no_pause", true);
+        startActivity(intent);
+        overridePendingTransition(0, 0);
+        finish();
     }
 
     /** adb: am start -n dev.nxnative.android/.MainActivity --es game <game folder> [--es pack <pack folder>] [--es save <save folder>] [--ez run true] adds the game without
@@ -994,6 +951,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        if (directBooted) return;
         resumed = true;
         if (gameBox != null && Game.load(this).size() != games.size()) refresh();   // a card FrontendLaunch added while Home was in the background
         onResumeViews();
@@ -1006,16 +964,14 @@ public final class MainActivity extends Activity {
 
     private void onResumeViews() {
         if (accessCard != null) accessCard.setVisibility(Environment.isExternalStorageManager() || !listNeedsAccess() ? View.GONE : View.VISIBLE);
-        bananas.setRunning(true);
         refreshSettings();
         workTick();
     }
 
-    /** The bananas stop while the screen is covered (a game, the self-test, settings) or off */
     @Override protected void onPause() {
+        if (directBooted) { super.onPause(); return; }
         resumed = false;
         UsersUi.commitName(this);
-        bananas.setRunning(false);
         Ondevice.pause(this);
         ExitWatch.pause();
         updateUi.removeCallbacks(updateRun);
@@ -1098,126 +1054,37 @@ public final class MainActivity extends Activity {
         games.clear();
         games.addAll(Game.load(this));
         if (gameBox == null) return;
-        if (BuildConfig.DEBUG && Prefs.demoGames(this)) { refreshDemo(); return; }   // test builds only: sample tiles to judge the look
-        if (!merged && games.size() > 1) {   // a list an older version left with two entries of one game: one card each (GameList.collapse; reads the dumps: off the main thread)
+        if (!merged && games.size() > 1) {
             merged = true;
             new Thread(() -> { if (Game.collapse(this)) runOnUiThread(() -> { if (!isFinishing()) refresh(); }); }, "nx-list-merge").start();
         }
         gameBox.removeAllViews();
         selectedTile = null;
-        if (addFab != null) addFab.setVisibility(View.VISIBLE);   // Add game is always there: with no game it is the only way in (#381: it was hidden and the welcome card had no button)
-        if (games.isEmpty() && !Ondevice.showing()) {   // no game: one line, the button has the focus
+        if (addFab != null) addFab.setVisibility(View.VISIBLE);
+        if (games.isEmpty() && !Ondevice.showing()) {
             gameBox.addView(emptyHint(), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
             noFocusTint(gameBox);
             if (addFab != null) addFab.post(() -> { if (addFab.isAttachedToWindow() && (!addFab.isInTouchMode() || PadFocus.hasGamepad()) && getCurrentFocus() == null) addFab.requestFocus(); });
             hintUpdate();
             return;
         }
-        // One tile per game: while a game is being prepared its tile carries the ring (workTile) and a tap opens the job's sheet (Ondevice.sheet); a game not listed yet gets its tile first
         workTiles.clear();
         ViewGroup row = homeBox();
         boolean prep = Ondevice.showing(), placed = false;
         if (prep) for (Game g : games) placed |= Ondevice.shows(g);
-        if (prep && !placed) { View t = prepTile(); addTile(row, t); workTile(t); }   // a game not listed yet: its tile first
-        View keep = null;
-        for (Game g : shownGames()) {
+        if (prep && !placed) { View t = prepTile(); addTile(row, t); workTile(t); }
+        for (Game g : games) {
             View t = gameCard(g);
             addTile(row, t);
             if (prep && Ondevice.shows(g)) workTile(t);
-            if (g.orderId().equals(keepSelected)) keep = layoutNow == HomeLayout.ROW ? t : (View) t.getParent();   // the grid's and the list's item holds the tile
         }
         startSelection(row);
-        if (keep != null) {   // after a move the selection stays on the moved game and the row scrolls to it (once the tiles are laid out)
-            final View moved = keep;
-            if (!moved.isInTouchMode()) moved.requestFocus();
-            selectTile(moved, false);
-            gameBox.postDelayed(() -> { if (moved.isAttachedToWindow()) selectTile(moved, true); }, 250);
-        }
-        keepSelected = null;
-        if (moveId != null && keep != null) { keep.setTranslationY(-dp(10)); keep.setScaleX(1.06f); keep.setScaleY(1.06f); keep.setTranslationZ(dp(12)); }   // the lifted game
         hintUpdate();
     }
 
-    // ---- Reorder games: a long press (or Y on a controller) on a tile opens Move left / Move right; the order is kept as game ids (GameOrder, Prefs.gameOrder) ----
-    private String keepSelected;
-
-    /** Home's games in the player's order; a game not in it goes last */
-    private List<Game> shownGames() { return GameOrder.sort(games, Prefs.gameOrder(this), Game::orderId); }
-
-    /**
-     * A game's options, from a long press on its tile (Hold X or Y on a controller): Move (a reorder mode, below), Set cover image (and Reset cover when it has one: CoverUi)
-     * and Remove game (GameDelete). A tile being prepared keeps its job sheet on a long press (workTile)
-     */
     private void optionsMenu(Game g) {
-        if (moveId != null) return;
-        List<String> labels = new ArrayList<>();
-        List<Runnable> acts = new ArrayList<>();
-        if (shownGames().size() > 1) { labels.add(Tx.s(R.string.home_move_game)); acts.add(() -> startMove(g)); }
-        labels.add(Tx.s(R.string.game_cover_set)); acts.add(() -> CoverUi.start(this, g));
-        if (CoverUi.has(this, g)) { labels.add(Tx.s(R.string.game_cover_reset)); acts.add(() -> CoverUi.reset(this, g)); }
-        labels.add(Tx.s(R.string.home_delete_game_menu)); acts.add(() -> GameDelete.ask(this, g));
-        new PadFocus.Builder(this).setTitle(g.name).setItems(labels.toArray(new String[0]), (d, w) -> acts.get(w).run()).show();
-    }
-
-    // ---- Move: a reorder mode. The game is lifted; D-pad (the grid: all four directions) or a tap on another game's place moves it, A or a tap on it puts it down, B cancels ----
-    private String moveId;
-    private List<String> moveOrig;
-
-    private void startMove(Game g) {
-        moveId = g.orderId();
-        moveOrig = new ArrayList<>();
-        for (Game x : shownGames()) moveOrig.add(x.orderId());
-        keepSelected = moveId;
-        refresh();
-        hintUpdate();
-    }
-
-    /** Moves the lifted game by delta places (clamped at the ends) */
-    private void stepMove(int delta) {
-        List<String> ids = new ArrayList<>();
-        for (Game x : shownGames()) ids.add(x.orderId());
-        List<String> now = GameOrder.move(ids, moveId, delta);
-        if (now.equals(ids)) return;
-        Prefs.gameOrder(this, GameOrder.write(now));
-        keepSelected = moveId;
-        refresh();
-    }
-
-    private void endMove(boolean keep) {
-        if (moveId == null) return;
-        if (!keep) Prefs.gameOrder(this, GameOrder.write(moveOrig));
-        keepSelected = moveId;
-        moveId = null;
-        moveOrig = null;
-        refresh();
-        hintUpdate();
-    }
-
-    /** A tap in move mode: on the lifted game puts it down, on another moves the lifted one to that place */
-    private void tapMove(Game g) {
-        if (g.orderId().equals(moveId)) { endMove(true); return; }
-        List<Game> shown = shownGames();
-        int from = -1, to = -1;
-        for (int k = 0; k < shown.size(); k++) { if (shown.get(k).orderId().equals(moveId)) from = k; if (shown.get(k).orderId().equals(g.orderId())) to = k; }
-        if (from >= 0 && to >= 0) stepMove(to - from);
-    }
-
-    /** A key while a game is lifted: true when it was used (the others are swallowed so nothing else on Home moves) */
-    private boolean moveKey(KeyEvent e) {
-        int k = e.getKeyCode();
-        boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
-        if (PadFocus.isBack(k) || k == KeyEvent.KEYCODE_BACK) { if (!down) endMove(false); return true; }
-        if (k == KeyEvent.KEYCODE_BUTTON_A || k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER) { if (down && e.getRepeatCount() == 0) endMove(true); return true; }
-        boolean rtl = layoutNow == HomeLayout.ROW && getResources().getConfiguration().getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
-        int cols = layoutNow == HomeLayout.GRID ? HomeLayout.columns(gameBox) : 1;
-        int d = 0;
-        if (k == KeyEvent.KEYCODE_DPAD_LEFT) d = rtl ? 1 : -1;
-        else if (k == KeyEvent.KEYCODE_DPAD_RIGHT) d = rtl ? -1 : 1;
-        else if (k == KeyEvent.KEYCODE_DPAD_UP) d = layoutNow == HomeLayout.GRID ? -cols : layoutNow == HomeLayout.LIST ? -1 : 0;
-        else if (k == KeyEvent.KEYCODE_DPAD_DOWN) d = layoutNow == HomeLayout.GRID ? cols : layoutNow == HomeLayout.LIST ? 1 : 0;
-        else return false;
-        if (down && d != 0) stepMove(d);
-        return true;
+        new PadFocus.Builder(this).setTitle(g.name)
+                .setItems(new String[] {Tx.s(R.string.home_delete_game_menu)}, (d, w) -> GameDelete.ask(this, g)).show();
     }
 
     // ---- The hint bar: the buttons that work now (HintBar), at the bottom of every page ----
@@ -1226,10 +1093,7 @@ public final class MainActivity extends Activity {
     void hintUpdate() {
         if (hint == null) return;
         boolean pad = HintBar.hasPad(this);
-        if (moveId != null) {
-            if (pad) hint.set(new String[] {"\u2194", Tx.s(R.string.hint_move)}, new String[] {"A", Tx.s(R.string.hint_place)}, new String[] {"B", Tx.s(R.string.hint_cancel)});
-            else hint.set(new String[] {null, Tx.s(R.string.hint_tap_move)});
-        } else if (onHome()) {
+        if (onHome()) {
             View f = getCurrentFocus();
             boolean onTile = f != null && f.getTag() instanceof TileInfo;
             if (games.isEmpty()) { if (pad) hint.set(new String[] {"A", Tx.s(R.string.home_add_game)}); else hint.set(); }
@@ -1278,18 +1142,16 @@ public final class MainActivity extends Activity {
     private void workTick() {
         workUi.removeCallbacks(workRun);
         if (!resumed || workTiles.isEmpty()) return;
-        boolean demo = BuildConfig.DEBUG && Prefs.demoGames(this);   // the sample tiles: a made-up progress
-        float p = demo ? (System.currentTimeMillis() / 150 % 100) / 100f : Ondevice.progress();
-        String line = demo ? Tx.s(R.string.common_preparing) : Ondevice.progressLine();
-        int state = demo ? Ondevice.TILE_RUNNING : Ondevice.tileState();
+        float p = Ondevice.progress();
+        String line = Ondevice.progressLine();
+        int state = Ondevice.tileState();
         int detail = line.indexOf(": ");   // the tile names the stage only; its detail (the files, the counts) is in the job's sheet and the log
         if (detail > 0) line = line.substring(0, detail);
         for (TileInfo ti : workTiles) {   // the job's state on the ring: running (the arc), waiting (it goes round), paused (the arc stays, II), failed (full, red, !), done
-            ti.ring.set(state == Ondevice.TILE_QUEUED ? -1f : state == Ondevice.TILE_FAILED || state == Ondevice.TILE_DONE ? 1f : p);
+            ti.ring.set(state == Ondevice.TILE_QUEUED ? -1f : state == Ondevice.TILE_RUNNING || state == Ondevice.TILE_PAUSED ? p : 1f);
             ti.ring.look(state == Ondevice.TILE_FAILED ? Ui.col(this, R.color.bn_danger) : state == Ondevice.TILE_PAUSED ? 0xFFFFFFFF : ti.ring.baseColor(),
                     state == Ondevice.TILE_FAILED ? "!" : state == Ondevice.TILE_PAUSED ? "II" : null);
             ti.workLine = line;
-            HomeLayout.caption(ti);
             ti.ot.setText(line + "\n" + Tx.s(R.string.home_tile_details));   // a hint that the tile opens the job's sheet
             ti.ring.setContentDescription(null);
         }
@@ -1314,7 +1176,6 @@ public final class MainActivity extends Activity {
         hs.setHorizontalScrollBarEnabled(false);
         hs.setClipToPadding(false);
         hs.setClipChildren(false);
-        hs.setOnTouchListener(popListener(hs));   // a tap on the empty part of the row pops a banana
         hs.setHorizontalFadingEdgeEnabled(true);   // a soft edge where more tiles are off screen
         hs.setFadingEdgeLength(dp(40));
         hs.setOverScrollMode(View.OVER_SCROLL_NEVER);
@@ -1379,16 +1240,9 @@ public final class MainActivity extends Activity {
         return b;
     }
 
-    private int layoutNow = HomeLayout.ROW;   // the layout Home was built in (Prefs.homeLayout, read at each refresh)
-
-    /** The box Home's tiles go into, for the chosen layout: the sideways row, or the grid or the list (HomeLayout) */
-    private ViewGroup homeBox() {
-        layoutNow = HomeLayout.mode(this);
-        return layoutNow == HomeLayout.ROW ? tileRow() : HomeLayout.container(this, gameBox, layoutNow);
-    }
+    private ViewGroup homeBox() { return tileRow(); }
 
     private void addTile(ViewGroup row, View v) {
-        if (layoutNow != HomeLayout.ROW) { HomeLayout.add(this, row, layoutNow, (FrameLayout) v); return; }
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(150), dp(150));
         if (row.getChildCount() > 0) lp.setMarginStart(dp(16));
         row.addView(v, lp);
@@ -1441,7 +1295,7 @@ public final class MainActivity extends Activity {
         c.setFocusable(true);
         c.setClickable(true);
         c.setContentDescription(name);
-        c.setOnClickListener(v -> { if (moveId == null && ov.getVisibility() == View.VISIBLE && st.hasOnClickListeners()) st.performClick(); else open.onClick(v); });   // a tile with something to do (Prepare, Fix the save folder) does it; a long press opens the page
+        c.setOnClickListener(v -> { if (ov.getVisibility() == View.VISIBLE && st.hasOnClickListeners()) st.performClick(); else open.onClick(v); });
         c.setOnLongClickListener(v -> { open.onClick(v); return true; });   // a game's tile: gameCard makes this the reorder menu
         c.setOnTouchListener((v, e) -> { if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) selectTile(c, false); return false; });   // a touch selects it (it grows) before the tap
         st.addTextChangedListener(new android.text.TextWatcher() {
@@ -1458,16 +1312,14 @@ public final class MainActivity extends Activity {
         st.setTag(ST_HIDDEN);
         LinearLayout meta = new LinearLayout(this);
         meta.setOrientation(LinearLayout.VERTICAL);
-        FrameLayout c = artTile(g.name, st, meta, v -> { if (moveId != null) tapMove(g); else manage(g); });   // in move mode a tap places the lifted game
-        c.setOnLongClickListener(v -> { optionsMenu(g); return true; });   // the game's options (workTile puts the job's sheet back on the tile being prepared)
+        FrameLayout c = artTile(g.name, st, meta, v -> manage(g));
+        c.setOnLongClickListener(v -> { optionsMenu(g); return true; });
         TextView tile = (TextView) c.getChildAt(0);
-        boolean ownCover = Covers.show(tile, g);   // the player's own cover wins over the game's icon
         GameMeta.loadControl(new File(g.gameDir), Edition.control(this, g), m -> {
-            if (m.icon != null && !ownCover) Ui.tileIcon(tile, m.icon);
+            if (m.icon != null) Ui.tileIcon(tile, m.icon);
             TileInfo ti = (TileInfo) c.getTag();
             ti.version = m.version;
-            HomeLayout.caption(ti);   // the grid's and the list's second line
-        });   // with the edition switch on, program 1's icon
+        });
         if (Profile.of(g.titleId) == null) {   // no profile in this APK: it cannot run here (Profile.missing says why); the page still has its folders, saves and Remove
             state(st, Tx.s(R.string.common_not_in_this_app_version), R.color.bn_danger, 0);
             return c;
@@ -1484,33 +1336,6 @@ public final class MainActivity extends Activity {
         t.setGravity(Gravity.CENTER);
         t.setTextSize(15);
         return t;
-    }
-
-    // ---- Sample games (test builds): what Home looks like with games, without any ----
-
-    private static final String[][] DEMO = {
-            {"Mario Kart World", "Ready", "#2B6FD1"}, {"Donkey Kong Bananza", "Ready", "#E8A317"}, {"Zelda: Ocarina of Time", "Needs preparing", "#2E9D5B"},
-            {"Pok\u00e9mon Pokopia", "Ready \u00b7 update", "#C0392B"}, {"Star Fox", "Preparing\u2026", "#6C5CE7"}, {"Mario Tennis Fever", "Not in this app version", "#8A5A2B"},
-            {"Splatoon Raiders", "Ready \u00b7 updating shaders", "#D35400"}, {"Metroid Prime 4", "Ready \u00b7 checking shaders", "#16A085"}};
-
-    private void refreshDemo() {
-        gameBox.removeAllViews();
-        selectedTile = null;
-        workTiles.clear();
-        ViewGroup row = homeBox();
-        for (String[] d : DEMO) {
-            boolean bad = d[1].startsWith("Not"), ready = d[1].startsWith("Ready");
-            TextView st = Ui.status(this, d[1], bad ? R.color.bn_danger : ready && !d[1].contains("update") ? R.color.bn_leaf : R.color.bn_accent);
-            st.setTag(d[1].contains("ing shaders") ? ST_SOFT | ST_WORKING : ready && !d[1].contains("update") ? ST_HIDDEN : ready ? ST_SOFT : 0);   // sample tiles: the kind of state, as the real ones
-            if (d[1].contains("updating shaders")) shaderProgress.put(st, 0.4f);
-            FrameLayout c = artTile(d[0], st, new LinearLayout(this), v -> gameSettings(new Game(d[0].startsWith("Donkey") ? "040074A01BF12000" : "0000000000000000", d[0], "/sdcard/Download/demo/" + d[0], "/sdcard/Download/demo/pack")));   // the sample opens a real game page (the first sample has the APK's profile, so every tab shows)
-            TextView tile = (TextView) c.getChildAt(0);
-            tile.setBackground(Ui.round(android.graphics.Color.parseColor(d[2]), dp(22), 0, 0));
-            tile.setTextColor(android.graphics.Color.WHITE);
-            addTile(row, c);
-            if (d[1].startsWith("Prepar")) workTile(c);   // the sample of a game being prepared: a ring that goes round
-        }
-        startSelection(row);
     }
 
     /** Why a game cannot start as it is, in a few words (unfinished or busy pack code, another game build, no current shader library), and whether Prepare fixes it */
@@ -1936,15 +1761,8 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (Ondevice.activityResult(this, request, result, data)) return;
-        if (Covers.activityResult(this, request, result, data)) return;
-        if (request == ReadinessActivity.REQUEST) { if (result == ReadinessActivity.FIX_DRIVER) GpuDriver.dialog(this, PICK_DRIVER); return; }   // its "Pick a GPU driver"
+        if (request == ReadinessActivity.REQUEST) { if (result == ReadinessActivity.FIX_DRIVER) GpuDriver.dialog(this, PICK_DRIVER); return; }
         if (result != RESULT_OK || data == null || data.getData() == null) return;
-        if (request == PICK_BG) {
-            if (UiLook.pickBackground(this, data.getData())) { Prefs.background(this, 2); bananas.setLook(2); }
-            else Toast.makeText(this, Tx.s(R.string.home_that_file_is_not_a), Toast.LENGTH_LONG).show();
-            if (settingsPage) build();
-            return;
-        }
         if (request == UsersUi.PICK_PHOTO) {   // a player's own picture
             if (usersEdit != null && !UsersUi.setPhoto(this, usersEdit, data.getData())) Toast.makeText(this, Tx.s(R.string.settings_that_picture_could_not_be_read), Toast.LENGTH_LONG).show();
             userChanged();
@@ -2371,32 +2189,7 @@ public final class MainActivity extends Activity {
         Ui.sheet(this, Tx.s(R.string.home_overlay), box).setPositiveButton(Tx.s(R.string.common_done), null).setOnDismissListener(d -> refreshSettings()).show();
     }
 
-    private String resLabel() { return Prefs.windowName(Prefs.window(this), true); }
-
-    /** Game resolution: the window size the host gives the game (DM_WINDOW), from the next start */
-    private void gameRes() {
-        int i = Math.max(0, java.util.Arrays.asList(Prefs.WINDOWS).indexOf(Prefs.window(this)));
-        new PadFocus.Builder(this).setTitle(Tx.s(R.string.home_game_resolution)).setSingleChoiceItems(Prefs.WINDOW_NAMES, i, (d, w) -> { Prefs.window(this, Prefs.WINDOWS[w]); refreshSettings(); d.dismiss(); })
-                .setNegativeButton(Tx.s(R.string.common_cancel), null).show();
-    }
-
     static String capLabel(int v) { return v < 0 ? Tx.s(R.string.home_default) : v == 0 ? Tx.s(R.string.game_the_game_s_own) : v + " fps"; }
-
-    /** The frame rate cap the next start uses (Prefs.fpsCap, DM_FPS_TARGET); the in-game panel changes it while the game runs */
-    private void fpsCap() {
-        int cur = Prefs.fpsCap(this), n = Prefs.FPS_CAPS.length;
-        String[] labels = new String[n + 1];
-        labels[0] = capLabel(-1);
-        int checked = 0;
-        for (int k = 0; k < n; k++) {
-            int v = Prefs.FPS_CAPS[k];
-            labels[k + 1] = capLabel(v);
-            if (v == cur) checked = k + 1;
-        }
-        new PadFocus.Builder(this).setTitle(Tx.s(R.string.common_frame_rate_cap))
-                .setSingleChoiceItems(labels, checked, (d, w) -> { Prefs.fpsCap(this, w == 0 ? -1 : Prefs.FPS_CAPS[w - 1]); refreshSettings(); d.dismiss(); })
-                .setNegativeButton(Tx.s(R.string.common_cancel), null).show();
-    }
 
     /** Frame generation's settings and the Lossless.dll found (or a manual pick when it is in none of the known places) */
     private void frameGen() {

@@ -25,16 +25,6 @@ final class Prefs {
     static boolean overlay(Context c) { return of(c).getBoolean("overlay", true); }
     static void overlay(Context c, boolean on) { of(c).edit().putBoolean("overlay", on).commit(); }
 
-    /** Home's tile order the player chose (GameOrder: game ids, one per line); empty: the order the games were added in */
-    static java.util.List<String> gameOrder(Context c) { return GameOrder.decode(of(c).getString("game_order", "")); }
-    static void gameOrder(Context c, java.util.List<String> ids) { of(c).edit().putString("game_order", GameOrder.encode(ids)).commit(); }
-    /** Home's layout (HomeLayout): 0 the sideways row of tiles (default), 1 a grid with the names, 2 a list */
-    static int homeLayout(Context c) { return of(c).getInt("home_layout", 0); }
-    static void homeLayout(Context c, int v) { of(c).edit().putInt("home_layout", v).commit(); }
-
-    /** The bananas popped on the launcher's background (BananaBackgroundView), all time; shown in Settings › About */
-    static long bananasPopped(Context c) { return of(c).getLong("bananas_popped", 0); }
-    static long addBananaPopped(Context c) { long n = bananasPopped(c) + 1; of(c).edit().putLong("bananas_popped", n).commit(); return n; }
     /** The in-game clean picture: stats, log, build tag, on-screen controls and the panel arrow hidden together. One saved flag, so hiding survives a
      *  restart as a whole; the overlay and log settings themselves are not changed, and showing everything returns to them. */
     static boolean clean(Context c) { return of(c).getBoolean("clean", false); }
@@ -680,19 +670,12 @@ final class Prefs {
     static String aspect(Context c, String titleId) { return of(c).getString(gameKey("aspect", titleId), null); }
     static void aspect(Context c, String titleId, String label) { put(c, gameKey("aspect", titleId), label); }
 
-    // ---- Look: theme, background, UI sounds (Settings › Appearance) ----
+    // ---- Look: theme, UI sounds (Settings › Appearance) ----
     static final String[] THEME_NAMES = {"Follow the system", "Light", "Dark"};
-    static final String[] BACKGROUND_NAMES = {"Bananas", "Plain", "My picture"};
-    /** The launcher's theme: 0 follows the system, 1 light, 2 dark (NxApp.applyTheme) */
-    static int theme(Context c) { return of(c).getInt("ui_theme", 0); }
+    /** The launcher's theme: 0 follows the system, 1 light, 2 dark obsidian default (NxApp.applyTheme) */
+    static int theme(Context c) { return of(c).getInt("ui_theme", 2); }
     static void theme(Context c, int v) { of(c).edit().putInt("ui_theme", v).commit(); }
-    /** The launcher's background: 0 drifting bananas (the default), 1 plain, 2 the user's picture (UiLook.backgroundFile) */
-    static int background(Context c) { return of(c).getInt("ui_background", 0); }
-    static void background(Context c, int v) { of(c).edit().putInt("ui_background", v).commit(); }
     /** The launcher's click and focus sounds (UiSound); on by default */
     static boolean uiSounds(Context c) { return of(c).getBoolean("ui_sounds", true); }
     static void uiSounds(Context c, boolean on) { of(c).edit().putBoolean("ui_sounds", on).commit(); }
-    /** Test builds: Home shows sample games (MainActivity.refreshDemo) */
-    static boolean demoGames(Context c) { return of(c).getBoolean("demo_games", false); }
-    static void demoGames(Context c, boolean on) { of(c).edit().putBoolean("demo_games", on).commit(); }
 }

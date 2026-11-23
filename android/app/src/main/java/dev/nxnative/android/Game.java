@@ -35,8 +35,6 @@ final class Game implements GameList.View {
 
     @Override public String titleId() { return titleId; }
 
-    /** The game's place in Home's order (GameOrder): its title ID and pack, never its position in the list */
-    String orderId() { return GameOrder.id(titleId, packDir); }
     @Override public String gameDir() { return gameDir; }
     @Override public long used() { return used; }
 

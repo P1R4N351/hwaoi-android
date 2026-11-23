@@ -58,7 +58,6 @@ final class GameDelete {
             list.removeIf(x -> x.gameDir.equals(g.gameDir));
             Game.save(a, list);
         }
-        Covers.delete(g.orderId());   // the player's own cover picture goes with the game
         PickedNup.forget(a, new File(g.gameDir));   // a .nup used where it is: its read permission goes back (another entry of it keeps it)
         a.refresh();
         AlertDialog wait = new PadFocus.Builder(a).setMessage(Tx.s(R.string.game_removing)).setCancelable(false).show();

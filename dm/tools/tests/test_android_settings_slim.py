@@ -25,12 +25,12 @@ class Grouping(unittest.TestCase):
         # rows added to the group: only the defaults a game's page can override and that are not input
         in_group = set(re.findall(r'perf\.addView\(new Ui\.Setting\(this, "[^"]+", "([^"]+)"', b))
         in_group |= set(re.findall(r'perf\.addView\((\w+)Row\.view', b))
-        self.assertEqual(in_group, {'Use fast cores', 'res', 'cap', 'ups', 'sharp', 'drs'})
+        self.assertEqual(in_group, {'Use fast cores', 'ups', 'sharp'})
 
     def test_top_level_rows(self):
         b = settings_body()
         for row in ('"Check for updates"', '"Player wiki"', '"Folders"', '"Storage"', '"Keep the screen on while preparing"', '"GPU driver"', '"Advanced"',
-                    '"Readiness check"', '"Graphics self-test"', '"Share log"', '"Tester settings"', '"ADB control (debug)"', '"Time of day"', '"Frame generation"'):
+                    '"Readiness check"', '"Graphics self-test"', '"Share log"', '"Tester settings"', '"ADB control (debug)"', '"Frame generation"'):
             self.assertIn(row, b)
         for row in ('ctl.addView(new Ui.Setting(this, "📳", "Rumble"', 'ctl.addView(xbox.view)', 'ctl.addView(padMap.view)', 'ctl.addView(touch.view)', 'ctl.addView(padPanel.view)', 'play.addView(rot.view)'):
             self.assertIn(row, b)

@@ -15,7 +15,7 @@ TEST = JAVA / 'jvmtest/java/dev/nxnative/android/AdbControlJvmTest.java'
 # The handlers MainActivity.fromIntent calls (and start(), which reads no_pause from the launcher's intent)
 HANDLERS = [JAVA / 'main/java/dev/nxnative/android/MainActivity.java', JAVA / 'main/java/dev/nxnative/android/GpuDriver.java',
             JAVA / 'main/java/dev/nxnative/android/PackUi.java', JAVA / 'ondevice/java/dev/nxnative/android/Ondevice.java']
-NOT_CONTROL = {'frontend_game'}   # FrontendLaunch's hand-over: what the exported .Launch alias already does for any app
+NOT_CONTROL = {'frontend_game', 'open_setup'}   # FrontendLaunch's hand-over: what the exported .Launch alias already does for any app
 EXTRA = re.compile(r'(?:get\w*Extra|hasExtra)\("([a-z_]+)"')
 
 

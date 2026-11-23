@@ -18,7 +18,6 @@ class Wiring(unittest.TestCase):
         self.assertIn('nxhost_cheat_set', (REPO / 'dm/host/hle_cheats.c').read_text(encoding='utf-8'))
         self.assertIn('Native_cheatSet', (REPO / 'android/app/src/main/cpp/nxlaunch.c').read_text(encoding='utf-8'))
         self.assertIn('native int cheatSet', (SRC / 'Native.java').read_text(encoding='utf-8'))
-        self.assertIn('Native.cheatSet', (SRC / 'SidePanel.java').read_text(encoding='utf-8'))
 
     def test_profile_column(self):
         self.assertIn("tsvRows(game, 'cheats')", (REPO / 'android/app/build.gradle').read_text(encoding='utf-8'))

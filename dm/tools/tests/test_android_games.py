@@ -28,8 +28,8 @@ class Games(unittest.TestCase):
         games = default_games()
         self.assertTrue(games, 'gradle.properties has no nxGames row')
         self.assertEqual(len(games), len(set(games)), 'a game twice in nxGames')
-        self.assertEqual(set(games), android_profiles(), 'nxGames must be the profiles with a readiness.tsv status row')
-        self.assertEqual(games[0], '040074A01BF12000', 'the first (the default game, the self-test\'s host) stays Donkey Kong Bananza')
+        self.assertEqual(games, ['04003F40232DE000'], 'AoI Native builds single-game 04003F40232DE000 by default')
+        self.assertIn('04003F40232DE000', android_profiles())
 
     def test_listed_games_have_what_the_build_reads(self):
         for g in default_games():

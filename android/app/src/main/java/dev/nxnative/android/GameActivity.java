@@ -1048,7 +1048,23 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
 
     /** A game a frontend started (FrontendLaunch): the app's task goes behind the frontend, so its stop shows the frontend, not Home */
-    void backToFrontend() { if (getIntent().getBooleanExtra("frontend", false)) moveTaskToBack(true); }
+    static final int PICK_DRIVER = 44;
+
+    @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request == PICK_DRIVER && result == RESULT_OK && data != null && data.getData() != null) {
+            String tid = titleId();
+            GpuDriver.picked(this, data.getData());
+            GpuDriver.choice(this, tid, null);
+        }
+    }
+
+    void backToFrontend() {
+        if (getIntent().getBooleanExtra("frontend", false) || getIntent().getBooleanExtra("direct_boot", false)) {
+            moveTaskToBack(true);
+            finishAndRemoveTask();
+        }
+    }
 
     /**
      * The screen goes (Stop, or Android recreating the activity while the game runs, which then attaches a new one): what hostSetup registered is let go, and the

@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark mode: a neutral night with the same banana yellow -->
-    <color name="bn_bg">#FF1B1B1F</color>
-    <color name="bn_card">#FF2A2A30</color>
-    <color name="bn_card_stroke">#FF3A3A42</color>
-    <color name="bn_tint">#FF37373F</color>
-    <color name="bn_banana">#FFFFD43B</color>
-    <color name="bn_banana_deep">#FFF2B705</color>
-    <color name="bn_on_banana">#FF3B2611</color>
-    <color name="bn_text">#FFF2F2F4</color>
-    <color name="bn_text_2">#FFB4B4BC</color>
-    <color name="bn_accent">#FFFFD43B</color>
-    <color name="bn_leaf">#FF7FC79A</color>
-    <color name="bn_on_leaf">#FF10241A</color>
-    <color name="bn_danger">#FFFF9670</color>
-    <color name="bn_danger_tint">#FF3D2016</color>
-    <color name="bn_warn_tint">#FF3F3014</color>
+    <!-- Age of Imprisonment obsidian theme: carved basalt slate, Secret Stone amber-gold, and Zonai luminous teal -->
+    <color name="bn_bg">#FF141311</color>
+    <color name="bn_card">#FF211F1B</color>
+    <color name="bn_card_stroke">#FF3A352C</color>
+    <color name="bn_tint">#FF2C2923</color>
+    <color name="bn_banana">#FFE8B84B</color>
+    <color name="bn_banana_deep">#FFD99B26</color>
+    <color name="bn_on_banana">#FF171614</color>
+    <color name="bn_text">#FFF3EFE6</color>
+    <color name="bn_text_2">#FFB5ADA0</color>
+    <color name="bn_accent">#FF5AC8B8</color>
+    <color name="bn_leaf">#FF5AC8B8</color>
+    <color name="bn_on_leaf">#FF0E221F</color>
+    <color name="bn_danger">#FFE05A47</color>
+    <color name="bn_danger_tint">#FF361B18</color>
+    <color name="bn_warn_tint">#FF382C14</color>
 </resources>
