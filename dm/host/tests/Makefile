@@ -80,6 +80,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_oot_fog
 	$(B)/t_oot_companion_tap
 	$(B)/t_oot_companion_waist
+	$(B)/t_ktgl_companion
 	$(B)/t_dkb_wide
 	$(B)/t_mkw_wide
 	$(B)/t_mtf_size
@@ -789,6 +790,10 @@ $(B)/t_oot_companion_tap: t_oot_companion_tap.c ../android/oot_companion_tap.h |
 run: $(B)/t_oot_companion_waist
 $(B)/t_oot_companion_waist: t_oot_companion_waist.c ../android/oot_companion.h ../android/companion_state.h ../android/oot_companion_tap.h | $(B)
 	$(CLANG) -O1 -g -Wall -Wextra -Werror -o $@ t_oot_companion_waist.c -lm
+
+run: $(B)/t_ktgl_companion
+$(B)/t_ktgl_companion: t_ktgl_companion.c ../android/ktgl_companion.h ../android/companion_state.h ../android/companion_trail.h ../android/companion_seq.h | $(B)
+	$(CLANG) -O1 -g -Wall -Wextra -Werror -o $@ t_ktgl_companion.c -lm
 
 run: $(B)/t_dkb_wide
 $(B)/t_dkb_wide: t_dkb_wide.c ../android/dkb_wide.c ../android/wide_shape.h ../hle.h ../dm.h $(GAME_H) | $(B)

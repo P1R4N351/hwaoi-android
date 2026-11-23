@@ -21,6 +21,8 @@ import java.util.Map;
 final class BifrostBridge {
     private static final String TAG = "OotBifrost";
     private static final String OOT_TITLE_ID = "0400486024DEC000";
+    private static final String AOI_TITLE_ID = "04003F40232DE000";
+    private static volatile BifrostBridge current;
 
     private final Context context;
     private final BifrostLooks.Feed feed;
@@ -34,15 +36,16 @@ final class BifrostBridge {
     private String said = "";
 
     static BifrostBridge create(Activity activity, String gameId) {
-        if (!OOT_TITLE_ID.equals(gameId)) return null;
+        boolean aoi = AOI_TITLE_ID.equals(gameId);
+        if (!OOT_TITLE_ID.equals(gameId) && !aoi) return null;
         int mode = Native.bifrostMode();
         if (mode == 0) return null;
-        return new BifrostBridge(activity.getApplicationContext(), mode == 2);
+        return new BifrostBridge(activity.getApplicationContext(), mode == 2, aoi);
     }
 
-    private BifrostBridge(Context context, boolean classic) {
+    private BifrostBridge(Context context, boolean classic, boolean aoi) {
         this.context = context;
-        this.feed = new BifrostLooks.Feed(classic);
+        this.feed = new BifrostLooks.Feed(classic, aoi);
     }
 
     void start() {
@@ -62,6 +65,7 @@ final class BifrostBridge {
             return;
         }
         running = true;
+        current = this;
         int token = ++generation;
         Handler queue = worker;
         queue.post(new Runnable() {
@@ -107,6 +111,7 @@ final class BifrostBridge {
     void close() {
         running = false;
         ++generation;
+        if (current == this) current = null;
         HandlerThread ending = thread;
         thread = null;
         Handler queue = worker;
@@ -120,6 +125,22 @@ final class BifrostBridge {
 
     private List<BifrostLooks.Command> stopped() {
         synchronized (feed) { return feed.stop(SystemClock.elapsedRealtime()); }
+    }
+
+    static void touched() {
+        BifrostBridge bridge = current;
+        if (bridge == null || !bridge.running || bridge.dead) return;
+        Handler queue = bridge.worker;
+        int token = bridge.generation;
+        if (queue == null) return;
+        queue.post(() -> {
+            if (token != bridge.generation || bridge.dead) return;
+            try {
+                List<BifrostLooks.Command> cmds;
+                synchronized (bridge.feed) { cmds = bridge.feed.touch(SystemClock.elapsedRealtime()); }
+                bridge.send(cmds);
+            } catch (Throwable failed) { bridge.fail(failed); }
+        });
     }
 
     private void fail(Throwable failed) {

@@ -182,6 +182,14 @@ final class Native {
     static native boolean companionState(long[] out);
     /** Sets the user-chosen companion page index (-1 when none / cleared) */
     static native void companionSetPage(int page);
+    /** Detailed KTGL Warriors companion snapshot (ints[32], flts[416]): returns newline-delimited pin labels or null */
+    static native String companionDetail(int[] ints, float[] flts);
+    /** Fires a write-safe companion input action or combo chord (ktgl_companion.h action ID) */
+    static native boolean companionFire(int actionId);
+    /** Immediately aborts any running companion input chord */
+    static native void companionAbortSeq();
+    /** Session tactical pins: op 0=add at current pose, 1=remove slot, 2=clear all */
+    static native int companionPin(int op, int slot, String label);
     /** Bifrost stick-LED bridge mode (DM_BIFROST): 0 off, 1 Pip-Boy feed (default), 2 classic public effects */
     static native int bifrostMode();
 }

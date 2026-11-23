@@ -499,6 +499,7 @@
     <string name="home_copied_into_the_app">已复制到应用中：%1$s</string>
     <string name="home_game_now_uses">%1$s 现在使用 %2$s。</string>
     <string name="home_lossless_dll_not_installed">未安装 Lossless.dll：%1$s</string>
+    <string name="home_tile_details">详情 ›</string>
     <string name="home_checking_name">正在检查 %1$s…</string>
     <plurals name="home_checking_games">
         <item quantity="other">正在检查 %1$d 个游戏…</item>
@@ -1292,7 +1293,6 @@
     <string name="settings_player_id">玩家 ID</string>
     <string name="settings_player_id_hint">名称只是标签：存档跟随 ID，所以改名不会移动或混淆存档。</string>
     <string name="settings_that_picture_could_not_be_read">无法读取该图片</string>
-    <string name="home_tile_details">详情 ›</string>
     <string name="home_move_left">向左移动</string>
     <string name="home_move_right">向右移动</string>
     <string name="home_delete_game_menu">移除游戏…</string>
@@ -1353,4 +1353,7 @@
     <string name="game_stick_leds_bifrost">摇杆灯效 (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">在 AYN Thor 上随心心、暂停界面与时之笛变化（启动时生效）</string>
     <string name="game_stick_leds_bifrost_off">由 Bifrost 自行控制 AYN Thor 摇杆灯效</string>
+    <string name="game_companion_hud">副屏伴侣 HUD</string>
+    <string name="game_companion_drawer">副屏伴侣抽屉（战术雷达、指令与连招图鉴）</string>
+    <string name="game_companion_display4_note">检测到内置副屏 Display 4 时自动显示</string>
 </resources>

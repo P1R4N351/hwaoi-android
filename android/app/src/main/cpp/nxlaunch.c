@@ -640,6 +640,14 @@ JNIEXPORT jstring JNICALL Java_dev_nxnative_android_Native_skipStatus(JNIEnv *en
 int nxhost_companion_state(int64_t out[8]);
 #pragma weak nxhost_companion_set_page
 void nxhost_companion_set_page(int page);
+#pragma weak nxhost_companion_detail
+int nxhost_companion_detail(int32_t *ints, int max_ints, float *flts, int max_flts, char *txt, int max_txt);
+#pragma weak nxhost_companion_fire
+int nxhost_companion_fire(int action_id);
+#pragma weak nxhost_companion_abort_seq
+void nxhost_companion_abort_seq(void);
+#pragma weak nxhost_companion_pin
+int nxhost_companion_pin(int op, int slot, const char *label);
 
 JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_companionState(JNIEnv *env, jclass cls, jlongArray out) {
     (void)cls;
@@ -655,6 +663,38 @@ JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_companionState(JNIEn
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionSetPage(JNIEnv *env, jclass cls, jint page) {
     (void)env; (void)cls;
     if (nxhost_companion_set_page) nxhost_companion_set_page((int)page);
+}
+
+JNIEXPORT jstring JNICALL Java_dev_nxnative_android_Native_companionDetail(JNIEnv *env, jclass cls, jintArray ints, jfloatArray flts) {
+    (void)cls;
+    if (!ints || !flts || !nxhost_companion_detail) return NULL;
+    if ((*env)->GetArrayLength(env, ints) < 32 || (*env)->GetArrayLength(env, flts) < 416) return NULL;
+    jint ibuf[32] = {0};
+    jfloat fbuf[416] = {0};
+    char txt[512] = "";
+    if (!nxhost_companion_detail((int32_t *)ibuf, 32, (float *)fbuf, 416, txt, sizeof txt)) return NULL;
+    (*env)->SetIntArrayRegion(env, ints, 0, 32, ibuf);
+    (*env)->SetFloatArrayRegion(env, flts, 0, 416, fbuf);
+    return (*env)->NewStringUTF(env, txt);
+}
+
+JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_companionFire(JNIEnv *env, jclass cls, jint actionId) {
+    (void)env; (void)cls;
+    return (nxhost_companion_fire && nxhost_companion_fire((int)actionId)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionAbortSeq(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    if (nxhost_companion_abort_seq) nxhost_companion_abort_seq();
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionPin(JNIEnv *env, jclass cls, jint op, jint slot, jstring label) {
+    (void)cls;
+    if (!nxhost_companion_pin) return -1;
+    char *s = label ? jstr(env, label) : NULL;
+    int r = nxhost_companion_pin((int)op, (int)slot, s);
+    free(s);
+    return (jint)r;
 }
 
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_bifrostMode(JNIEnv *env, jclass cls) {

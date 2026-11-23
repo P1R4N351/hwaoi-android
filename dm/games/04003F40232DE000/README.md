@@ -71,3 +71,9 @@ Verified live on a 16 GB **AYN Thor** (`QCS8550` / `Adreno (TM) 740`, Android 13
 - **KTGL shader/layout front-caches & VP9 NV12 optimizations (`DM_VK_KTGL_CACHE=1`, `DM_MOVIE_FAST_NV12=1`, `DM_MOVIE_LOOP_OPT=1`):** Zero-write `512x4` separable program and layout front-caches (`884,000 -> 0` steady `g_mu` locks; `6.58x–6.98x` in `t_ktgl_cache`), narrow `qdx_convert` transfer/compute barriers, border-only NV12 black padding (`1.25x–1.38x` on `720p -> 1080p`), and `VP9D_SET_LOOP_FILTER_OPT=1`. See [KTGL commonalities & cross-venture optimizations](../../../docs/ktgl-commonalities.md).
 
 Support this port: [README](../../../README.md#support)
+
+
+## Second-Screen Companion (`Display 4` & Opt-In Drawer)
+
+- Implemented via `WarriorsCompanionController` + `WarriorsCompanionPresentation` (`FLAG_NOT_FOCUSABLE`) + `CompanionDisplay` PnP matcher + `WarriorsCompanionView` / `WarriorsCompanionDraw` / `WarriorsCompanionModel` backed by `ktgl_companion.h` (`04003F40232DE000` Zonai jade-teal `#5AC8B8` & Secret Stone amber `#E8B84B` theme) and `BifrostBridge` (`AOI_BASE` / `AOI_OPEN`).
+- Live telemetry feeds `nxhost_fps`, `dm_movie_playing()` cutscene auto-dimming, `nxhost_paused()`, `dm_fs_commit_count()` (`DATA.BIN`), `nxhost_companion_pad_peek`, and `nxhost_companion_buttons_set` write-safe 2-step shoulder/combo chords.

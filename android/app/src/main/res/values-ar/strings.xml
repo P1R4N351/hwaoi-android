@@ -499,6 +499,7 @@
     <string name="home_copied_into_the_app">تم النسخ إلى التطبيق: %1$s</string>
     <string name="home_game_now_uses">%1$s يستخدم الآن %2$s.</string>
     <string name="home_lossless_dll_not_installed">لم يُثبَّت Lossless.dll: %1$s</string>
+    <string name="home_tile_details">التفاصيل ›</string>
     <string name="home_checking_name">جارٍ فحص %1$s…</string>
     <plurals name="home_checking_games">
         <item quantity="zero">جارٍ فحص %1$d لعبة…</item>
@@ -1327,7 +1328,6 @@
     <string name="settings_player_id">معرّف اللاعب</string>
     <string name="settings_player_id_hint">الأسماء مجرد تسميات: تتبع الحفظات المعرّف، لذا لا يؤدي تغيير الاسم إلى نقل الحفظات أو خلطها.</string>
     <string name="settings_that_picture_could_not_be_read">تعذّرت قراءة هذه الصورة</string>
-    <string name="home_tile_details">التفاصيل ›</string>
     <string name="home_move_left">نقل إلى اليسار</string>
     <string name="home_move_right">نقل إلى اليمين</string>
     <string name="home_delete_game_menu">إزالة اللعبة…</string>
@@ -1388,4 +1388,7 @@
     <string name="game_stick_leds_bifrost">إضاءة العصي (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">تتبع القلوب وقائمة الإيقاف والأوكارينا على AYN Thor (عند التشغيل)</string>
     <string name="game_stick_leds_bifrost_off">ترك إضاءة العصي على AYN Thor تحت تحكم Bifrost نفسه</string>
+    <string name="game_companion_hud">شاشة المرافق</string>
+    <string name="game_companion_drawer">درج شاشة المرافق (الرادار التكتيكي والأوامر والمجموعات)</string>
+    <string name="game_companion_display4_note">تُعرض تلقائيًا على الشاشة المدمجة Display 4 عند توفرها</string>
 </resources>

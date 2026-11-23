@@ -1360,4 +1360,7 @@
     <string name="game_stick_leds_bifrost">Stick-LEDs (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">Herzen, Pausenmenü und Okarina auf dem AYN Thor folgen (beim Start)</string>
     <string name="game_stick_leds_bifrost_off">AYN-Thor-Stick-LEDs der Steuerung von Bifrost überlassen</string>
+    <string name="game_companion_hud">Begleiter-HUD</string>
+    <string name="game_companion_drawer">Begleiter-HUD-Leiste (Taktik-Radar, Befehle &amp; Kombo-Buch)</string>
+    <string name="game_companion_display4_note">Wird bei vorhandenem integriertem Display 4 automatisch angezeigt</string>
 </resources>

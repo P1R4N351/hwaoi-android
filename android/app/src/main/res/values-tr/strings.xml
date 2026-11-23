@@ -499,6 +499,7 @@
     <string name="home_copied_into_the_app">Uygulamaya kopyalandı: %1$s</string>
     <string name="home_game_now_uses">%1$s artık şunu kullanıyor: %2$s.</string>
     <string name="home_lossless_dll_not_installed">Lossless.dll kurulmadı: %1$s</string>
+    <string name="home_tile_details">Ayrıntılar ›</string>
     <string name="home_checking_name">Denetleniyor: %1$s…</string>
     <plurals name="home_checking_games">
         <item quantity="one">%1$d oyun denetleniyor…</item>
@@ -1299,7 +1300,6 @@
     <string name="settings_player_id">Oyuncu kimliği</string>
     <string name="settings_player_id_hint">İsimler yalnızca etikettir: kayıtlar kimliği izler, bu yüzden ad değiştirmek kayıtları taşımaz veya karıştırmaz.</string>
     <string name="settings_that_picture_could_not_be_read">Bu resim okunamadı</string>
-    <string name="home_tile_details">Ayrıntılar ›</string>
     <string name="home_move_left">Sola taşı</string>
     <string name="home_move_right">Sağa taşı</string>
     <string name="home_delete_game_menu">Oyunu kaldır…</string>
@@ -1360,4 +1360,7 @@
     <string name="game_stick_leds_bifrost">Çubuk LED\'leri (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">AYN Thor\'da kalpleri, duraklatma menüsünü ve Okarinayı izle (başlatmada)</string>
     <string name="game_stick_leds_bifrost_off">AYN Thor çubuk LED\'lerini Bifrost\'un kendi denetimine bırak</string>
+    <string name="game_companion_hud">Yardımcı HUD</string>
+    <string name="game_companion_drawer">Yardımcı HUD çekmecesi (Taktik Radar, Komut ve Grimoire)</string>
+    <string name="game_companion_display4_note">Takılıysa yerleşik Display 4 ekranında otomatik gösterilir</string>
 </resources>

@@ -26,6 +26,7 @@ static nxin_pad g_pad[DM_PLAYERS];
 static float g_dz = -1;
 static nxin_touch g_touch; static int g_touch_init;
 static uint64_t g_shake_btn;
+static uint64_t g_companion_btn;
 static pad_motion_cal g_pm_cal[DM_PLAYERS];   // each controller's rest offset of the gyro (pad_motion.h), under g_mu
 static int g_pm_log[DM_PLAYERS];
 static int g_held;   // the text input box is up: pad and touch events are dropped (android_text_input)
@@ -59,7 +60,7 @@ static void publish_pad(int p) {   // under g_mu
 static void publish_touch_pad(void) {   // under g_mu
     uint64_t b; int32_t lx, ly, rx, ry;
     nxin_touch_pad(&g_touch, &b, &lx, &ly, &rx, &ry);
-    dm_input_set(b | g_shake_btn, lx, ly, rx, ry);
+    dm_input_set(b | g_shake_btn | g_companion_btn, lx, ly, rx, ry);
 }
 static void publish_fingers(void) {   // under g_mu
     _Static_assert(sizeof(nxin_finger) == sizeof(dm_touch), "finger layout");
@@ -229,8 +230,37 @@ void nxhost_touch_layout(float vw, float vh, float px, float py, float pw, float
     pthread_mutex_unlock(&g_mu);
 }
 static void touch_release_all(void) {   // under g_mu
+    if (g_companion_btn) {
+        g_companion_btn = 0;
+        if (!g_touch_init) dm_input_set(0, 0, 0, 0, 0);
+    }
     if (!g_touch_init) return;
     nxin_touch_event(&g_touch, AM_CANCEL, 0, 0, 0); publish_touch_pad(); publish_fingers();
+}
+static int32_t companion_stronger_axis(int32_t a, int32_t b) { return abs(b) > abs(a) ? b : a; }
+void nxhost_companion_buttons_set(uint64_t buttons) {
+    pthread_mutex_lock(&g_mu);
+    uint64_t want = (g_held || g_joining) ? 0ULL : (buttons & 0xFFFFULL);
+    if (want != g_companion_btn) {
+        g_companion_btn = want;
+        touch_once();
+        publish_touch_pad();
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+void nxhost_companion_pad_peek(int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry, uint64_t *buttons) {
+    pthread_mutex_lock(&g_mu);
+    uint64_t pb = 0ULL, tb = 0ULL;
+    int32_t plx = 0, ply = 0, prx = 0, pry = 0;
+    int32_t tlx = 0, tly = 0, trx = 0, try_v = 0;
+    nxin_pad_out(&g_pad[0], deadzone(), &pb, &plx, &ply, &prx, &pry);
+    if (g_touch_init) nxin_touch_pad(&g_touch, &tb, &tlx, &tly, &trx, &try_v);
+    if (buttons) *buttons = pb | tb;
+    if (lx) *lx = companion_stronger_axis(plx, tlx);
+    if (ly) *ly = companion_stronger_axis(ply, tly);
+    if (rx) *rx = companion_stronger_axis(prx, trx);
+    if (ry) *ry = companion_stronger_axis(pry, try_v);
+    pthread_mutex_unlock(&g_mu);
 }
 void nxhost_touch_controls_enable(bool on) {
     pthread_mutex_lock(&g_mu); touch_once();

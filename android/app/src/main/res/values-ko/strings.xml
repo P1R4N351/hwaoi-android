@@ -71,6 +71,8 @@
     <string name="common_resolution">해상도</string>
     <string name="common_rumble">진동</string>
     <string name="common_screen_rotation">화면 회전</string>
+    <string name="common_screen_scaling">화면 확대 방식</string>
+    <string name="common_screen_sharpness">화면 선명도</string>
     <string name="common_share_log">로그 공유</string>
     <string name="common_stop">중지</string>
     <string name="common_system">시스템</string>
@@ -701,6 +703,14 @@
         <item>바이리니어(가장 빠름, 가장 부드러움)</item>
         <item>FSR 3.1(선명, 안정적)</item>
     </string-array>
+    <string-array name="arr_screen_scale">
+        <item>최근접 이웃</item>
+        <item>쌍선형</item>
+        <item>쌍3차</item>
+        <item>FSR 1</item>
+        <item>SGSR 1</item>
+        <item>기기(절전)</item>
+    </string-array>
     <string-array name="arr_panel_look">
         <item>작게</item>
         <item>보통</item>
@@ -748,6 +758,7 @@
     <string name="home_shaders_need_one_update">셰이더 업데이트 1회 필요</string>
     <string name="home_nup">" (.nup)"</string>
     <string name="game_applies_from_the_next_frame">다음 프레임부터 적용되며 이 게임에 유지돼요(게임 설정 › 업스케일러와 같은 설정).</string>
+    <string name="game_applies_from_the_next_frame_2">다음 프레임부터 적용되며 이 게임에 유지돼요(게임 설정 › 화면 확대 방식과 같은 설정이에요).</string>
     <string name="game_applies_at_the_next_start">다음 실행부터 적용돼요(이번 실행은 실시간 변경을 받지 않아요: DM_CTL 꺼짐).</string>
     <string name="game_applies_at_once_kept_for">바로 적용되며 이 게임에 유지돼요(게임 설정 › 고급과 같은 설정).</string>
     <string name="game_shaders_the_game_lacks_are_3">게임에 없는 셰이더는 실행 중에 빌드돼요. 스위치는 게임 페이지 › 고급 › 플레이 중 셰이더 빌드에 있어요(기본값 켬, 변경은 다음 실행부터 적용).</string>
@@ -1336,21 +1347,13 @@
     <string name="game_mods_remove_note">모드 파일이 이 휴대폰에서 삭제돼요. 게임 자체 파일은 남아요.</string>
     <string name="game_mods_imported">%1$s을(를) 가져왔어요(파일 %2$d개). 다음 실행부터 적용돼요.</string>
     <string name="game_mods_refused">가져오지 못함: %1$s</string>
-    <string name="common_screen_scaling">화면 확대 방식</string>
-    <string name="common_screen_sharpness">화면 선명도</string>
-    <string name="game_applies_from_the_next_frame_2">다음 프레임부터 적용되며 이 게임에 유지돼요(게임 설정 › 화면 확대 방식과 같은 설정이에요).</string>
     <string name="game_fast_fp16_shader_math">빠른 FP16 셰이더 연산</string>
-    <string name="game_fp16_default_precision">기본 정밀도</string>
     <string name="game_fp16_on_turnip_faster">Turnip에서 16비트 반정밀도: 셰이더 연산이 빨라지고 발열이 줄어요</string>
-    <string-array name="arr_screen_scale">
-        <item>최근접 이웃</item>
-        <item>쌍선형</item>
-        <item>쌍3차</item>
-        <item>FSR 1</item>
-        <item>SGSR 1</item>
-        <item>기기(절전)</item>
-    </string-array>
+    <string name="game_fp16_default_precision">기본 정밀도</string>
     <string name="game_stick_leds_bifrost">스틱 LED (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">AYN Thor에서 하트, 일시정지 화면 및 오카리나 상태 표시 (시작 시 적용)</string>
     <string name="game_stick_leds_bifrost_off">AYN Thor 스틱 LED를 Bifrost 자체 제어로 유지</string>
+    <string name="game_companion_hud">컴패니언 HUD</string>
+    <string name="game_companion_drawer">컴패니언 HUD 서랍(전술 레이더, 커맨드, 콤보)</string>
+    <string name="game_companion_display4_note">내장 Display 4 화면이 감지되면 자동으로 표시됩니다</string>
 </resources>

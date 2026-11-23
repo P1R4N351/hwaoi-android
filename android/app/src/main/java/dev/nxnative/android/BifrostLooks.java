@@ -61,6 +61,8 @@ final class BifrostLooks {
     static final Look OPEN = new Look("pause-subscreen", 0xf0d678, 85, false, 60, "STATIC", 0.5f, 255);
     static final Look OCARINA = new Look("ocarina-play", hue(0x3b9eff), 95, false, 70, "BREATH", 0.25f, 200);
     static final Look LOW = new Look("low-hearts", hue(0xff2a1a), 110, true, 80, "PULSE", 0.8f, 255);
+    static final Look AOI_BASE = new Look("zonai-jade", hue(0x5ac8b8), 77, false, 60, "BREATH", 0.10f, 150);
+    static final Look AOI_OPEN = new Look("zonai-open", 0xe8b84b, 85, false, 60, "STATIC", 0.5f, 255);
 
     static final class State {
         boolean inGame;
@@ -119,6 +121,7 @@ final class BifrostLooks {
         static final long ENTRY_PULSE_DELAY_MS = 600;
 
         private boolean classic;
+        private final boolean aoiPalette;
         private Look shown, candidate;
         private int candidateCount;
         private boolean low, wasOpen, wasOcarina, sawNoGame, dirty, active;
@@ -129,7 +132,8 @@ final class BifrostLooks {
         private int sentCount;
         private String muteReason = "";
 
-        Feed(boolean classic) { this.classic = classic; }
+        Feed(boolean classic) { this(classic, false); }
+        Feed(boolean classic, boolean aoiPalette) { this.classic = classic; this.aoiPalette = aoiPalette; }
 
         boolean classic() { return classic; }
         Look shown() { return shown; }
@@ -146,6 +150,7 @@ final class BifrostLooks {
             }
             if (low) return LOW;
             if (s.ocarina) return OCARINA;
+            if (aoiPalette) return s.open ? AOI_OPEN : AOI_BASE;
             return s.open ? OPEN : BASE;
         }
 
@@ -285,6 +290,14 @@ final class BifrostLooks {
             active = false;
             dirty = false;
             return c;
+        }
+
+        List<Command> touch(long now) {
+            List<Command> out = new ArrayList<>(1);
+            if (now >= mutedUntil && !classic && active && shown != null && room(now, COMMANDS_PER_SECOND)) {
+                pulse(now, "STATIC", out);
+            }
+            return out;
         }
 
         private void pulse(long now, String kind, List<Command> out) {

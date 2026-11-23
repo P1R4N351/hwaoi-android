@@ -499,6 +499,7 @@
     <string name="home_copied_into_the_app">Skopiowano do aplikacji: %1$s</string>
     <string name="home_game_now_uses">%1$s teraz używa: %2$s.</string>
     <string name="home_lossless_dll_not_installed">Lossless.dll nie zainstalowany: %1$s</string>
+    <string name="home_tile_details">Szczegóły ›</string>
     <string name="home_checking_name">Sprawdzanie: %1$s…</string>
     <plurals name="home_checking_games">
         <item quantity="one">Sprawdzanie %1$d gry…</item>
@@ -1313,7 +1314,6 @@
     <string name="settings_player_id">ID gracza</string>
     <string name="settings_player_id_hint">Nazwy to tylko etykiety: zapisy podążają za ID, więc zmiana nazwy nigdy ich nie przenosi ani nie miesza.</string>
     <string name="settings_that_picture_could_not_be_read">Nie można odczytać tego obrazu</string>
-    <string name="home_tile_details">Szczegóły ›</string>
     <string name="home_move_left">Przesuń w lewo</string>
     <string name="home_move_right">Przesuń w prawo</string>
     <string name="home_delete_game_menu">Usuń grę…</string>
@@ -1374,4 +1374,7 @@
     <string name="game_stick_leds_bifrost">Diody drążków (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">Śledź serca, menu pauzy i Okarynę na AYN Thor (od uruchomienia)</string>
     <string name="game_stick_leds_bifrost_off">Pozostaw diody drążków AYN Thor pod własną kontrolą Bifrost</string>
+    <string name="game_companion_hud">Ekran towarzysza</string>
+    <string name="game_companion_drawer">Szuflada towarzysza (Radar taktyczny, Polecenia i Grymuar)</string>
+    <string name="game_companion_display4_note">Automatycznie wyświetlane na wbudowanym ekranie Display 4, gdy jest dostępny</string>
 </resources>

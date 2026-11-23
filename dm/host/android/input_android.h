@@ -107,3 +107,14 @@ NXHOST_API void nxhost_codecs_log(void);
 NXHOST_API int nxhost_companion_state(int64_t out[8]);
 // Sets the second screen's user-chosen page index (-1 when none / cleared)
 NXHOST_API void nxhost_companion_set_page(int page);
+// Companion virtual controller button mask (ORed with touch pad; released on pause/text-input)
+NXHOST_API void nxhost_companion_buttons_set(uint64_t buttons);
+// Reads live player-1 pad/touch state without consuming edges or mixing companion buttons
+NXHOST_API void nxhost_companion_pad_peek(int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry, uint64_t *buttons);
+// Detailed Warriors companion telemetry snapshot for Display 4 / drawer UI; returns 1 when populated
+NXHOST_API int nxhost_companion_detail(int32_t *ints, int max_ints, float *flts, int max_flts, char *txt, int max_txt);
+// Trigger tactical companion input chord or party swap when write-safe gates allow
+NXHOST_API int nxhost_companion_fire(int action_id);
+NXHOST_API void nxhost_companion_abort_seq(void);
+// Session waypoint pins (op: 0=add at current pose, 1=remove slot, 2=clear all)
+NXHOST_API int nxhost_companion_pin(int op, int slot, const char *label);

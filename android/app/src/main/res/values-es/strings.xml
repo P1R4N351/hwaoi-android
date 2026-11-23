@@ -499,6 +499,7 @@
     <string name="home_copied_into_the_app">Copiado en la app: %1$s</string>
     <string name="home_game_now_uses">%1$s ahora usa %2$s.</string>
     <string name="home_lossless_dll_not_installed">Lossless.dll no instalado: %1$s</string>
+    <string name="home_tile_details">Detalles ›</string>
     <string name="home_checking_name">Comprobando %1$s…</string>
     <plurals name="home_checking_games">
         <item quantity="one">Comprobando %1$d juego…</item>
@@ -1306,7 +1307,6 @@
     <string name="settings_player_id">ID de jugador</string>
     <string name="settings_player_id_hint">Los nombres son solo etiquetas: los datos guardados siguen al ID, así que cambiar el nombre nunca mueve ni mezcla partidas.</string>
     <string name="settings_that_picture_could_not_be_read">No se pudo leer esa imagen</string>
-    <string name="home_tile_details">Detalles ›</string>
     <string name="home_move_left">Mover a la izquierda</string>
     <string name="home_move_right">Mover a la derecha</string>
     <string name="home_delete_game_menu">Quitar juego…</string>
@@ -1367,4 +1367,7 @@
     <string name="game_stick_leds_bifrost">LED de los sticks (Bifrost)</string>
     <string name="game_stick_leds_bifrost_on">Seguir corazones, menú de pausa y Ocarina en AYN Thor (al iniciar)</string>
     <string name="game_stick_leds_bifrost_off">Dejar los LED del AYN Thor bajo el control propio de Bifrost</string>
+    <string name="game_companion_hud">HUD complementario</string>
+    <string name="game_companion_drawer">Panel complementario (Radar táctico, Comandos y Grimorio)</string>
+    <string name="game_companion_display4_note">Se muestra automáticamente en la pantalla integrada Display 4 cuando está presente</string>
 </resources>

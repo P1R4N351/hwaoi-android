@@ -125,10 +125,26 @@ public final class BifrostJvmTest {
         check(clr.size() == 1 && BifrostLooks.ACTION_CLEAR.equals(clr.get(0).action), "stop emits immediate ACTION_CLEAR");
     }
 
+
+    private static void testAoiPaletteAndTouch() {
+        BifrostLooks.Feed feed = new BifrostLooks.Feed(false, true);
+        BifrostLooks.State s = new BifrostLooks.State();
+        s.inGame = true;
+        check(feed.want(s) == BifrostLooks.AOI_BASE, "AoI world -> AOI_BASE");
+        s.open = true;
+        check(feed.want(s) == BifrostLooks.AOI_OPEN, "AoI menu -> AOI_OPEN");
+        s.open = false;
+        feed.poll(1000L, s);
+        check(feed.poll(1125L, s).size() == 1, "AoI feed activates");
+        List<BifrostLooks.Command> tcmds = feed.touch(1400L);
+        check(tcmds.size() == 1 && BifrostLooks.ACTION_PULSE.equals(tcmds.get(0).action), "touch emits ACTION_PULSE");
+    }
+
     public static void main(String[] args) {
         testCompanionStateBounds();
         testLookPriorityAndHysteresis();
         testFeedBurstRateFallbackMuteAndStop();
+        testAoiPaletteAndTouch();
         System.out.println("BifrostJvmTest: PASS");
     }
 }
