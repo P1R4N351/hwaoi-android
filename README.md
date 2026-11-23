@@ -24,7 +24,16 @@ Tested live on AYN Thor (`QCS8550` / Adreno 740, `14.9 GiB` RAM, Android 13 SDK 
 - **Video & Audio:** Host `libvpx v1.17.0` decoded `2,363` VP9 packets (`2,359` frames out, `8.17 ms/packet` avg); AAudio `48000 Hz` stereo output ran with `0` underruns across callbacks `4001–20000` (`0.0 ms` zero-padded) after `3` initial boot underruns.
 - **Saves & Controls:** Flat `8 MB` (`8,388,608` B) `DATA.BIN` initializes cleanly; menu (`A`), movement (`LUp`/`LRight`), camera (`RLeft`/`RRight`), and pause/unpause (`Plus`/`B`) verified live.
 - **Memory Margin (`frame 20812`, first field):** `TOTAL PSS: 7,183,483 kB` (`6.85 GiB`), `TOTAL RSS: 7,298,216 kB` (`6.96 GiB`), `MemAvailable: 6,183,676 kB` (`5.90 GiB` free), `SwapFree: 3,587,172 kB`, `0` `lmkd` kills, `0` crashes.
-- **Open / Untested:** Later combat missions (including whether indirect `QUADS` triggers there) and mid-stage autosave write/reload remain to be exercised.
+- **Extended Battle Telemetry (71.4 min, `61,140` frames, `DM_LSFG=0`):** Across `67` 5-second field/combat windows (`337-1,546` draws/frame, median `824`), measured `p10 35.2 fps`, `p50 46.4 fps`, `p90 52.5 fps`, `max 55.7 fps`, holding `35.5 fps` at peak `1,546` draws/frame (`GPU busy p50/p90 25.0/29.4 ms`); `498` graphics + `50` compute pipelines (`0` failed, `0` shared-memory rejections), `4` live indirect `QUADS` conversions (`0` pass splits), `1,922 MiB` Vulkan memory at frame `60,900` (`4,693-5,546 MiB` RSS), `0` crashes, `0` `lmkd` events (after fixing `-DNDEBUG` `vka_job_set_handles` in `cff8035`).
+- **Open / Untested:** Qualcomm stock system driver, `<16 GB` devices, and chapter-end save write/reload remain untested.
+
+---
+
+## Direct Boot, Second-Screen Companion & Upstream Contributions
+
+- **Direct-Boot & Zonai Quick Menu:** Launches straight into `04003F40232DE000` (`GameActivity`) with single-title obsidian/gold/teal styling and a trimmed in-game quick menu (`af06f05`, `14b543d`).
+- **Converged Warriors Second-Screen Companion (`Display 4` & Opt-In Drawer):** Clean-room MIT companion (`ktgl_companion.h`, shared with [AoC Native](https://github.com/P1R4N351/hwaoc-android) and published standalone in [`P1R4N351/nx-second-screen` `v0.3.0`](https://github.com/P1R4N351/nx-second-screen/releases/tag/v0.3.0)). Attaches a `FLAG_NOT_FOCUSABLE | FLAG_KEEP_SCREEN_ON` `Presentation` on AYN Thor Display 4 (`1240x1080`) without stealing Display 0 gamepad focus, featuring 4 evenly-spaced tabs (`RADAR`, `ACTIONS`, `COMBOS`, `STATUS`), 128-point 3D inertial trail + 8 waypoint pins, fail-closed `R`/`L`/party/combo chords, cutscene auto-dimming, 1 px / 60 s AMOLED burn-in orbit, and Bifrost LED sync (`AOI_BASE` / `AOI_OPEN`, `com.moonbench.bifrost.permission.CONTROL_LEDS`).
+- **AYN Controller Support & Upstream `BananaNative` PRs:** Auto-detects AYN Thor/Odin `"Odin Controller"` (`0x2020:0x0111`) face-button labels (`OdinPad`). Upstream `moceure/BananaNative` contributions: [PR #559](https://git.eden-emu.dev/moceure/BananaNative/pulls/559) (merged, AoI Android bring-up), [PR #625](https://git.eden-emu.dev/moceure/BananaNative/pulls/625) (open, AoI `Supported` promotion), and [PR #631](https://git.eden-emu.dev/moceure/BananaNative/pulls/631) (open, `OdinPad` AYN controller mapping).
 
 ---
 
