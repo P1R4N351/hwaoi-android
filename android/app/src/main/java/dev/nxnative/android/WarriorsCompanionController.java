@@ -10,7 +10,6 @@ import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
-import android.view.WindowManager;
 import android.widget.FrameLayout;
 
 /**
@@ -132,7 +131,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
             android.graphics.Point sz = new android.graphics.Point();
             target.getRealSize(sz);
             Log.i(TAG, "presentation attached displayId=" + presDisplayId + " (" + sz.x + "x" + sz.y + ")");
-        } catch (WindowManager.InvalidDisplayException | RuntimeException e) {
+        } catch (RuntimeException e) {
             Log.w(TAG, "presentation attach failed: " + e.getMessage());
             dismissPresentation();
         }

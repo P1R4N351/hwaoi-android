@@ -19,9 +19,6 @@
 extern "C" {
 #endif
 
-#define KTGL_AOC_BUILD "c3cf52bf2b05d7310884971b50bcccb8"
-#define KTGL_AOI_BUILD "659cb288b5c5b2b49853add616c0d5bf"
-
 enum { KTGL_GAME_UNKNOWN = 0, KTGL_GAME_AOC = 1, KTGL_GAME_AOI = 2 };
 
 enum {

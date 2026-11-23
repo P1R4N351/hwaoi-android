@@ -19,8 +19,8 @@ static KtglHostSample base_sample(uint64_t now_ns) {
 static void test_lifecycle_and_fail_closed(void) {
     KtglCompanionCtx c;
     ktgl_companion_init(&c, KTGL_GAME_AOI, 0, 0);
-    assert(ktgl_build_matches("659CB288B5C5B2B49853ADD616C0D5BF4EA4E1BA", KTGL_AOI_BUILD));
-    assert(!ktgl_build_matches("c3cf52bf2b05d7310884971b50bcccb8", KTGL_AOI_BUILD));
+    assert(ktgl_build_matches("0123456789ABCDEF0123456789ABCDEF00112233", "0123456789abcdef0123456789abcdef"));
+    assert(!ktgl_build_matches("fedcba9876543210fedcba9876543210", "0123456789abcdef0123456789abcdef"));
 
     uint64_t t = 1000000000ULL;
     KtglHostSample s = base_sample(t);

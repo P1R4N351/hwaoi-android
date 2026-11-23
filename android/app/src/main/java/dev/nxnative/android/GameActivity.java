@@ -116,7 +116,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         }
         FrameLayout root = new FrameLayout(this);
         rootView = root;
-        rootView = root;
         SurfaceView surface = new SurfaceView(this);
         surface.getHolder().addCallback(this);
         root.addView(surface);
@@ -295,7 +294,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private static boolean skipShown;
     /** The last DM_VK_DRIVER= line of the run's environment (null: none, the system driver): which driver runs, for the notice's log line */
     private static String runDriverLine;
-    private FrameLayout rootView;
     private final Runnable skipRun = this::skipTick;
     private void skipTick() {
         if (skipShown || rootView == null) return;
@@ -1559,4 +1557,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     FrameLayout rootView() { return rootView; }
     View panelView() { return panel; }
     boolean gamepadConnected() { return !pads.isEmpty(); }
+    boolean companionDrawerOpen() { return companion != null ? companion.isDrawerOpen() : Prefs.companionDrawer(this, titleId()); }
+    void companionDrawer(boolean on) { if (companion != null) companion.setDrawerOpen(on); else Prefs.companionDrawer(this, titleId(), on); }
 }
