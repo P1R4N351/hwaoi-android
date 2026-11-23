@@ -289,7 +289,7 @@ static void qs_stats(uint64_t ticket) {
 }
 static qs_sub *worker_alloc_sub(int fast) {
     qs_sub *q = fast ? vka_sub_alloc(&g_sub_pool) : (qs_sub *)calloc(1u, sizeof(*q));
-    assert(q != NULL);
+    if (!q) { VRED("out of memory allocating replay submission"); abort(); }
     return q;
 }
 static int worker_take_job(int qon, job_t *out) {
@@ -399,7 +399,8 @@ void mtl_exec(const uint8_t *handle) {
     if (g_cur_nh == g_cur_cap) {
         int nc = g_cur_cap ? (2 * g_cur_cap) : 64;
         const uint8_t **nb = (const uint8_t **)realloc((void *)g_cur_h, (size_t)nc * sizeof(*nb));
-        assert(nb != NULL); g_cur_cap = nc; g_cur_h = nb;
+        if (!nb) { VRED("out of memory growing submit handles to %d", nc); abort(); }
+        g_cur_cap = nc; g_cur_h = nb;
     }
     g_cur_h[g_cur_nh++] = handle;
 }
@@ -408,9 +409,11 @@ uint64_t mtl_sub_commit(void) {
     g_in_sub = 0;
     int fast = vka_worker_fast_on(); job_t j = {J_SUB};
     j.serial = g_pend_serial; j.origin_ll = g_pend_origin;
-    assert(vka_job_set_handles(&j.jb, g_cur_h, g_cur_nh, fast) == 0);
     j.fence = vka_fence_next(); j.frame = vka_frame();
-    int cap = 0; for (int i = 0; i < j.jb.nh; i++) vka_worker_fence_syncs(vka_job_handle(&j.jb, i), j.fence, &j.jb, &cap, fast);
+    if (vka_worker_prep_sub(&j.jb, g_cur_h, g_cur_nh, j.fence, fast) != 0) {
+        VRED("out of memory queuing %d command handles", g_cur_nh);
+        abort();
+    }
     push(&j);
     return j.fence;
 }

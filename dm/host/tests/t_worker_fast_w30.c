@@ -6,6 +6,13 @@
 #include <string.h>
 #include <time.h>
 
+#define W30_CHECK(cond) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+        abort(); \
+    } \
+} while (0)
+
 enum { W30_LIST_BYTES = 16384, W30_CALL_DEPTH = 18 };
 typedef struct { uint8_t b[W30_LIST_BYTES]; size_t n; } w30_list;
 
@@ -17,7 +24,7 @@ static uint64_t w30_now_ns(void) {
 
 static uint8_t *w30_put(w30_list *l, uint32_t op, const void *pl, uint32_t plen) {
     uint32_t sz = 8u + ((plen + 7u) & ~7u);
-    assert(l->n + sz <= sizeof(l->b));
+    W30_CHECK(l->n + sz <= sizeof(l->b));
     uint8_t *r = l->b + l->n;
     op_hdr h = {op, sz};
     memcpy(r, &h, sizeof h);
@@ -30,6 +37,34 @@ static qs g_w30_qs;
 static uint64_t w30_q_done_cb(void *ctx) { (void)ctx; return 0u; }
 static uint64_t w30_q_now_cb(void *ctx) { (void)ctx; return 1000u; }
 static int w30_q_run_cb(void *ctx, qs_sub *s) { (void)ctx; qs_commit(&g_w30_qs, s->fence, 1); return 0; }
+
+static void w30_verify_prep_sub_ndebug(void) {
+    w30_list lst = {0};
+    sync_t syn_f = {0}, syn_w = {.fenced = 1u, .fence = 41u};
+    sync_t *pf = &syn_f;
+    const sync_t *pw = &syn_w;
+    const uint8_t *dummy = NULL;
+    w30_put(&lst, OP_DRAW, &dummy, 8u);
+    w30_put(&lst, OP_FENCE_SYNC, &pf, 8u);
+    w30_put(&lst, OP_WAIT_SYNC, &pw, 8u);
+    w30_put(&lst, OP_END, NULL, 0u);
+    const uint8_t *hdls[20];
+    for (int i = 0; i < 20; i++) hdls[i] = lst.b;
+    const int ncases[4] = {0, 1, VKA_WORKER_INLINE_H, VKA_WORKER_INLINE_H + 1};
+    for (int fast = 0; fast < 2; fast++) {
+        for (int ci = 0; ci < 4; ci++) {
+            int nh = ncases[ci];
+            syn_f = (sync_t){0};
+            vka_job_buf jb = {0};
+            int rc = vka_worker_prep_sub(&jb, hdls, nh, 123u, fast);
+            W30_CHECK(rc == 0 && jb.nh == nh);
+            for (int i = 0; i < nh; i++) W30_CHECK(vka_job_handle(&jb, i) == hdls[i]);
+            if (nh > 0) W30_CHECK(syn_f.fenced == 1u && syn_f.fence == 123u && jb.nws == nh);
+            else W30_CHECK(syn_f.fenced == 0u && jb.nws == 0);
+            vka_job_buf_free(&jb);
+        }
+    }
+}
 
 static void w30_build_scan_lists(w30_list *main_l, w30_list *jmp_l, w30_list sub_l[W30_CALL_DEPTH],
                                  sync_t *syn_f, sync_t *syn_w0, sync_t *syn_w1,
@@ -74,12 +109,14 @@ static void w30_verify_signal_before_wait(void) {
     const uint8_t *hdl[1] = {sig_l.b};
     vka_job_buf slow = {0}, fast = {0};
     int cap_s = 0, cap_f = 0;
-    assert(vka_job_set_handles(&slow, hdl, 1, 0) == 0);
+    int rc_s = vka_job_set_handles(&slow, hdl, 1, 0);
+    W30_CHECK(rc_s == 0);
     vka_worker_fence_syncs(vka_job_handle(&slow, 0), 11u, &slow, &cap_s, 0);
-    assert(vka_job_set_handles(&fast, hdl, 1, 1) == 0);
+    int rc_f = vka_job_set_handles(&fast, hdl, 1, 1);
+    W30_CHECK(rc_f == 0);
     vka_worker_fence_syncs(vka_job_handle(&fast, 0), 11u, &fast, &cap_f, 1);
-    assert(slow.w0done == 1 && slow.w0kind == 0);
-    assert(fast.w0done == slow.w0done && fast.w0kind == slow.w0kind);
+    W30_CHECK(slow.w0done == 1 && slow.w0kind == 0);
+    W30_CHECK(fast.w0done == slow.w0done && fast.w0kind == slow.w0kind);
     vka_job_buf_free(&slow);
     vka_job_buf_free(&fast);
 }
@@ -100,19 +137,21 @@ static void w30_verify_scan_and_inline_parity(void) {
         int nh = ncases[ci], cap_s = 0, cap_f = 0;
         vka_job_buf slow = {0}, fast = {0};
         syn_f.fence = 0u; syn_f.fenced = 0u;
-        assert(vka_job_set_handles(&slow, handles, nh, 0) == 0);
+        int rc_s = vka_job_set_handles(&slow, handles, nh, 0);
+        W30_CHECK(rc_s == 0);
         for (int i = 0; i < nh; i++) vka_worker_fence_syncs(vka_job_handle(&slow, i), 99u, &slow, &cap_s, 0);
-        assert(syn_w1.fence == 77u);
+        W30_CHECK(syn_w1.fence == 77u);
         syn_f.fence = 0u; syn_f.fenced = 0u;
-        assert(vka_job_set_handles(&fast, handles, nh, 1) == 0);
-        assert((fast.h == NULL) == (nh <= VKA_WORKER_INLINE_H));
+        int rc_f = vka_job_set_handles(&fast, handles, nh, 1);
+        W30_CHECK(rc_f == 0);
+        W30_CHECK((fast.h == NULL) == (nh <= VKA_WORKER_INLINE_H));
         for (int i = 0; i < nh; i++) vka_worker_fence_syncs(vka_job_handle(&fast, i), 99u, &fast, &cap_f, 1);
-        assert(slow.nws == fast.nws && slow.w0done == fast.w0done && slow.w0kind == fast.w0kind && slow.w0fence == fast.w0fence);
-        for (int i = 0; i < nh; i++) assert(vka_job_handle(&slow, i) == vka_job_handle(&fast, i));
+        W30_CHECK(slow.nws == fast.nws && slow.w0done == fast.w0done && slow.w0kind == fast.w0kind && slow.w0fence == fast.w0fence);
+        for (int i = 0; i < nh; i++) W30_CHECK(vka_job_handle(&slow, i) == vka_job_handle(&fast, i));
         const qs_wsnap *sw = slow.ws, *fw = fast.ws ? fast.ws : fast.ws_in;
-        if (slow.nws > 0) assert(memcmp(sw, fw, (size_t)slow.nws * sizeof(sw[0])) == 0);
-        assert((nh == 0) || syn_f.fenced == 1u);
-        if (nh >= 1) assert(wptr[0] == sw[0].rec && wptr[1] == sw[1].rec && sw[1].fence == 99u);
+        if (slow.nws > 0) W30_CHECK(memcmp(sw, fw, (size_t)slow.nws * sizeof(sw[0])) == 0);
+        W30_CHECK((nh == 0) || syn_f.fenced == 1u);
+        if (nh >= 1) W30_CHECK(wptr[0] == sw[0].rec && wptr[1] == sw[1].rec && sw[1].fence == 99u);
         vka_job_buf_free(&slow);
         vka_job_buf_free(&fast);
     }
@@ -136,17 +175,18 @@ static void w30_verify_qsched_slab(void) {
         vka_job_buf jb = {0};
         int cap = 0;
         int nh = (it & 1u) ? VKA_WORKER_INLINE_H : 4;
-        assert(vka_job_set_handles(&jb, hdls, nh, 1) == 0);
+        int rc = vka_job_set_handles(&jb, hdls, nh, 1);
+        W30_CHECK(rc == 0);
         vka_worker_fence_syncs(vka_job_handle(&jb, 0), it + 1u, &jb, &cap, 1);
         qs_sub *q = vka_sub_alloc(&pool);
-        assert(q != NULL);
+        W30_CHECK(q != NULL);
         vka_sub_bind_job(q, &jb, 1);
         q->serial = 1u; q->fence = it + 1u;
-        assert(q->nh == nh && q->h[nh - 1] == lst.b && q->ws != NULL && q->ws[0].fence == (it >= 60u ? 55u : 0u));
+        W30_CHECK(q->nh == nh && q->h[nh - 1] == lst.b && q->ws != NULL && q->ws[0].fence == (it >= 60u ? 55u : 0u));
         qs_submit(&g_w30_qs, q);
         vka_job_buf_free(&jb);
     }
-    assert(pool.misses == 1u && pool.hits == 199u);
+    W30_CHECK(pool.misses == 1u && pool.hits == 199u);
     vka_sub_pool_destroy(&pool);
     qs_ev_free(&g_w30_qs);
 }
@@ -190,7 +230,8 @@ static void *w30_worker_fn(void *arg) {
 static void w30_verify_wait_ring(int fast) {
     w30_ring r = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .fast = fast};
     pthread_t th;
-    assert(pthread_create(&th, NULL, w30_worker_fn, &r) == 0);
+    int rc = pthread_create(&th, NULL, w30_worker_fn, &r);
+    W30_CHECK(rc == 0);
     for (uint64_t i = 1u; i <= W30_NJ; i++) {
         pthread_mutex_lock(&r.mu);
         while (r.qin - r.qout >= W30_QCAP) { r.ws.prod_waiters++; pthread_cond_wait(&r.cv, &r.mu); r.ws.prod_waiters--; }
@@ -207,9 +248,10 @@ static void w30_verify_wait_ring(int fast) {
     vka_worker_wake_on_push(&r.ws, &r.cv, fast);
     pthread_cond_broadcast(&r.cv);
     pthread_mutex_unlock(&r.mu);
-    assert(pthread_join(th, NULL) == 0);
-    assert(r.sum == (uint64_t)W30_NJ * (W30_NJ + 1u) / 2u);
-    assert(fast ? (r.ws.elided > 0u) : (r.ws.broadcasts > 0u));
+    rc = pthread_join(th, NULL);
+    W30_CHECK(rc == 0);
+    W30_CHECK(r.sum == (uint64_t)W30_NJ * (W30_NJ + 1u) / 2u);
+    W30_CHECK(fast ? (r.ws.elided > 0u) : (r.ws.broadcasts > 0u));
 }
 
 static void w30_run_bench(void) {
@@ -234,14 +276,14 @@ static void w30_run_bench(void) {
         volatile uint64_t sink = 0u;
         uint64_t t0 = w30_now_ns();
         for (uint64_t it = 0u; it < 20000u; it++) {
-            vka_job_buf jb = {0}; int cap = 0;
-            assert(vka_job_set_handles(&jb, hdls, 4, fast) == 0);
-            for (int h = 0; h < 4; h++) vka_worker_fence_syncs(vka_job_handle(&jb, h), it + 1u, &jb, &cap, fast);
+            vka_job_buf jb = {0};
+            int rc = vka_worker_prep_sub(&jb, hdls, 4, it + 1u, fast);
+            W30_CHECK(rc == 0);
             pthread_mutex_lock(&mu);
             vka_worker_wake_on_push(&ws, &cv, fast);
             pthread_mutex_unlock(&mu);
             qs_sub *q = fast ? vka_sub_alloc(&pool) : (qs_sub *)calloc(1u, sizeof(*q));
-            assert(q != NULL);
+            W30_CHECK(q != NULL);
             vka_sub_bind_job(q, &jb, fast);
             q->serial = 1u; q->fence = it + 1u;
             sink += (uint64_t)q->nws;
@@ -265,6 +307,7 @@ int main(void) {
     int fast_env = vka_worker_fast_on();
     if (f) vka_worker_fast_reset_for_test(1);
     vka_w30_set_fault(f);
+    w30_verify_prep_sub_ndebug();
     w30_verify_scan_and_inline_parity();
     w30_verify_qsched_slab();
     if (!f) {

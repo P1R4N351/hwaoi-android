@@ -251,8 +251,7 @@ static inline void vka_sync_record_op(uint32_t op, const uint8_t *p, const void 
         memcpy(&raw, a, sizeof raw);
         const sync_t *s = (const sync_t *)(uintptr_t)raw;
         uint64_t wf = (s && s->fenced) ? s->fence : 0u;
-        int rc = vka_job_push_ws(jb, cap, (qs_wsnap){p, wf}, fast);
-        assert(rc == 0);
+        if (vka_job_push_ws(jb, cap, (qs_wsnap){p, wf}, fast) != 0) abort();
         if (!jb->w0done) { jb->w0done = 1; jb->w0kind = 2; jb->w0fence = wf; }
     } else if (op == OP_WAIT_EVENT && jb && !jb->w0done) {
         p_wait_event w;
@@ -297,6 +296,22 @@ static inline void vka_worker_fence_syncs(const uint8_t *p, uint64_t fence,
         p += h.size;
     }
     assert(0 && "command list exceeded VKA_SYNC_SCAN_MAX_STEPS");
+}
+
+static inline int vka_worker_prep_sub(vka_job_buf *jb, const uint8_t *const *src,
+                                      int nh, uint64_t fence, int fast) {
+    assert(jb != NULL && nh >= 0);
+    if (vka_w30_fault_mode() == 6) {
+        jb->nh = 0;
+        jb->h = NULL;
+        return 0;
+    }
+    if (vka_job_set_handles(jb, src, nh, fast) != 0) return -1;
+    int cap = 0;
+    for (int i = 0; i < jb->nh; i++) {
+        vka_worker_fence_syncs(vka_job_handle(jb, i), fence, jb, &cap, fast);
+    }
+    return 0;
 }
 
 typedef struct {
