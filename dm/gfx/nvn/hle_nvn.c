@@ -1512,8 +1512,32 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
 // while there are usually only 1–2 in practice), and the empty tail took 40–50% of the command bytes per frame; the advanced stats page of the level 88 sorceress recorded 12.5 MB per frame, using up the game's own command memory pool (about 105 segments x 128 KB per frame)
 #define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
 // Draws carry the indirect / multi-draw fields (ind onwards) only when they use them: a plain indexed draw record is 0x28 bytes instead of 0x40 (nvn_obj.h draw_rec)
-static void rec_draw(NVNcommandBuffer *c, p_draw d) { shp_bind(SHK_IND, d.ind, 16); shp_bind(SHK_IND, d.mdi_cnt, 4); size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
+// DM_NVN_DRAW_BT=<n> (diagnostic, live): the next n recorded draws log their count and the return addresses above the NVN call
+// (host frames first, then the game's), to find which game routine issues a given widget's draws.
+static void rec_draw_bt(int cnt) {
+    static uint32_t tick; static int left; static char last[16];
+    if ((tick++ & 255u) == 0u) {
+        const char *e = getenv("DM_NVN_DRAW_BT");
+        if (!e || !*e) last[0] = 0;
+        else if (strncmp(e, last, sizeof last - 1)) { snprintf(last, sizeof last, "%s", e); left = atoi(e); }
+    }
+    if (left <= 0) return;
+    left--;
+    uint64_t fp = (uint64_t)__builtin_frame_address(0), ra[14]; int n = 0;
+    for (int i = 0; i < 20 && n < 14 && fp && !(fp & 7); i++) {
+        uint64_t w[2];
+        if (plat_mem_read(fp, w, sizeof w)) break;
+        ra[n++] = w[1];
+        if (w[0] <= fp) break;
+        fp = w[0];
+    }
+    char b[14 * 18 + 4]; size_t o = 0; b[0] = 0;
+    for (int i = 0; i < n && o < sizeof b; i++) o += (size_t)snprintf(b + o, sizeof b - o, " %llx", (unsigned long long)ra[i]);
+    LOG("[nvn] dbt cnt %d:%s", cnt, b);
+}
+static void rec_draw(NVNcommandBuffer *c, p_draw d) { rec_draw_bt(d.count); shp_bind(SHK_IND, d.ind, 16); shp_bind(SHK_IND, d.mdi_cnt, 4); size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
 static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) {
+    rec_draw_bt(d.count);
     shp_bind(SHK_IBUF, d.ibuf, d.ind || d.count <= 0 ? 0 : (uint64_t)d.count << (d.itype == 0 ? 0 : d.itype == 1 ? 1 : 2)); shp_bind(SHK_IND, d.ind, 20); shp_bind(SHK_IND, d.mdi_cnt, 4);
     size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n); }
 #if defined(__ANDROID__)

@@ -3154,6 +3154,17 @@ dyn_done:
                 vka_minimap_note_fs_tex(vka_tex_id_img(r_->tid, g_cb), DY.dt);
         }
     }
+    if (g_vka_mm_tr.on && g_vka_mm_tr.valid) {   // DM_VK_MM_TRACE: this draw's identity beside its capture decision
+        const vka_img *t0_ = NULL; int nt_ = 0;
+        int n_ = (!mesh && sh[1]) ? (g_wk.n[1] < 16 ? g_wk.n[1] : 16) : 0;
+        for (int i_ = 0; i_ < n_; i_++) {
+            const vka_res *r_ = &g_wk.r[1][i_];
+            if (r_->what != VKA_R_TEX || !r_->tid || vka_tex_id_is_buffer(r_->tid)) continue;
+            if (!t0_) t0_ = vka_tex_id_img(r_->tid, g_cb);
+            nt_++;
+        }
+        vka_minimap_trace_draw(sh[0] ? sh[0]->key : 0u, sh[1] ? sh[1]->key : 0u, t0_, nt_);
+    }
     if (g_rtl_pass && rtl_room()) {   // DM_VK_RT_LOG: the draw's state
         char cm[200]; size_t cn = 0;
         for (uint32_t i = 0; i < R.ncolor && cn < sizeof cm; i++) if (R.cf[i]) cn += (size_t)snprintf(cm + cn, sizeof cm - cn, " c%u mask %x out %x blend %d(%d,%d,%d/%d,%d,%d)", i, k.att[i].mask,

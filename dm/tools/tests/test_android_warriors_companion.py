@@ -165,10 +165,10 @@ typedef struct { vka_range ubo[VKA_NSTAGE][16]; uint32_t base_instance; } vka_bs
 typedef struct { uint32_t fmt : 8, offset : 19, stream : 5; } va_st;
 typedef struct { uint32_t stride, divisor; } vs_st;
 typedef struct { uint64_t address, size; } NVNbufferRange;
-typedef struct { vka_bstate b; va_st attr[16]; int nattr; vs_st stream[16]; NVNbufferRange vbuf[16]; float vp[16][4]; int has_vp; uint8_t vp_sw[16][4]; } vka_dstate;
+typedef struct { vka_bstate b; va_st attr[16]; int nattr; vs_st stream[16]; NVNbufferRange vbuf[16]; float vp[16][4]; int has_vp; uint8_t vp_sw[16][4]; uint32_t st_ref[2]; } vka_dstate;
 typedef struct { int32_t prim, first, count, instances, base_instance; uint64_t ind; } p_draw;
 typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instances; uint64_t ibuf, ind; } p_draw_idx;
-typedef struct { VkImage img; struct { VkFormat vk; } f; uint64_t serial; uint32_t w, h, layers, samples, depth, usage, aspect; int gpu_owned; } vka_img;
+typedef struct { VkImage img; struct { VkFormat vk; } f; uint64_t serial; uint32_t w, h, layers, levels, samples, depth, usage, aspect; int gpu_owned; } vka_img;
 
 static struct { VkDevice dev; VkPhysicalDevice pd; } V = { 1ull, 1ull };
 static uint64_t g_f = 10;
@@ -195,7 +195,8 @@ static void stub_pb(VkCommandBuffer c, uint32_t s, uint32_t d, uint32_t f, uint3
 static void stub_clr(VkCommandBuffer c, VkImage i, uint32_t l, const VkClearColorValue *cv, uint32_t n, const VkImageSubresourceRange *r) { (void)c; (void)i; (void)l; (void)cv; (void)n; (void)r; }
 static void stub_br(VkCommandBuffer c, const VkRenderingInfo *ri) { (void)c; (void)ri; }
 static void stub_er(VkCommandBuffer c) { (void)c; }
-static void stub_cib(VkCommandBuffer c, VkImage i, uint32_t l, VkBuffer b, uint32_t n, const VkBufferImageCopy *r) { (void)c; (void)i; (void)l; (void)b; (void)n; (void)r; }
+static int g_ncib;   /* image-to-buffer copies: one per staged stream */
+static void stub_cib(VkCommandBuffer c, VkImage i, uint32_t l, VkBuffer b, uint32_t n, const VkBufferImageCopy *r) { (void)c; (void)i; (void)l; (void)b; (void)n; (void)r; g_ncib++; }
 static void stub_bi(VkCommandBuffer c, VkImage s, uint32_t sl, VkImage d, uint32_t dl, uint32_t n, const VkImageBlit *r, VkFilter f) { (void)c; (void)s; (void)sl; (void)d; (void)dl; (void)n; (void)r; (void)f; }
 
 static struct {
@@ -227,7 +228,6 @@ static struct {
     stub_pb, stub_clr, stub_br, stub_er, stub_cib, stub_bi
 };
 
-#define VLOG(...) ((void)0)
 static uint32_t vka_mem_type(uint32_t b, uint32_t r, uint32_t p) { (void)r; (void)p; return (b & 1u) ? 0u : UINT32_MAX; }
 static int vka_hung(void) { return 0; }
 static void vka_oq_pass_end(void) {}
@@ -242,6 +242,8 @@ int vka_cpu_read(uint64_t addr, void *out, size_t n) {
     return 1;
 }
 
+#define VLOG(...) ((void)0)
+#define VKA_ENV(key, def) (def)
 #include "vka_minimap.h"
 
 typedef struct { float x, y, z, idx; } vtx_idx_pos;
@@ -303,6 +305,7 @@ static void run_obj_frame(
     const float fb_ortho[64], const vtx_idx_pos q_bar[18], const vtx_idx_pos q_txt[180],
     const vtx_idx_pos q_ic[12], int icon_draws, const vtx_idx_pos q_sub[18], const vtx_idx_pos q_subt[180]) {
     vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    vka_minimap_trace_draw(1ull, 2ull, &im, 1);   /* off by default: logs nothing, changes nothing */
     VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
     vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
         (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
@@ -371,11 +374,98 @@ static void test_pass_462636(void) {
     g_f = 14; run_obj_frame(fb_ortho, q_bar, q_txt, q_ic, 0, q_sub, q_subt);
     vka_mm_rect r3 = g_vka_mm.hit_obj;
     assert(r1.x == r3.x && r1.y == r3.y && r1.w == r3.w && r1.h == r3.h);
+
+    /* A frame's HUD is recorded over several render passes: each pass end must stage the stream again,
+       so the copy that is read back is the one taken after the frame's last HUD draw. */
+    g_f++; vka_minimap_present();
+    for (int i = 0; i < 4 && (atomic_load(&g_vka_mm.obj.pending_valid) || (g_vka_mm.frame_counter & 1u)); i++) { g_f++; vka_minimap_present(); }
+    assert(!atomic_load(&g_vka_mm.obj.pending_valid) && !(g_vka_mm.frame_counter & 1u));
+    g_f += 2;
+    int c0 = g_ncib;
+    run_obj_frame(fb_ortho, q_bar, q_txt, q_ic, 1, q_sub, q_subt);
+    int c1 = g_ncib;
+    run_obj_frame(fb_ortho, q_bar, q_txt, q_ic, 1, q_sub, q_subt);   /* a second HUD pass of the same frame */
+    int c2 = g_ncib;
+    assert(c1 - c0 >= 1);
+    assert(c2 - c1 == c1 - c0);
+}
+
+static void test_speech_popup_stays(void) {
+    float fb_ortho[64]; memset(fb_ortho, 0, sizeof fb_ortho);
+    fb_ortho[8 + 0] = 2.f / 1920.f; fb_ortho[8 + 5] = -2.f / 1080.f; fb_ortho[8 + 10] = 1.f;
+    fb_ortho[8 + 12] = -1.f; fb_ortho[8 + 13] = 1.f; fb_ortho[8 + 15] = 1.f;
+    init_id_m34(&fb_ortho[24]);
+    vtx_idx_pos q_panel[6], q_face[6], q_heart[6];
+    make_quad_vtx(q_panel, 0.f, 902.f, 980.f, 1062.f, 0.f, 0.f);    /* the pop-up's backing, measured on AoI */
+    make_quad_vtx(q_face, 6.f, 842.f, 206.f, 1062.f, 0.f, 0.f);     /* its portrait */
+    make_quad_vtx(q_heart, 50.f, 25.f, 94.f, 69.f, 0.f, 0.f);       /* a heart: left HUD */
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    vka_dstate ds_panel = make_dstate((void *)q_panel, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_face = make_dstate((void *)q_face, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_heart = make_dstate((void *)q_heart, (void *)fb_ortho, 256u, NULL, 0u);
+    for (int with_panel = 0; with_panel < 2; with_panel++) {
+        g_f += 2;
+        vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+            (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+        vka_minimap_select_target(1ull, &ds_heart, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == 1);
+        if (with_panel) {
+            vka_minimap_select_target(1ull, &ds_panel, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+            assert(g_vka_mm.cur_hud == 0);
+        }
+        vka_minimap_select_target(1ull, &ds_face, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == (with_panel ? 0 : 1));
+        vka_minimap_select_target(1ull, &ds_heart, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == 1);
+        vka_minimap_pass_end(1ull, &im);
+        vka_minimap_present();
+    }
+}
+
+static void test_menu_dim_stops_capture(void) {
+    float fb_ortho[64]; memset(fb_ortho, 0, sizeof fb_ortho);
+    fb_ortho[8 + 0] = 2.f / 1920.f; fb_ortho[8 + 5] = -2.f / 1080.f; fb_ortho[8 + 10] = 1.f;
+    fb_ortho[8 + 12] = -1.f; fb_ortho[8 + 13] = 1.f; fb_ortho[8 + 15] = 1.f;
+    init_id_m34(&fb_ortho[24]);
+    vtx_idx_pos q_dim[6], q_heart[6];
+    make_quad_vtx(q_dim, 0.f, 0.f, 1920.f, 1080.f, 0.f, 0.f);
+    make_quad_vtx(q_heart, 50.f, 25.f, 94.f, 69.f, 0.f, 0.f);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    vka_dstate ds_dim = make_dstate((void *)q_dim, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_heart = make_dstate((void *)q_heart, (void *)fb_ortho, 256u, NULL, 0u);
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_select_target(1ull, &ds_heart, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 1);                      /* the HUD frame before the menu opens */
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_select_target(1ull, &ds_dim, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    vka_minimap_select_target(1ull, &ds_heart, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 0);                      /* after the dim layer: stays on the main target */
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_select_target(1ull, &ds_heart, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 0);                      /* and in a later pass of the same frame */
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_select_target(1ull, &ds_heart, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 1);                      /* menu closed: captured again */
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
 }
 
 int main(void) {
     test_proj_decode();
     test_pass_462636();
+    test_speech_popup_stays();
+    test_menu_dim_stops_capture();
     puts("vka_minimap_c_regression: PASS");
     return 0;
 }

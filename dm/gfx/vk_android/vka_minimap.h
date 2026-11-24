@@ -80,7 +80,8 @@ static struct {
     int saw_mm_frame, saw_obj_frame, saw_lhud_frame;
     int in_hud_pass, pass_opaque_fs, pass_modal, pass_dialog;
     int pass_mm_hit, pass_obj_hit, obj_bounds_init, pass_obj_icon, pass_obj_pill, pass_obj_text, cand_obj_text;
-    int pass_lhud_any, pass_lhud_top;
+    int pass_lhud_any, pass_lhud_top, nfp, fr_modal;
+    float fp[8][4];   // this frame's foreign panels (vka_mm_note_foreign)
     uint64_t hud_cleared_frame, hud_state_frame, frame_got_mm, frame_got_obj, frame_got_lhud;
     vka_mm_rect hit_mm, hit_obj, prev_hit_obj, hit_lhud;
     uint32_t learn_mm_w, learn_mm_h;
@@ -94,6 +95,10 @@ static struct {
     .obj = { .slot_bytes = VKA_OBJ_BUF_BYTES, .pending_slot = -1, .ready_slot = -1 },
     .lhud = { .slot_bytes = VKA_LHUD_BUF_BYTES, .pending_slot = -1, .ready_slot = -1 },
 };
+
+static struct {
+    int on, valid, hb; char cls; int32_t cnt; uint32_t stt, sref, blend, mask, seq; float mn[2], mx[2];
+} g_vka_mm_tr;
 
 static int vka_mm_supported_fmt(VkFormat fmt) {
     return fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB
@@ -268,7 +273,7 @@ static void vka_minimap_pass_begin(
         g_vka_mm.pass_mm_hit = 0; g_vka_mm.pass_obj_hit = 0; g_vka_mm.obj_bounds_init = 0;
         g_vka_mm.pass_obj_icon = 0; g_vka_mm.pass_obj_pill = 0; g_vka_mm.pass_obj_text = 0; g_vka_mm.cand_obj_text = 0;
         g_vka_mm.obj_icon_cx = 0.f; g_vka_mm.obj_icon_core_w = 0.f;
-        g_vka_mm.pass_lhud_any = 0; g_vka_mm.pass_lhud_top = 0;
+        g_vka_mm.pass_lhud_any = 0; g_vka_mm.pass_lhud_top = 0; g_vka_mm.nfp = 0; g_vka_mm.fr_modal = 0;
         g_vka_mm.hud_state_frame = fr; g_vka_mm.hud_state_im = im->img;
     }
     g_vka_mm.pass_area = area; g_vka_mm.main_cview = main_cview; g_vka_mm.main_clayout = main_clayout;
@@ -276,6 +281,8 @@ static void vka_minimap_pass_begin(
     if (g_vka_mm.has_depth) { g_vka_mm.depth_view = dp->imageView; g_vka_mm.depth_layout = dp->imageLayout; }
     g_vka_mm.has_stencil_att = 1; g_vka_mm.stencil_view = sp->imageView; g_vka_mm.stencil_layout = sp->imageLayout;
     g_vka_mm.in_hud_pass = 1; g_vka_mm.pass_im = im->img; g_vka_mm.pass_w = w; g_vka_mm.pass_h = h;
+    if (g_vka_mm.fr_modal) g_vka_mm.pass_modal = 1;
+    { int tn = VKA_ENV("DM_VK_MM_TRACE", 0); g_vka_mm_tr.on = tn > 0 && (fr % (uint64_t)tn) == 0u; g_vka_mm_tr.valid = 0; }
 }
 
 static void vka_mm_clear_hud_img(VkCommandBuffer cb) {
@@ -659,6 +666,12 @@ static int vka_mm_is_mm_draw(const float *mn, const float *mx, uint32_t stt, int
     if (g_vka_mm.pass_mm_hit) {
         if (stt != 0u && mn[0] >= w * 0.45f) return 1;
         vka_mm_rect r = g_vka_mm.hit_mm;
+        // The map's own layers (terrain, fog): unstencilled quads that cover the whole minimap and share its centre.
+        float rx1 = (float)(r.x + (int32_t)r.w), ry1 = (float)(r.y + (int32_t)r.h);
+        if (stt == 0u && cnt <= 6 && mn[0] <= (float)r.x && mx[0] >= rx1 && mn[1] <= (float)r.y && mx[1] >= ry1
+                && mx[0] - mn[0] < w * 0.98f
+                && fabsf((mn[0] + mx[0]) * 0.5f - ((float)r.x + rx1) * 0.5f) <= 4.f
+                && fabsf((mn[1] + mx[1]) * 0.5f - ((float)r.y + ry1) * 0.5f) <= 4.f) return 1;
         return mn[0] >= (float)(r.x - 28) && mx[0] <= (float)(r.x + (int32_t)r.w + 28)
             && mn[1] >= (float)(r.y - 28) && mx[1] <= (float)(r.y + (int32_t)r.h + 28);
     }
@@ -671,6 +684,27 @@ static int vka_mm_is_mm_draw(const float *mn, const float *mx, uint32_t stt, int
             vka_mm_try_minimap(mn, mx);
             return g_vka_mm.pass_mm_hit;
         }
+    }
+    return 0;
+}
+
+// A widget's draws are contiguous: backing panel first, then its children. A panel that starts in the left strip but reaches
+// well past it (a speech pop-up, a menu row) is not left-HUD, and neither are the portrait and text drawn on it afterwards.
+static void vka_mm_note_foreign(const float *mn, const float *mx, int32_t cnt) {
+    float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+    if (cnt < 4 || g_vka_mm.nfp >= 8) return;
+    if (mn[0] > w * 0.26f || mx[0] < w * 0.30f || bw < w * 0.20f || bw > w * 0.90f || bh < h * 0.04f || bh > h * 0.50f) return;
+    float *r = g_vka_mm.fp[g_vka_mm.nfp++];
+    r[0] = mn[0]; r[1] = mn[1]; r[2] = mx[0]; r[3] = mx[1];
+}
+
+static int vka_mm_on_foreign(const float *mn, const float *mx) {
+    float pad = (float)g_vka_mm.pass_h * 0.05f;
+    float cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
+    for (int i = 0; i < g_vka_mm.nfp; i++) {
+        const float *r = g_vka_mm.fp[i];
+        if (cx >= r[0] && cx <= r[2] && cy >= r[1] - pad && cy <= r[3] + pad) return 1;
     }
     return 0;
 }
@@ -689,6 +723,7 @@ static int vka_mm_is_lhud_draw(const float *mn, const float *mx, int32_t cnt) {
     if (mn[0] < -16.f || mn[0] > w * 0.20f || mx[0] > w * 0.26f || mn[1] < -16.f || mx[1] > h + 16.f) return 0;
     if (bw < 6.f || bw > w * 0.26f || bh < 6.f || bh > h * 0.42f) return 0;
     if (mn[0] > w * 0.18f && bh > bw * 6.f) return 0;
+    if (vka_mm_on_foreign(mn, mx)) return 0;
     g_vka_mm.pass_lhud_any = 1;
     g_vka_mm.hit_lhud = vka_mm_lhud_box(g_vka_mm.pass_w, g_vka_mm.pass_h);
     return 1;
@@ -767,20 +802,45 @@ static int vka_mm_is_obj_draw(const float *mn, const float *mx, int32_t cnt) {
     return vka_mm_obj_icon(mn, mx, cnt);
 }
 
+// DM_VK_MM_TRACE=<n> (diagnostic, live): every n-th frame, one log line per HUD-pass draw with its identity
+// (shader keys, first sampled texture, stencil state), its resolved bounds and the capture decision.
+// cls: x pre-filter, b no bounds, F opaque fullscreen, S stencil mask, M modal/masked, m minimap, l left HUD, o objective, - main.
+static void vka_minimap_trace_draw(uint64_t vsk, uint64_t fsk, const vka_img *t0, int ntex) {
+    (void)vsk; (void)fsk; (void)t0; (void)ntex;   // read only by the log line
+    if (!g_vka_mm_tr.on || !g_vka_mm_tr.valid) return;
+    g_vka_mm_tr.valid = 0;
+    VLOG("mm trace f%llu d%u: cls %c vs %016llx fs %016llx cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d",
+         (unsigned long long)vka_frame(), g_vka_mm_tr.seq++, g_vka_mm_tr.cls, (unsigned long long)vsk, (unsigned long long)fsk,
+         g_vka_mm_tr.cnt, g_vka_mm_tr.stt, g_vka_mm_tr.sref, g_vka_mm_tr.blend, g_vka_mm_tr.mask, g_vka_mm_tr.hb,
+         g_vka_mm_tr.mn[0], g_vka_mm_tr.mn[1], g_vka_mm_tr.mx[0], g_vka_mm_tr.mx[1],
+         t0 ? t0->w : 0u, t0 ? t0->h : 0u, t0 ? t0->levels : 0u, (unsigned long long)(t0 ? t0->serial : 0u), ntex);
+}
+
 static int vka_minimap_select_target(
     VkCommandBuffer cb, const vka_dstate *d, uint32_t vin_mask, const p_draw *dw, const p_draw_idx *di,
     int mesh, uint64_t ind, uint32_t stt, uint32_t dt, uint32_t c0_mask, uint32_t blend_en) {
     if (!g_vka_mm.in_hud_pass) return 0;
-    if (mesh || ind || dt != 0u || d->nattr < 1) return vka_mm_switch_target(cb, 0);
     int32_t cnt = dw ? dw->count : (di ? di->count : 0);
+    g_vka_mm_tr.valid = 1; g_vka_mm_tr.hb = 0; g_vka_mm_tr.cls = 'x'; g_vka_mm_tr.cnt = cnt; g_vka_mm_tr.stt = stt;
+    g_vka_mm_tr.sref = d->st_ref[0]; g_vka_mm_tr.blend = blend_en; g_vka_mm_tr.mask = c0_mask;
+    if (mesh || ind || dt != 0u || d->nattr < 1) return vka_mm_switch_target(cb, 0);
     float mn[2] = {0}, mx[2] = {0};
+    g_vka_mm_tr.cls = 'b';
     if (cnt < 3 || cnt > 4096 || !vka_mm_attr_xy_bounds(d, vin_mask, dw, di, cnt, mn, mx)) return vka_mm_switch_target(cb, 0);
+    g_vka_mm_tr.hb = 1; g_vka_mm_tr.cls = '-';
+    g_vka_mm_tr.mn[0] = mn[0]; g_vka_mm_tr.mn[1] = mn[1]; g_vka_mm_tr.mx[0] = mx[0]; g_vka_mm_tr.mx[1] = mx[1];
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
     if (stt == 0u && !blend_en && cnt <= 6) {
         int px_fs = (bw >= w * 0.90f && bh >= h * 0.90f);
         int ndc_fs = (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f);
-        if (px_fs || ndc_fs) { g_vka_mm.pass_opaque_fs = 1; return vka_mm_switch_target(cb, 0); }
+        if (px_fs || ndc_fs) { g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F'; return vka_mm_switch_target(cb, 0); }
+    }
+    // A blended quad over exactly the whole pass is a menu's frozen scene or dim layer (or a fade): the HUD is not the
+    // active layer, so nothing more is captured this frame, in this pass or a later one.
+    if (stt == 0u && blend_en && cnt <= 6 && (c0_mask & 0xfu) != 0u
+            && fabsf(mn[0]) <= 2.f && fabsf(mn[1]) <= 2.f && fabsf(mx[0] - w) <= 2.f && fabsf(mx[1] - h) <= 2.f) {
+        g_vka_mm.fr_modal = 1; g_vka_mm.pass_modal = 1;
     }
     if ((c0_mask & 0xfu) != 0u && cnt >= 4) {
         if (bw >= w * 0.28f && bw <= w * 0.88f && bh >= h * 0.12f && bh <= h * 0.88f
@@ -789,11 +849,13 @@ static int vka_minimap_select_target(
         if (bw >= w * 0.34f && bw <= w * 0.88f && bh <= h * 0.45f && cy > h * 0.62f && fabsf(cx - w * 0.5f) < w * 0.18f)
             g_vka_mm.pass_dialog = 1;
     }
-    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { vka_mm_try_minimap(mn, mx); return 0; }
-    if (g_vka_mm.pass_opaque_fs || g_vka_mm.pass_modal || (c0_mask & 0xfu) == 0u) return vka_mm_switch_target(cb, 0);
+    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vka_mm_tr.cls = 'S'; vka_mm_try_minimap(mn, mx); return 0; }
+    if (g_vka_mm.pass_opaque_fs || g_vka_mm.pass_modal || (c0_mask & 0xfu) == 0u) { g_vka_mm_tr.cls = 'M'; return vka_mm_switch_target(cb, 0); }
     int want = vka_mm_is_mm_draw(mn, mx, stt, cnt);
-    if (!want) want = vka_mm_is_lhud_draw(mn, mx, cnt);
-    if (!want && blend_en) want = vka_mm_is_obj_draw(mn, mx, cnt);
+    if (want) g_vka_mm_tr.cls = 'm';
+    if (!want) { want = vka_mm_is_lhud_draw(mn, mx, cnt); if (want) g_vka_mm_tr.cls = 'l'; }
+    if (!want && blend_en) { want = vka_mm_is_obj_draw(mn, mx, cnt); if (want) g_vka_mm_tr.cls = 'o'; }
+    if (!want) vka_mm_note_foreign(mn, mx, cnt);
     return vka_mm_switch_target(cb, want);
 }
 
@@ -825,7 +887,9 @@ static void vka_minimap_note_fs_tex(vka_img *im, uint32_t dt) {
 }
 
 static void vka_mm_stream_stage(vka_mm_stream *st, VkCommandBuffer cb, const vka_mm_rect *r) {
-    if (st->wrote_in_frame || atomic_load_explicit(&st->pending_valid, memory_order_acquire)) return;
+    // The HUD of one frame is recorded over several render passes: every pass end stages again into the same slot,
+    // so the copy that is read back is the last one, taken after the frame's final HUD draw (the first held only a prefix).
+    if (atomic_load_explicit(&st->pending_valid, memory_order_acquire)) return;
     VkDeviceSize need = (VkDeviceSize)r->w * r->h * 4u;
     if ((g_vka_mm.frame_counter & 1u) != 0u || !r->w || !r->h || need > st->slot_bytes) return;
     if (!g_vka_mm.hud_ready || !vka_mm_ensure_stream_ring(st)) return;
