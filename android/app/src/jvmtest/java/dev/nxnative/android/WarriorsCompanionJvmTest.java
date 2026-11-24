@@ -83,7 +83,9 @@ public final class WarriorsCompanionJvmTest {
 
     private static void testRtAndStatusTelemetry() {
         WarriorsCompanionModel m = new WarriorsCompanionModel();
-        check(m.devOnStatus && m.stickSync, "status overlay migration and stick sync default ON");
+        check(m.devOnStatus && m.stickLights && m.stickSync, "status overlay migration, stick lights, and stick sync default ON");
+        m.stickLights = false;
+        check(!m.stickLights, "stick lights master toggle switches OFF");
         check("SEARCHING RT".equals(m.minimapLabel()), "initial minimap label is SEARCHING RT");
         check("WAIT".equals(m.rtCandLabel()), "initial RT candidate label is WAIT");
         m.minimapW = 256; m.minimapH = 256; m.minimapCandCount = 3; m.minimapCandIdx = 1;

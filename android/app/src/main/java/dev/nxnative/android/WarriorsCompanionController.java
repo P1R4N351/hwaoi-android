@@ -25,7 +25,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     static final String AOI_TITLE_ID = "04003F40232DE000";
     private static final String TAG = "WarriorsCompanion";
     private static final long POLL_MS = 50L;
-    private static final int MINIMAP_MAX_BYTES = 512 * 512 * 4;
+    private static final int MINIMAP_MAX_BYTES = 768 * 768 * 4;
 
     private final GameActivity activity;
     private final FrameLayout rootView;
@@ -68,13 +68,13 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         this.model.gameKind = AOC_TITLE_ID.equals(titleId)
                 ? WarriorsCompanionModel.GAME_AOC : WarriorsCompanionModel.GAME_AOI;
         this.model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
+        this.model.stickLights = Prefs.bifrost(activity, titleId);
         this.model.stickSync = Prefs.bifrostScreenSync(activity);
+        BifrostBridge.setEnabled(this.model.stickLights);
         this.drawerOpen = Prefs.companionDrawer(activity, titleId);
         this.art.loadCached(activity);
         syncArtFlags();
-        File packDir = AppStorage.pack(activity, titleId);
-        File extDir = activity.getExternalFilesDir(null);
-        this.art.harvestFromGameDirsAsync(activity, new File[] { packDir, extDir }, model.gameKind, this::onArtUpdated);
+        this.art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, this::onArtUpdated);
         this.dm = (DisplayManager) activity.getSystemService(Context.DISPLAY_SERVICE);
         if (this.dm != null) this.dm.registerDisplayListener(this, ui);
         ensurePresentation();
@@ -104,7 +104,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private WarriorsCompanionView.Actions makeActions() {
         return new WarriorsCompanionView.Actions() {
             @Override public void onTabSelected(int tab) {
-                Native.companionMinimapEnable(tab == WarriorsCompanionModel.TAB_TACTICAL);
+                Native.companionMinimapEnable(minimapWantActive());
                 syncPublishedTab();
                 refreshNow();
             }
@@ -114,6 +114,13 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
                 boolean next = !Prefs.overlayOnSecondScreen(activity);
                 Prefs.overlayOnSecondScreen(activity, next);
                 model.devOnStatus = next;
+                invalidateViews();
+            }
+            @Override public void onToggleStickLights() {
+                boolean next = !Prefs.bifrost(activity, titleId);
+                Prefs.bifrost(activity, titleId, next);
+                BifrostBridge.setEnabled(next);
+                model.stickLights = next;
                 invalidateViews();
             }
             @Override public void onToggleStickSync() {
@@ -129,8 +136,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
                 refreshNow();
             }
             @Override public void onRescanArt() {
-                File[] dirs = new File[] { AppStorage.pack(activity, titleId), activity.getExternalFilesDir(null) };
-                art.harvestFromGameDirsAsync(activity, dirs, model.gameKind, WarriorsCompanionController.this::onArtUpdated);
+                art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, WarriorsCompanionController.this::onArtUpdated);
             }
             @Override public void onClearArt() {
                 art.clearCache(activity);
@@ -256,11 +262,11 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         String text = Native.companionDetail(ints, flts);
         if (text != null) model.update(ints, flts, text, now);
         else model.updateOrbit(now);
+        model.stickLights = BifrostBridge.enabled;
         model.stickSync = BifrostBridge.syncScreenBrightness;
         model.screenBrightnessPct = BifrostBridge.lastScreenPct;
         model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
-        if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
-                && !model.moviePlaying && !model.hostPaused) {
+        if (minimapWantActive()) {
             Native.companionMinimapEnable(true);
             int got = Native.companionMinimap(minimapBytes, minimapMeta);
             int rw = minimapMeta[0], rh = minimapMeta[1];
@@ -292,9 +298,27 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         schedulePoll();
     }
 
+    private boolean minimapWantActive() {
+        return !closed && resumed && anyVisible() && model.inGame && !model.moviePlaying && !model.hostPaused;
+    }
+
+    private File[] harvestDirs() {
+        String g = activity.getIntent() != null ? activity.getIntent().getStringExtra("game") : null;
+        String p = activity.getIntent() != null ? activity.getIntent().getStringExtra("pack") : null;
+        File gd = g != null && !g.isEmpty() ? new File(g) : null;
+        return new File[] {
+            gd != null && gd.isDirectory() ? new File(gd, "romfs/Movie") : null,
+            gd != null && gd.isDirectory() ? new File(gd, "romfs") : null,
+            gd,
+            p != null && !p.isEmpty() ? new File(p) : null,
+            AppStorage.pack(activity, titleId),
+            activity.getExternalFilesDir(null),
+        };
+    }
+
     void onResume() {
         resumed = true;
-        Native.companionMinimapEnable(model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL);
+        Native.companionMinimapEnable(minimapWantActive());
         schedulePoll();
     }
 

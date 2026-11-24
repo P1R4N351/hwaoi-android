@@ -17,6 +17,7 @@ final class WarriorsCompanionView extends View {
         void onFireAction(int actionId);
         void onAbortChord();
         void onToggleDevOnStatus();
+        void onToggleStickLights();
         void onToggleStickSync();
         void onCycleRt();
         void onRescanArt();
@@ -162,11 +163,12 @@ final class WarriorsCompanionView extends View {
 
     private boolean handleStatusTap(float lx, float ly) {
         if (lx < 796f || lx > 1194f) return false;
-        if (ly >= 180f && ly <= 290f) { actions.onToggleDevOnStatus(); return true; }
-        if (ly >= 314f && ly <= 424f) { actions.onToggleStickSync(); return true; }
-        if (ly >= 448f && ly <= 558f) { model.toggleAutoDim(); return true; }
-        if (ly >= 728f && ly <= 838f) { actions.onRescanArt(); return true; }
-        if (ly >= 862f && ly <= 960f) { actions.onClearArt(); return true; }
+        if (ly >= 170f && ly <= 264f) { actions.onToggleDevOnStatus(); return true; }
+        if (ly >= 280f && ly <= 374f) { actions.onToggleStickLights(); return true; }
+        if (ly >= 390f && ly <= 484f) { actions.onToggleStickSync(); return true; }
+        if (ly >= 500f && ly <= 594f) { model.toggleAutoDim(); return true; }
+        if (ly >= 746f && ly <= 840f) { actions.onRescanArt(); return true; }
+        if (ly >= 856f && ly <= 950f) { actions.onClearArt(); return true; }
         return false;
     }
 }

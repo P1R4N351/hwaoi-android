@@ -590,10 +590,8 @@ void vka_rp_end(void) {
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
     vka_xp_ts(g_cb, 1);
     if (R.nci > 0 && R.cim[0]) {
-        uint32_t mw = R.cim[0]->w >> R.clv[0]; if (!mw) mw = 1;
-        uint32_t mh = R.cim[0]->h >> R.clv[0]; if (!mh) mh = 1;
-        vka_minimap_pass_end(g_cb, R.cim[0], R.clv[0], R.cl0[0], R.cim[0]->f.view, mw, mh);
-    }
+        vka_minimap_pass_end(g_cb, R.cim[0], R.clv[0], R.cl0[0]);
+    } else vka_minimap_pass_abort();
     bcrt_flush();        // block-compressed targets drawn through shadows: their blocks back (bcrt_attach)
     ub_flush();          // inline uniform updates deferred during the pass: copied into placed guest RAM
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
@@ -788,6 +786,10 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
         if (dp || sp) snprintf(b + bn, bn < sizeof b ? sizeof b - bn : 0, " d:%d%s", R.df ? R.df : R.sf, (dp ? dp : sp)->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? "C" : "");
         vka_gp_pass(b);
     }
+    if (R.nci > 0 && R.cim[0] && s_im[0] == R.cim[0]) {
+        vka_minimap_pass_begin(g_cb, R.cim[0], R.clv[0], R.cl0[0], layers, w, h,
+                               ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD, sp != NULL);
+    } else vka_minimap_pass_abort();
     R.classic = 0;
     if (vka_classic_rp()) {   // DM_VK_CLASSIC_RP: the same pass as a VkRenderPass with an imageless framebuffer
         rpkey k; memset(&k, 0, sizeof k); fbkey fk; memset(&fk, 0, sizeof fk);
@@ -3134,6 +3136,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     DY.valid = 1;
     if (dyn_fast) vka_dyn_guard_put(&g_dyn_guard, &dyn_k);
 dyn_done:
+    vka_minimap_note_draw(d, dw, di, mesh, ind, DY.stt, DY.dt, k.att[0].mask);
     if (g_rtl_pass && rtl_room()) {   // DM_VK_RT_LOG: the draw's state
         char cm[200]; size_t cn = 0;
         for (uint32_t i = 0; i < R.ncolor && cn < sizeof cm; i++) if (R.cf[i]) cn += (size_t)snprintf(cm + cn, sizeof cm - cn, " c%u mask %x out %x blend %d(%d,%d,%d/%d,%d,%d)", i, k.att[i].mask,

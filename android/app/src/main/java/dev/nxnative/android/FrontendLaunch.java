@@ -144,7 +144,7 @@ public final class FrontendLaunch extends Activity {
     }
 
     private void play(Game g) {
-        startActivity(new Intent(this, GameActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        DisplayLaunch.startOnMainDisplay(this, new Intent(this, GameActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 .putExtra("title_id", g.titleId).putExtra("name", g.name).putExtra("game", g.gameDir).putExtra("pack", g.packDir).putExtra("frontend", true));
         finish();
     }
@@ -153,7 +153,7 @@ public final class FrontendLaunch extends Activity {
     private void home(File game) {
         Intent h = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         if (game != null) h.putExtra("frontend_game", game.getPath());
-        startActivity(h);
+        DisplayLaunch.startOnMainDisplay(this, h);
         finish();
     }
 

@@ -314,24 +314,27 @@ final class WarriorsCompanionDraw {
         drawCard(c, 774f, 108f, 1216f, 1048f, m);
         drawText(c, "SECOND SCREEN & LEDs", 796f, 146f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
 
-        drawButton(c, 796f, 180f, 1194f, 290f, m, m.devOnStatus, m.primaryColor(),
+        drawButton(c, 796f, 170f, 1194f, 264f, m, m.devOnStatus, m.primaryColor(),
                 "DEV HUD -> STATUS", m.devOnStatus ? "CORNERS HIDDEN ON TOP" : "SHOWN IN TOP CORNERS", 20f);
 
-        drawButton(c, 796f, 314f, 1194f, 424f, m, m.stickSync, m.secondaryColor(),
-                "STICK LED = SCREEN", m.stickSyncLabel() + "  \u00b7  " + m.bifrostLookDesc(), 20f);
+        drawButton(c, 796f, 280f, 1194f, 374f, m, m.stickLights, m.primaryColor(),
+                "STICK LIGHTS", m.stickLights ? ("ON  \u00b7  " + m.bifrostLookDesc()) : "OFF  \u00b7  LEDS CLEARED", 20f);
 
-        drawButton(c, 796f, 448f, 1194f, 558f, m, m.autoDim, m.primaryColor(),
+        drawButton(c, 796f, 390f, 1194f, 484f, m, m.stickLights && m.stickSync, m.secondaryColor(),
+                "STICK LED = SCREEN", m.stickSyncLabel() + (m.stickLights ? "  \u00b7  BRIGHTNESS" : "  \u00b7  MUTED"), 20f);
+
+        drawButton(c, 796f, 500f, 1194f, 594f, m, m.autoDim, m.primaryColor(),
                 "CUTSCENE AUTO-DIM", m.autoDim ? "ON" : "OFF", 20f);
 
-        drawText(c, "TARGET GAME ART", 796f, 616f, 18f, m.secondaryColor(), true, Paint.Align.LEFT);
-        drawKvRow(c, 796f, 1194f, 654f, "BACKDROP", m.hasBackdrop ? m.assetSource : "NONE",
+        drawText(c, "TARGET GAME ART", 796f, 640f, 18f, m.secondaryColor(), true, Paint.Align.LEFT);
+        drawKvRow(c, 796f, 1194f, 678f, "BACKDROP", m.hasBackdrop ? m.assetSource : "NONE",
                 m.hasBackdrop ? 0xFF34D399 : 0xFF94A3B8);
-        drawKvRow(c, 796f, 1194f, 692f, "EMBLEM", m.hasEmblem ? "HARVESTED" : "NONE",
+        drawKvRow(c, 796f, 1194f, 714f, "EMBLEM", m.hasEmblem ? "HARVESTED" : "NONE",
                 m.hasEmblem ? 0xFF34D399 : 0xFF94A3B8);
 
-        drawButton(c, 796f, 728f, 1194f, 838f, m, false, m.primaryColor(),
+        drawButton(c, 796f, 746f, 1194f, 840f, m, false, m.primaryColor(),
                 "RESCAN GAME ART", "PACK & MOVIES", 20f);
-        drawButton(c, 796f, 862f, 1194f, 960f, m, false, m.borderColor(),
+        drawButton(c, 796f, 856f, 1194f, 950f, m, false, m.borderColor(),
                 "CLEAR HARVESTED ART", "RETURN TO PROCEDURAL", 19f);
     }
 

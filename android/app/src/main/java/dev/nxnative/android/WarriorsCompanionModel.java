@@ -21,7 +21,7 @@ public final class WarriorsCompanionModel {
     public int trailCount, seqTag = -1, seqStep, seqCount, keepCount;
     public boolean inGame, writeSafe, moviePlaying, hostPaused, saveBusy, seqActive, inputActive;
     public boolean headingUp = true, macroMode = true, autoDim = true;
-    public boolean devOnStatus = true, stickSync = true, hasBackdrop, hasEmblem, hasLiveMinimap;
+    public boolean devOnStatus = true, stickLights = true, stickSync = true, hasBackdrop, hasEmblem, hasLiveMinimap;
     public int screenBrightnessPct = -1, minimapW, minimapH, minimapCandCount, minimapCandIdx;
     public String devBuildTag = "", devOverlayText = "", assetSource = "NONE";
     public float posX, posY, posZ, yawDeg, fps, frameMs;

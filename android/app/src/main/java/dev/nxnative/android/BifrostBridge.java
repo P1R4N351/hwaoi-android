@@ -24,6 +24,7 @@ final class BifrostBridge {
     private static final String OOT_TITLE_ID = "0400486024DEC000";
     private static final String AOI_TITLE_ID = "04003F40232DE000";
     private static volatile BifrostBridge current;
+    static volatile boolean enabled = true;
     static volatile boolean syncScreenBrightness = true;
     static volatile int lastScreenPct = -1;
 
@@ -47,7 +48,7 @@ final class BifrostBridge {
     private final BifrostLooks.State state = new BifrostLooks.State();
     private HandlerThread thread;
     private volatile Handler worker;
-    private volatile boolean running, dead;
+    private volatile boolean running, dead, foreground;
     private volatile int generation;
     private String said = "";
 
@@ -64,8 +65,23 @@ final class BifrostBridge {
         this.feed = new BifrostLooks.Feed(classic, aoi);
     }
 
+    static void setEnabled(boolean on) {
+        enabled = on;
+        BifrostBridge b = current;
+        if (b == null) return;
+        if (!on) b.stop();
+        else if (b.foreground) b.start();
+    }
+
+    void pause() {
+        foreground = false;
+        stop();
+    }
+
     void start() {
-        if (running || dead) return;
+        foreground = true;
+        current = this;
+        if (!enabled || running || dead) return;
         try {
             if (worker == null) {
                 context.getPackageManager().getPackageInfo(BifrostLooks.PACKAGE, 0);

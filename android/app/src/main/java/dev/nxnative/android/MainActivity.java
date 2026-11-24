@@ -73,6 +73,7 @@ public final class MainActivity extends Activity {
             setIntent(gated(getIntent()));
             if (tryDirectBoot(getIntent())) { directBooted = true; return; }
         }
+        if (DisplayLaunch.ensureMainDisplay(this)) return;
         rootFrame = new FrameLayout(this);
         View backdrop = new View(this);
         backdrop.setBackgroundColor(Ui.col(this, R.color.bn_bg));
@@ -844,6 +845,7 @@ public final class MainActivity extends Activity {
             directBooted = true;
             return;
         }
+        if (DisplayLaunch.ensureMainDisplay(this)) return;
         fromIntent(gi);
     }
 
@@ -854,7 +856,6 @@ public final class MainActivity extends Activity {
             int pid = -1;
             try { String ps = rec.get("pid"); if (ps != null) pid = Integer.parseInt(ps); } catch (NumberFormatException ignored) {}
             if (pid <= 0 || !ExitWatch.alive(this, pid)) {
-                if (ExitWatch.cause(this, rec, false) != null) return false;
                 ExitWatch.shown(this);
             }
         }
@@ -895,7 +896,7 @@ public final class MainActivity extends Activity {
                 .putExtra("title_id", g.titleId).putExtra("name", g.name).putExtra("game", g.gameDir)
                 .putExtra("pack", g.packDir).putExtra("direct_boot", true);
         if (src != null && src.getBooleanExtra("no_pause", false)) intent.putExtra("no_pause", true);
-        startActivity(intent);
+        DisplayLaunch.startOnMainDisplay(this, intent);
         overridePendingTransition(0, 0);
         finish();
     }
@@ -2178,7 +2179,7 @@ public final class MainActivity extends Activity {
         Game.touch(this, g);   // the entry played last is the one kept if the list ever holds this game twice
         Intent intent = new Intent(this, GameActivity.class).putExtra("title_id", g.titleId).putExtra("name", g.name).putExtra("game", g.gameDir).putExtra("pack", g.packDir);
         if (getIntent().getBooleanExtra("no_pause", false)) intent.putExtra("no_pause", true);
-        startActivity(intent);
+        DisplayLaunch.startOnMainDisplay(this, intent);
     }
 
     /** The overlay's master switch and its items (Overlay.rows); the main screen's switch follows the master switch */

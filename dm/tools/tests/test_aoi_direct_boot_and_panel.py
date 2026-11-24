@@ -32,6 +32,10 @@ class AoiDirectBootAndPanelTests(unittest.TestCase):
         ga = (JAVA / 'GameActivity.java').read_text(encoding='utf-8')
         self.assertIn('"direct_boot"', ga)
         self.assertIn('finishAndRemoveTask()', ga)
+        self.assertNotIn('if (ExitWatch.cause(this, rec, false) != null) return false;', ma)
+        self.assertIn('DisplayLaunch.startOnMainDisplay', ma)
+        dl = (JAVA / 'DisplayLaunch.java').read_text(encoding='utf-8')
+        self.assertIn('setLaunchDisplayId(Display.DEFAULT_DISPLAY)', dl)
 
     def test_zonai_quick_menu_and_ablation(self) -> None:
         sp = (JAVA / 'SidePanel.java').read_text(encoding='utf-8')
