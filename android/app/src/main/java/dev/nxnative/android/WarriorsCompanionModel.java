@@ -5,8 +5,8 @@ import java.util.Locale;
 
 /**
  * Pure-JVM model for the converged Age of Calamity / Age of Imprisonment second screen.
- * Holds telemetry unpacked from ktgl_companion.h, tactical radar state, stopwatch,
- * KO counter, chord/combo catalogs, cutscene auto-dimming, and AMOLED pixel orbit.
+ * Holds telemetry unpacked from ktgl_companion.h, live Vulkan minimap & objective metadata,
+ * Purah Pad theme palette, chord/combo catalogs, cutscene auto-dimming, and AMOLED pixel orbit.
  */
 public final class WarriorsCompanionModel {
     public static final int DETAIL_INTS = 32, DETAIL_FLOATS = 416;
@@ -18,11 +18,13 @@ public final class WarriorsCompanionModel {
     public static final int ACT_LOCKON = 30, ACT_SPECIAL = 31, ACT_DODGE = 32, ACT_COMBO_BASE = 40;
 
     public int status, gameKind = GAME_AOI, activeParty, presents, saveCommits, lastSaveAgeS = -1;
-    public int trailCount, seqTag = -1, seqStep, seqCount, keepCount;
+    public int trailCount, seqTag = -1, seqStep, seqCount;
     public boolean inGame, writeSafe, moviePlaying, hostPaused, saveBusy, seqActive, inputActive;
     public boolean headingUp = true, macroMode = true, autoDim = true;
-    public boolean devOnStatus = true, stickLights = true, stickSync = true, hasBackdrop, hasEmblem, hasLiveMinimap;
+    public boolean devOnStatus = true, stickLights = true, stickSync = true;
+    public boolean hasBackdrop, hasEmblem, hasLiveMinimap, hasLiveObjective, hasPurahTex;
     public int screenBrightnessPct = -1, minimapW, minimapH, minimapCandCount, minimapCandIdx;
+    public int objectiveW, objectiveH;
     public String devBuildTag = "", devOverlayText = "", assetSource = "NONE";
     public float posX, posY, posZ, yawDeg, fps, frameMs;
     public final float[] trailX = new float[TRAIL_CAP], trailY = new float[TRAIL_CAP], trailZ = new float[TRAIL_CAP];
@@ -34,8 +36,8 @@ public final class WarriorsCompanionModel {
 
     private static final float[] ZOOM_METERS = {40f, 80f, 160f};
     private int tab = TAB_TACTICAL, zoomIdx = 1, orbitStep;
-    private boolean seedApplied, timerRunning;
-    private long lastOrbitMs = -1L, timerAccumMs, timerStartMs;
+    private boolean seedApplied;
+    private long lastOrbitMs = -1L;
 
     public boolean update(int[] ints, float[] flts, String txt, long nowMs) {
         updateOrbit(nowMs);
@@ -118,8 +120,8 @@ public final class WarriorsCompanionModel {
     public void updateOrbit(long nowMs) {
         if (lastOrbitMs < 0L) lastOrbitMs = nowMs;
         if (nowMs - lastOrbitMs >= 60_000L) {
-            orbitStep = (orbitStep + 1) & 7;
             lastOrbitMs = nowMs;
+            orbitStep = (orbitStep + 1) & 7;
         }
     }
 
@@ -149,21 +151,6 @@ public final class WarriorsCompanionModel {
     public int cyclePreset() { pinPresetIdx = (pinPresetIdx + 1) % 5; return pinPresetIdx; }
     public boolean dimmed() { return autoDim && moviePlaying; }
     public boolean touchBlocked() { return dimmed(); }
-
-    public boolean timerRunning() { return timerRunning; }
-    public void toggleTimer(long nowMs) {
-        if (timerRunning) { timerAccumMs += Math.max(0L, nowMs - timerStartMs); timerRunning = false; }
-        else { timerStartMs = nowMs; timerRunning = true; }
-    }
-    public void resetTimer(long nowMs) { timerAccumMs = 0L; timerStartMs = nowMs; timerRunning = false; }
-    public String formatTimer(long nowMs) {
-        long ms = timerAccumMs + (timerRunning ? Math.max(0L, nowMs - timerStartMs) : 0L);
-        long s = ms / 1000L;
-        return String.format(Locale.ROOT, "%02d:%02d.%d", s / 60L, s % 60L, (ms % 1000L) / 100L);
-    }
-
-    public void adjustKeep(int delta) { keepCount = clamp(keepCount + delta, 0, 9999); }
-    public void resetKeep() { keepCount = 0; }
 
     public int pinCount() {
         int n = 0;
@@ -198,11 +185,15 @@ public final class WarriorsCompanionModel {
         return dy > 3f ? (dist + " \u25b2") : dy < -3f ? (dist + " \u25bc") : dist;
     }
 
-    public int bgColor() { return gameKind == GAME_AOC ? 0xFF0E131B : 0xFF141311; }
-    public int cardColor() { return gameKind == GAME_AOC ? 0xFF151D29 : 0xFF1C1A17; }
-    public int borderColor() { return gameKind == GAME_AOC ? 0xFF28374A : 0xFF332F28; }
-    public int primaryColor() { return gameKind == GAME_AOC ? 0xFF38BDF8 : 0xFF5AC8B8; }
-    public int secondaryColor() { return gameKind == GAME_AOC ? 0xFFEAB308 : 0xFFE8B84B; }
+    /** Pure #000000 OLED black unless filled by a harvested game asset. */
+    public int bgColor() { return 0xFF000000; }
+    public int cardColor() { return 0xCC0A0F14; }
+    /** Borderless cards and buttons (zero cell borders). */
+    public int borderColor() { return 0x00000000; }
+    /** Purah Pad luminous cyan/teal accent. */
+    public int primaryColor() { return 0xFF5CE6C4; }
+    /** Purah Pad antique gold accent. */
+    public int secondaryColor() { return 0xFFDCC08A; }
     public String saveFileName() { return gameKind == GAME_AOC ? "svdt" : "DATA.BIN"; }
     public String bifrostLookDesc() {
         return gameKind == GAME_AOC ? "Cyan / Gold" : "Jade / Amber";
@@ -281,9 +272,13 @@ public final class WarriorsCompanionModel {
         }
     }
 
-
     public String minimapLabel() {
         return minimapW > 0 && minimapH > 0 ? ("RT " + minimapW + "x" + minimapH) : "SEARCHING RT";
+    }
+
+    public String objectiveLabel() {
+        return hasLiveObjective && objectiveW > 0 && objectiveH > 0
+                ? ("OBJ " + objectiveW + "x" + objectiveH) : "SEARCHING OBJ";
     }
 
     public String rtCandLabel() {

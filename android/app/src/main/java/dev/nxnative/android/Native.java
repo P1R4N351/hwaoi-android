@@ -198,4 +198,8 @@ final class Native {
     static native int companionMinimapCycle();
     /** Enables or disables native Vulkan minimap capture. */
     static native void companionMinimapEnable(boolean on);
+    /** Reads native Vulkan objective indicator into RGBA buffer; meta = {w, h, seq, active}. Returns 1 if updated. */
+    static native int companionObjective(byte[] rgba, int[] meta);
+    /** Harvests one UI/Purah Pad texture asynchronously from Vulkan; meta = {w, h, seq, state}. Returns 1 if ready. */
+    static native int companionUiTex(byte[] rgba, int[] meta, boolean request);
 }

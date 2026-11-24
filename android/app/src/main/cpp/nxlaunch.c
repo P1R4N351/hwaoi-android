@@ -654,6 +654,10 @@ int nxhost_companion_minimap(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
 int nxhost_companion_minimap_cycle(void);
 #pragma weak nxhost_companion_minimap_enable
 void nxhost_companion_minimap_enable(int on);
+#pragma weak nxhost_companion_objective
+int nxhost_companion_objective(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
+#pragma weak nxhost_companion_ui_tex
+int nxhost_companion_ui_tex(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request);
 
 JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_companionState(JNIEnv *env, jclass cls, jlongArray out) {
     (void)cls;
@@ -728,6 +732,36 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionMinimapCycle(JN
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionMinimapEnable(JNIEnv *env, jclass cls, jboolean on) {
     (void)env; (void)cls;
     if (nxhost_companion_minimap_enable) nxhost_companion_minimap_enable(on ? 1 : 0);
+}
+
+static jint companion_read_buf(
+        JNIEnv *env, jbyteArray rgba, jintArray meta, int nmeta,
+        int (*fn4)(uint8_t *, int, int32_t *),
+        int (*fn_req)(uint8_t *, int, int32_t *, int), int req) {
+    if (!rgba || !meta || (*env)->GetArrayLength(env, meta) < nmeta || nmeta > 8) return 0;
+    jint jm[8] = {0}; int32_t m[8] = {0};
+    (*env)->GetIntArrayRegion(env, meta, 0, nmeta, jm);
+    for (int i = 0; i < nmeta; i++) m[i] = (int32_t)jm[i];
+    jsize cap = (*env)->GetArrayLength(env, rgba);
+    jbyte *buf = cap > 0 ? (*env)->GetByteArrayElements(env, rgba, NULL) : NULL;
+    int updated = 0;
+    if (buf) updated = fn_req ? fn_req((uint8_t *)buf, (int)cap, m, req) : (fn4 ? fn4((uint8_t *)buf, (int)cap, m) : 0);
+    if (buf) (*env)->ReleaseByteArrayElements(env, rgba, buf, updated ? 0 : JNI_ABORT);
+    for (int i = 0; i < nmeta; i++) jm[i] = (jint)m[i];
+    (*env)->SetIntArrayRegion(env, meta, 0, nmeta, jm);
+    return updated ? 1 : 0;
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionObjective(
+        JNIEnv *env, jclass cls, jbyteArray rgba, jintArray meta) {
+    (void)cls;
+    return nxhost_companion_objective ? companion_read_buf(env, rgba, meta, 4, nxhost_companion_objective, NULL, 0) : 0;
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionUiTex(
+        JNIEnv *env, jclass cls, jbyteArray rgba, jintArray meta, jboolean request) {
+    (void)cls;
+    return nxhost_companion_ui_tex ? companion_read_buf(env, rgba, meta, 4, NULL, nxhost_companion_ui_tex, request ? 1 : 0) : 0;
 }
 
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_bifrostMode(JNIEnv *env, jclass cls) {

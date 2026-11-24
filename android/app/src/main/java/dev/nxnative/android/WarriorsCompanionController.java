@@ -26,6 +26,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private static final String TAG = "WarriorsCompanion";
     private static final long POLL_MS = 50L;
     private static final int MINIMAP_MAX_BYTES = 768 * 768 * 4;
+    private static final int OBJ_MAX_BYTES = 768 * 224 * 4, UI_TEX_BYTES = 512 * 512 * 4;
 
     private final GameActivity activity;
     private final FrameLayout rootView;
@@ -38,11 +39,15 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private final float[] flts = new float[WarriorsCompanionModel.DETAIL_FLOATS];
     private final byte[] minimapBytes = new byte[MINIMAP_MAX_BYTES];
     private final int[] minimapMeta = new int[5];
+    private final byte[] objBytes = new byte[OBJ_MAX_BYTES];
+    private final int[] objMeta = new int[4];
+    private final byte[] uiBytes = new byte[UI_TEX_BYTES];
+    private final int[] uiMeta = new int[4];
 
     private WarriorsCompanionPresentation presentation;
     private WarriorsCompanionView presView, drawerView;
-    private Bitmap minimapBmp;
-    private int presDisplayId = -1, lastPublishedTab = -1;
+    private Bitmap minimapBmp, objBmp;
+    private int presDisplayId = -1, lastPublishedTab = -1, uiTexTick, uiTexTries;
     private boolean started, resumed, closed, drawerOpen;
 
     private final Runnable pollTask = new Runnable() {
@@ -98,6 +103,8 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         model.hasBackdrop = art.backdrop() != null;
         model.hasEmblem = art.emblem() != null;
         model.hasLiveMinimap = art.minimap() != null;
+        model.hasLiveObjective = art.objective() != null;
+        model.hasPurahTex = art.purahTex() != null;
         model.assetSource = art.source();
     }
 
@@ -136,6 +143,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
                 refreshNow();
             }
             @Override public void onRescanArt() {
+                uiTexTries = 0; uiTexTick = 0;
                 art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, WarriorsCompanionController.this::onArtUpdated);
             }
             @Override public void onClearArt() {
@@ -268,21 +276,12 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
         if (minimapWantActive()) {
             Native.companionMinimapEnable(true);
-            int got = Native.companionMinimap(minimapBytes, minimapMeta);
-            int rw = minimapMeta[0], rh = minimapMeta[1];
-            model.minimapW = rw;
-            model.minimapH = rh;
-            model.minimapCandCount = minimapMeta[3];
-            model.minimapCandIdx = minimapMeta[4];
-            if (got == 1 && rw > 0 && rw <= 512 && rh > 0 && rh <= 512 && rw * rh * 4 <= minimapBytes.length) {
-                if (minimapBmp == null || minimapBmp.getWidth() != rw || minimapBmp.getHeight() != rh) {
-                    minimapBmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
-                }
-                minimapBmp.copyPixelsFromBuffer(ByteBuffer.wrap(minimapBytes, 0, rw * rh * 4));
-                art.setMinimap(minimapBmp);
-            }
+            pollMinimapStream();
+            pollObjectiveStream();
+            pollGpuUiTex();
         } else {
             Native.companionMinimapEnable(false);
+            art.setObjective(null);
         }
         syncArtFlags();
         syncPublishedTab();
@@ -296,6 +295,48 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
             try { presentation.show(); } catch (RuntimeException ignored) { dismissPresentation(); }
         }
         schedulePoll();
+    }
+
+    private void pollMinimapStream() {
+        int got = Native.companionMinimap(minimapBytes, minimapMeta);
+        int rw = minimapMeta[0], rh = minimapMeta[1];
+        model.minimapW = rw;
+        model.minimapH = rh;
+        model.minimapCandCount = minimapMeta[3];
+        model.minimapCandIdx = minimapMeta[4];
+        if (got == 1 && rw > 0 && rw <= 768 && rh > 0 && rh <= 768 && rw * rh * 4 <= minimapBytes.length) {
+            if (minimapBmp == null || minimapBmp.getWidth() != rw || minimapBmp.getHeight() != rh) {
+                minimapBmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
+            }
+            minimapBmp.copyPixelsFromBuffer(ByteBuffer.wrap(minimapBytes, 0, rw * rh * 4));
+            art.setMinimap(minimapBmp);
+        }
+    }
+
+    private void pollObjectiveStream() {
+        int got = Native.companionObjective(objBytes, objMeta);
+        int ow = objMeta[0], oh = objMeta[1], active = objMeta[3];
+        model.objectiveW = ow;
+        model.objectiveH = oh;
+        if (active == 0) {
+            art.setObjective(null);
+        } else if (got == 1 && ow > 0 && ow <= 768 && oh > 0 && oh <= 224 && ow * oh * 4 <= objBytes.length) {
+            if (objBmp == null || objBmp.getWidth() != ow || objBmp.getHeight() != oh) {
+                objBmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888);
+            }
+            objBmp.copyPixelsFromBuffer(ByteBuffer.wrap(objBytes, 0, ow * oh * 4));
+            art.setObjective(objBmp);
+        }
+    }
+
+    private void pollGpuUiTex() {
+        if (art.purahTex() != null || art.isSuppressed() || uiTexTries >= 8) return;
+        boolean req = (uiTexTick % 30) == 0 && uiMeta[3] == 0;
+        uiTexTick++;
+        if (Native.companionUiTex(uiBytes, uiMeta, req) == 1) {
+            uiTexTries++;
+            art.ingestGpuUiTex(activity, uiBytes, uiMeta[0], uiMeta[1], model.gameKind);
+        }
     }
 
     private boolean minimapWantActive() {
@@ -347,7 +388,9 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         Native.companionMinimapEnable(false);
         Native.companionAbortSeq();
         art.setMinimap(null);
+        art.setObjective(null);
         minimapBmp = null;
+        objBmp = null;
         dismissPresentation();
         if (drawerView != null && rootView != null) {
             rootView.removeView(drawerView);

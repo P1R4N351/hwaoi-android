@@ -17,59 +17,64 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * BYOG runtime asset harvester for the Warriors second-screen companion.
- * Zero game assets ship in the repository or APK: backgrounds and crests are
- * harvested at runtime from the user's own installed game files (pack icons,
- * RomFS WebM/EBML attract movies) and cached under filesDir/companion_art/.
+ * Zero game assets ship in the repository or APK: backgrounds, crests, and Purah Pad
+ * UI textures are harvested at runtime from the user's installed game files (.nup,
+ * pack images, RomFS WebM/EBML attract movies) or live Vulkan UI atlas blits, and
+ * cached under filesDir/companion_art/.
  */
 final class WarriorsAssetHarvester {
     private static final String TAG = "WarriorsArt";
     private static final String DIR_NAME = "companion_art";
     private static final String BG_FILE = "backdrop.png";
     private static final String EMBLEM_FILE = "emblem.png";
+    private static final String PURAH_FILE = "purah_tex.png";
     private static final String SRC_FILE = "source.txt";
-    private static final int BG_W = 620, BG_H = 540, EMBLEM_SZ = 192;
+    private static final int BG_W = 620, BG_H = 540, EMBLEM_SZ = 192, PURAH_SZ = 256;
     private static final int MAX_FILES_SCAN = 96;
 
     private volatile Bitmap backdrop;
     private volatile Bitmap emblem;
+    private volatile Bitmap purahTex;
     private volatile String source = "NONE";
     private volatile boolean scanning;
+    private volatile boolean suppressed;
     private volatile Bitmap minimap;
+    private volatile Bitmap objective;
 
     Bitmap minimap() { return minimap; }
     void setMinimap(Bitmap bmp) { minimap = bmp; }
-
+    Bitmap objective() { return objective; }
+    void setObjective(Bitmap bmp) { objective = bmp; }
     Bitmap backdrop() { return backdrop; }
     Bitmap emblem() { return emblem; }
+    Bitmap purahTex() { return purahTex; }
     String source() { return source; }
+    boolean isSuppressed() { return suppressed; }
+    void setSuppressed(boolean s) { suppressed = s; }
 
     void loadCached(Context ctx) {
         File dir = artDir(ctx);
-        File bg = new File(dir, BG_FILE);
-        if (bg.isFile() && bg.length() > 0) {
-            Bitmap b = BitmapFactory.decodeFile(bg.getAbsolutePath());
-            if (b != null) backdrop = b;
-        }
-        File em = new File(dir, EMBLEM_FILE);
-        if (em.isFile() && em.length() > 0) {
-            Bitmap b = BitmapFactory.decodeFile(em.getAbsolutePath());
-            if (b != null) emblem = b;
-        }
+        backdrop = decodeFileSimple(new File(dir, BG_FILE));
+        emblem = decodeFileSimple(new File(dir, EMBLEM_FILE));
+        purahTex = decodeFileSimple(new File(dir, PURAH_FILE));
         File sf = new File(dir, SRC_FILE);
         if (sf.isFile()) {
             source = readSmallText(sf);
-        } else if (backdrop != null) {
+        } else if (backdrop != null || purahTex != null) {
             source = "CACHE";
         }
     }
 
     void harvestFromGameDirsAsync(Context ctx, File[] roots, int gameKind, Runnable onUpdated) {
+        suppressed = false;
         if (scanning || roots == null || roots.length == 0) return;
         scanning = true;
         final Context app = ctx.getApplicationContext();
@@ -89,23 +94,75 @@ final class WarriorsAssetHarvester {
     }
 
     void clearCache(Context ctx) {
+        suppressed = true;
         File dir = artDir(ctx);
         deleteQuiet(new File(dir, BG_FILE));
         deleteQuiet(new File(dir, EMBLEM_FILE));
+        deleteQuiet(new File(dir, PURAH_FILE));
         deleteQuiet(new File(dir, SRC_FILE));
         backdrop = null;
         emblem = null;
+        purahTex = null;
         source = "NONE";
     }
 
+    /** Ingests a one-shot 512x512 RGBA8 UI texture captured via Vulkan blit when not suppressed. */
+    boolean ingestGpuUiTex(Context ctx, byte[] rgba, int w, int h, int gameKind) {
+        if (suppressed || rgba == null || w < 128 || h < 128 || w * h * 4 > rgba.length) return false;
+        if (!hasRichUiDetail(rgba, w, h)) return false;
+        Bitmap src = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        src.copyPixelsFromBuffer(ByteBuffer.wrap(rgba, 0, w * h * 4));
+        Bitmap tile = Bitmap.createScaledBitmap(src, PURAH_SZ, PURAH_SZ, true);
+        saveBitmap(new File(artDir(ctx), PURAH_FILE), tile);
+        purahTex = tile;
+        if (backdrop == null || "NUP".equals(source)) {
+            Bitmap styled = styleBackdrop(src, gameKind);
+            saveBitmap(new File(artDir(ctx), BG_FILE), styled);
+            writeSmallText(new File(artDir(ctx), SRC_FILE), "PURAH PAD");
+            backdrop = styled;
+            source = "PURAH PAD";
+        }
+        if (emblem == null) {
+            Bitmap sq = centerCropSquare(src, EMBLEM_SZ);
+            saveBitmap(new File(artDir(ctx), EMBLEM_FILE), sq);
+            emblem = sq;
+        }
+        src.recycle();
+        return true;
+    }
+
+    private static boolean hasRichUiDetail(byte[] rgba, int w, int h) {
+        int stepX = Math.max(1, w / 32), stepY = Math.max(1, h / 32);
+        int nonBlack = 0, colored = 0, lumaMin = 255, lumaMax = 0;
+        for (int y = 0; y < h; y += stepY) {
+            for (int x = 0; x < w; x += stepX) {
+                int o = (y * w + x) * 4;
+                int r = rgba[o] & 0xFF, g = rgba[o + 1] & 0xFF, b = rgba[o + 2] & 0xFF, a = rgba[o + 3] & 0xFF;
+                if (a <= 32) continue;
+                int mx = Math.max(r, Math.max(g, b)), mn = Math.min(r, Math.min(g, b));
+                int lum = (r * 3 + g * 6 + b) / 10;
+                if (r + g + b > 24) nonBlack++;
+                if (mx - mn > 22) colored++;
+                if (lum < lumaMin) lumaMin = lum;
+                if (lum > lumaMax) lumaMax = lum;
+            }
+        }
+        return nonBlack >= 120 && (colored >= 48 || (lumaMax - lumaMin) >= 64);
+    }
+
     private boolean scanRoots(Context ctx, File[] roots, int gameKind) {
+        boolean changed = false;
+        for (File root : roots) {
+            if (root != null && root.isFile() && Nup.extOf(root.getName()) != null) {
+                if (extractNupArt(ctx, root, gameKind)) changed = true;
+            }
+        }
         List<File> images = new ArrayList<>();
         List<File> movies = new ArrayList<>();
         int[] budget = {MAX_FILES_SCAN};
         for (File root : roots) {
             if (root != null && root.exists()) walkBounded(root, 0, budget, images, movies);
         }
-        boolean changed = false;
         if (emblem == null) {
             for (File f : images) {
                 Bitmap b = decodeBounded(f, 512, 512);
@@ -148,8 +205,39 @@ final class WarriorsAssetHarvester {
         return changed;
     }
 
+    private boolean extractNupArt(Context ctx, File nupFile, int gameKind) {
+        if (emblem != null && backdrop != null) return false;
+        try {
+            Nup n = Nup.open(nupFile);
+            Nup.Meta meta = n.gameMeta();
+            if (meta == null || meta.icon == null || meta.icon.length < 128) return false;
+            Bitmap decoded = BitmapFactory.decodeByteArray(meta.icon, 0, meta.icon.length);
+            if (decoded == null || decoded.getWidth() < 64 || decoded.getHeight() < 64) return false;
+            boolean did = false;
+            if (emblem == null) {
+                Bitmap sq = centerCropSquare(decoded, EMBLEM_SZ);
+                saveBitmap(new File(artDir(ctx), EMBLEM_FILE), sq);
+                emblem = sq;
+                did = true;
+            }
+            if (backdrop == null) {
+                Bitmap styled = styleBackdrop(decoded, gameKind);
+                saveBitmap(new File(artDir(ctx), BG_FILE), styled);
+                writeSmallText(new File(artDir(ctx), SRC_FILE), "NUP");
+                backdrop = styled;
+                source = "NUP";
+                did = true;
+            }
+            decoded.recycle();
+            return did;
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "nup meta harvest failed", e);
+            return false;
+        }
+    }
+
     private static void walkBounded(File dir, int depth, int[] budget, List<File> imgs, List<File> movs) {
-        if (depth > 4 || budget[0] <= 0) return;
+        if (depth > 4 || budget[0] <= 0 || !dir.isDirectory()) return;
         File[] list = dir.listFiles();
         if (list == null) return;
         for (File f : list) {
@@ -159,7 +247,7 @@ final class WarriorsAssetHarvester {
                 continue;
             }
             budget[0]--;
-            String n = f.getName().toLowerCase(java.util.Locale.ROOT);
+            String n = f.getName().toLowerCase(Locale.ROOT);
             if ((n.endsWith(".png") || n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".webp"))
                     && f.length() > 2048 && f.length() < 8_388_608L) {
                 imgs.add(f);
@@ -193,6 +281,10 @@ final class WarriorsAssetHarvester {
         }
     }
 
+    private static Bitmap decodeFileSimple(File f) {
+        return (f.isFile() && f.length() > 0) ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
+    }
+
     private static Bitmap decodeBounded(File f, int maxW, int maxH) {
         BitmapFactory.Options o = new BitmapFactory.Options();
         o.inJustDecodeBounds = true;
@@ -214,8 +306,8 @@ final class WarriorsAssetHarvester {
         int dx = (BG_W - dw) / 2, dy = (BG_H - dh) / 2;
         Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);
         c.drawBitmap(src, null, new Rect(dx, dy, dx + dw, dy + dh), p);
-        int topCol = gameKind == WarriorsCompanionModel.GAME_AOC ? 0xB80E131B : 0xB8141311;
-        int botCol = gameKind == WarriorsCompanionModel.GAME_AOC ? 0xD80A0F16 : 0xD8100E0C;
+        int topCol = gameKind == WarriorsCompanionModel.GAME_AOC ? 0xC4080D11 : 0xC40B0C0E;
+        int botCol = gameKind == WarriorsCompanionModel.GAME_AOC ? 0xE604070A : 0xE6050608;
         Paint scrim = new Paint();
         scrim.setShader(new LinearGradient(0, 0, 0, BG_H, topCol, botCol, Shader.TileMode.CLAMP));
         c.drawRect(0, 0, BG_W, BG_H, scrim);

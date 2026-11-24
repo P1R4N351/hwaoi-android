@@ -822,6 +822,7 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
         last = cur; lastw = w;
     }
     if (!R.classic) vk.vkCmdBeginRendering(g_cb, &ri);
+    vka_minimap_pass_preclear(g_cb);
     R.on = 1; vka_n_rp++; if (g_dyn_filter == 2) vka_dyn_invalidate();   // DM_VK_DYN_FILTER=2: the dynamic state set again at each pass (bisect)
     g_zdir = 0;
     if (dp) { g_zs.npb++; if (dp->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) g_zs.nlc++; for (int k = 0; k < nlate; k++) if (late[k]->asp & VK_IMAGE_ASPECT_DEPTH_BIT) g_zs.ncl++; }
@@ -3136,7 +3137,15 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     DY.valid = 1;
     if (dyn_fast) vka_dyn_guard_put(&g_dyn_guard, &dyn_k);
 dyn_done:
-    vka_minimap_note_draw(d, dw, di, mesh, ind, DY.stt, DY.dt, k.att[0].mask);
+    vka_minimap_note_draw(d, dw, di, mesh, ind, DY.stt, DY.dt, k.att[0].mask, k.att[0].en);
+    if (!mesh && sh[1] && vka_minimap_want_ui_tex()) {
+        int n_ = g_wk.n[1] < 16 ? g_wk.n[1] : 16;
+        for (int i_ = 0; i_ < n_; i_++) {
+            const vka_res *r_ = &g_wk.r[1][i_];
+            if (r_->what == VKA_R_TEX && r_->tid && !vka_tex_id_is_buffer(r_->tid))
+                vka_minimap_note_fs_tex(vka_tex_id_img(r_->tid, g_cb), DY.dt);
+        }
+    }
     if (g_rtl_pass && rtl_room()) {   // DM_VK_RT_LOG: the draw's state
         char cm[200]; size_t cn = 0;
         for (uint32_t i = 0; i < R.ncolor && cn < sizeof cm; i++) if (R.cf[i]) cn += (size_t)snprintf(cm + cn, sizeof cm - cn, " c%u mask %x out %x blend %d(%d,%d,%d/%d,%d,%d)", i, k.att[i].mask,

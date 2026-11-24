@@ -35,14 +35,14 @@ final class WarriorsCompanionView extends View {
         this.model = model;
         this.art = art;
         this.actions = actions;
-        setBackgroundColor(0xFF060709);
+        setBackgroundColor(0xFF000000);
         setFocusable(false);
     }
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         draw.drawAll(canvas, model, art.backdrop(), art.emblem(), art.minimap(),
-                getWidth(), getHeight(), SystemClock.elapsedRealtime());
+                art.objective(), art.purahTex(), getWidth(), getHeight(), SystemClock.elapsedRealtime());
     }
 
     @Override public boolean performClick() { return super.performClick(); }
@@ -87,30 +87,18 @@ final class WarriorsCompanionView extends View {
     }
 
     private boolean handleMapTap(float lx, float ly) {
-        if (lx >= 24f && lx <= 756f && ly >= 108f && ly <= 1048f) {
+        if (lx >= 24f && lx <= 748f && ly >= 108f && ly <= 1048f) {
             actions.onCycleRt();
             return true;
         }
-        if (lx < 774f) return false;
-        if (ly >= 170f && ly <= 250f) { actions.onCycleRt(); return true; }
-        if (ly >= 268f && ly <= 348f) { actions.onFireAction(WarriorsCompanionModel.ACT_LOCKON); return true; }
-        if (ly >= 366f && ly <= 496f) {
-            actions.onFireAction(lx <= 995f ? (WarriorsCompanionModel.ACT_R_BASE + 1) : WarriorsCompanionModel.ACT_SPECIAL);
+        if (lx < 784f || lx > 1200f) return false;
+        if (ly >= 404f && ly <= 496f) { actions.onFireAction(WarriorsCompanionModel.ACT_LOCKON); return true; }
+        if (ly >= 512f && ly <= 604f) { actions.onCycleRt(); return true; }
+        if (ly >= 620f && ly <= 716f) {
+            actions.onFireAction(lx <= 992f ? (WarriorsCompanionModel.ACT_R_BASE + 1) : WarriorsCompanionModel.ACT_SPECIAL);
             return true;
         }
-        if (ly >= 676f && ly <= 750f) {
-            if (lx <= 995f) model.toggleTimer(SystemClock.elapsedRealtime());
-            else model.resetTimer(SystemClock.elapsedRealtime());
-            return true;
-        }
-        if (ly >= 838f && ly <= 924f) {
-            if (lx <= 893f) model.adjustKeep(-1);
-            else if (lx <= 995f) model.adjustKeep(1);
-            else if (lx <= 1097f) model.adjustKeep(10);
-            else model.resetKeep();
-            return true;
-        }
-        if (ly >= 944f && ly <= 1024f) { actions.onRescanArt(); return true; }
+        if (ly >= 740f && ly <= 828f) { actions.onRescanArt(); return true; }
         return false;
     }
 

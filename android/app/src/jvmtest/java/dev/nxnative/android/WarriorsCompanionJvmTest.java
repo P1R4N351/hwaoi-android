@@ -51,13 +51,6 @@ public final class WarriorsCompanionJvmTest {
         m.toggleAutoDim();
         check(!m.dimmed() && !m.touchBlocked(), "auto-dim opt-out unblocks touch");
 
-        m.toggleTimer(5000L);
-        check("00:02.5".equals(m.formatTimer(7500L)), "stopwatch formats tenths");
-        m.toggleTimer(7500L);
-        check("00:02.5".equals(m.formatTimer(9900L)), "paused stopwatch freezes");
-        m.adjustKeep(10);
-        m.adjustKeep(-1);
-        check(m.keepCount == 9, "keep counter adjusts");
 
         for (int step = 0; step < 8; step++) {
             m.updateOrbit(step * 60_000L);
@@ -91,6 +84,13 @@ public final class WarriorsCompanionJvmTest {
         m.minimapW = 256; m.minimapH = 256; m.minimapCandCount = 3; m.minimapCandIdx = 1;
         check("RT 256x256".equals(m.minimapLabel()), "minimap label formats RT extent");
         check("2 / 3".equals(m.rtCandLabel()), "RT candidate label formats 1-based slot");
+
+        check(m.bgColor() == 0xFF000000, "companion background defaults to pure black");
+        check(m.borderColor() == 0x00000000, "companion panels and buttons are borderless");
+        check(m.primaryColor() == 0xFF5CE6C4 && m.secondaryColor() == 0xFFDCC08A, "Purah Pad palette active");
+        check("SEARCHING OBJ".equals(m.objectiveLabel()), "initial objective label");
+        m.hasLiveObjective = true; m.objectiveW = 520; m.objectiveH = 96;
+        check("OBJ 520x96".equals(m.objectiveLabel()), "live objective label formats extent");
 
         m.screenBrightnessPct = 42;
         check("ON (42%)".equals(m.stickSyncLabel()), "stick sync label reports brightness percentage");
