@@ -648,6 +648,12 @@ int nxhost_companion_fire(int action_id);
 void nxhost_companion_abort_seq(void);
 #pragma weak nxhost_companion_pin
 int nxhost_companion_pin(int op, int slot, const char *label);
+#pragma weak nxhost_companion_minimap
+int nxhost_companion_minimap(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
+#pragma weak nxhost_companion_minimap_cycle
+int nxhost_companion_minimap_cycle(void);
+#pragma weak nxhost_companion_minimap_enable
+void nxhost_companion_minimap_enable(int on);
 
 JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_companionState(JNIEnv *env, jclass cls, jlongArray out) {
     (void)cls;
@@ -695,6 +701,33 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionPin(JNIEnv *env
     int r = nxhost_companion_pin((int)op, (int)slot, s);
     free(s);
     return (jint)r;
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionMinimap(
+        JNIEnv *env, jclass cls, jbyteArray rgba, jintArray meta) {
+    (void)cls;
+    if (!rgba || !meta || !nxhost_companion_minimap) return 0;
+    if ((*env)->GetArrayLength(env, meta) < 5) return 0;
+    jint jm[5] = {0};
+    (*env)->GetIntArrayRegion(env, meta, 0, 5, jm);
+    int32_t m[5] = {(int32_t)jm[0], (int32_t)jm[1], (int32_t)jm[2], (int32_t)jm[3], (int32_t)jm[4]};
+    jsize cap = (*env)->GetArrayLength(env, rgba);
+    jbyte *buf = cap > 0 ? (*env)->GetByteArrayElements(env, rgba, NULL) : NULL;
+    int updated = buf ? nxhost_companion_minimap((uint8_t *)buf, (int)cap, m) : 0;
+    if (buf) (*env)->ReleaseByteArrayElements(env, rgba, buf, updated ? 0 : JNI_ABORT);
+    for (int i = 0; i < 5; i++) jm[i] = (jint)m[i];
+    (*env)->SetIntArrayRegion(env, meta, 0, 5, jm);
+    return updated ? 1 : 0;
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionMinimapCycle(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    return nxhost_companion_minimap_cycle ? (jint)nxhost_companion_minimap_cycle() : 0;
+}
+
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionMinimapEnable(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls;
+    if (nxhost_companion_minimap_enable) nxhost_companion_minimap_enable(on ? 1 : 0);
 }
 
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_bifrostMode(JNIEnv *env, jclass cls) {

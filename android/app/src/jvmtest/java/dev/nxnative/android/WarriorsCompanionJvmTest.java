@@ -81,13 +81,14 @@ public final class WarriorsCompanionJvmTest {
         check(CompanionDisplay.select(externalOnly, "QCM", true) == 5, "external opt-in selects first usable");
     }
 
-    private static void testCropAndStatusTelemetry() {
+    private static void testRtAndStatusTelemetry() {
         WarriorsCompanionModel m = new WarriorsCompanionModel();
         check(m.devOnStatus && m.stickSync, "status overlay migration and stick sync default ON");
-        check("NORMAL".equals(m.mapCropLabel()), "default map crop is NORMAL");
-        m.cycleMapCrop(); check("WIDE".equals(m.mapCropLabel()), "crop cycles to WIDE");
-        m.cycleMapCrop(); check("TIGHT".equals(m.mapCropLabel()), "crop cycles to TIGHT");
-        m.cycleMapCrop(); check("NORMAL".equals(m.mapCropLabel()), "crop cycles back to NORMAL");
+        check("SEARCHING RT".equals(m.minimapLabel()), "initial minimap label is SEARCHING RT");
+        check("WAIT".equals(m.rtCandLabel()), "initial RT candidate label is WAIT");
+        m.minimapW = 256; m.minimapH = 256; m.minimapCandCount = 3; m.minimapCandIdx = 1;
+        check("RT 256x256".equals(m.minimapLabel()), "minimap label formats RT extent");
+        check("2 / 3".equals(m.rtCandLabel()), "RT candidate label formats 1-based slot");
 
         m.screenBrightnessPct = 42;
         check("ON (42%)".equals(m.stickSyncLabel()), "stick sync label reports brightness percentage");
@@ -108,7 +109,7 @@ public final class WarriorsCompanionJvmTest {
     public static void main(String[] args) {
         testModelUnpackProjectionAndDim();
         testDisplayClassification();
-        testCropAndStatusTelemetry();
+        testRtAndStatusTelemetry();
         System.out.println("WarriorsCompanionJvmTest: PASS");
     }
 }

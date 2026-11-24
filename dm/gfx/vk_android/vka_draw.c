@@ -23,6 +23,7 @@
 #include "vka_dyn_fast.h"
 #include "vka_cs_fast.h"
 #include "vka_gw_fast.h"
+#include "vka_minimap.h"
 #include "vka_view_fast.h"
 #include "vka_rp_mod_fast.h"
 #include "vka_view_ub_fast.h"
@@ -588,6 +589,11 @@ void vka_rp_end(void) {
     if (R.classic) vk.vkCmdEndRenderPass(g_cb); else vk.vkCmdEndRendering(g_cb);
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
     vka_xp_ts(g_cb, 1);
+    if (R.nci > 0 && R.cim[0]) {
+        uint32_t mw = R.cim[0]->w >> R.clv[0]; if (!mw) mw = 1;
+        uint32_t mh = R.cim[0]->h >> R.clv[0]; if (!mh) mh = 1;
+        vka_minimap_pass_end(g_cb, R.cim[0], R.clv[0], R.cl0[0], R.cim[0]->f.view, mw, mh);
+    }
     bcrt_flush();        // block-compressed targets drawn through shadows: their blocks back (bcrt_attach)
     ub_flush();          // inline uniform updates deferred during the pass: copied into placed guest RAM
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);

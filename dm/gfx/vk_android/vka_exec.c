@@ -134,7 +134,9 @@ __attribute__((visibility("default"))) void nxhost_skip_status(char *buf, size_t
     int p = atomic_load_explicit(&g_skipw_pct, memory_order_acquire);
     if (n) { if (p > 0) snprintf(buf, n, "%d %s", p, g_skipw.causes); else buf[0] = 0; }
 }
+void vka_minimap_present(void);
 void mtl_set_frame(uint64_t f) {
+    vka_minimap_present();
     g_frame = f; vka_ctl_frame(f);
     { if (atomic_load_explicit(&vka_synclog_n, memory_order_relaxed) > 0) VLOG("sync frame %llu begins at %.2f ms", (unsigned long long)f, (now_ns() % 1000000000000ull) / 1e6); }
     skipwarn_frame(f);

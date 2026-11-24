@@ -91,32 +91,22 @@ final class WarriorsCompanionDraw {
         if (minimap != null && !minimap.isRecycled()) {
             c.save();
             clipPath.reset();
-            if (m.mapCropMode == 2) {
-                rf.set(cx - rad, cy - rad, cx + rad, cy + rad);
-                clipPath.addRoundRect(rf, 28f, 28f, Path.Direction.CW);
-            } else {
-                clipPath.addCircle(cx, cy, rad - 4f, Path.Direction.CW);
-            }
+            clipPath.addCircle(cx, cy, rad - 4f, Path.Direction.CW);
             c.clipPath(clipPath);
             dstRect.set((int) (cx - rad), (int) (cy - rad), (int) (cx + rad), (int) (cy + rad));
             c.drawBitmap(minimap, null, dstRect, imgPaint);
             c.restore();
         } else {
             drawText(c, "LIVE GAME MAP", cx, cy - 10f, 26f, m.primaryColor(), true, Paint.Align.CENTER);
-            drawText(c, m.inGame ? "Waiting for frame..." : "Enter gameplay to mirror minimap",
+            drawText(c, m.inGame ? "Waiting for minimap RT..." : "Enter gameplay to stream minimap RT",
                     cx, cy + 28f, 18f, 0xFF94A3B8, false, Paint.Align.CENTER);
         }
 
         p.setStyle(Paint.Style.STROKE);
         p.setStrokeWidth(3.5f);
         p.setColor(m.primaryColor());
-        if (m.mapCropMode == 2) {
-            rf.set(cx - rad, cy - rad, cx + rad, cy + rad);
-            c.drawRoundRect(rf, 28f, 28f, p);
-        } else {
-            c.drawCircle(cx, cy, rad, p);
-        }
-        drawText(c, "CROP: " + m.mapCropLabel(), 50f, 148f, 17f, 0xFF94A3B8, true, Paint.Align.LEFT);
+        c.drawCircle(cx, cy, rad, p);
+        drawText(c, m.minimapLabel(), 50f, 148f, 17f, 0xFF94A3B8, true, Paint.Align.LEFT);
         drawText(c, m.hasLiveMinimap ? "LIVE" : "STANDBY", 730f, 148f, 17f,
                 m.hasLiveMinimap ? 0xFF34D399 : 0xFF94A3B8, true, Paint.Align.RIGHT);
     }
@@ -125,7 +115,7 @@ final class WarriorsCompanionDraw {
         drawCard(c, 774f, 108f, 1216f, 520f, m);
         drawText(c, "MAP CONTROLS", 796f, 146f, 19f, m.primaryColor(), true, Paint.Align.LEFT);
         drawButton(c, 796f, 170f, 1194f, 250f, m, true, m.primaryColor(),
-                "CROP ZOOM", m.mapCropLabel(), 20f);
+                "CYCLE RT", m.rtCandLabel(), 20f);
         drawButton(c, 796f, 268f, 1194f, 348f, m, false, m.secondaryColor(),
                 "FULL MAP", "MINUS (-)", 20f);
         drawButton(c, 796f, 366f, 988f, 496f, m, false, m.primaryColor(),
@@ -149,7 +139,7 @@ final class WarriorsCompanionDraw {
         drawButton(c, 1000f, 838f, 1092f, 924f, m, false, m.secondaryColor(), "+10", null, 22f);
         drawButton(c, 1102f, 838f, 1194f, 924f, m, false, m.borderColor(), "RST", null, 19f);
         drawButton(c, 796f, 944f, 1194f, 1024f, m, false, m.borderColor(),
-                "HARVEST GAME BG", "SRC: " + m.assetSource, 18f);
+                "RESCAN GAME ART", "SRC: " + m.assetSource, 18f);
     }
 
     private void drawCommandTab(Canvas c, WarriorsCompanionModel m) {
@@ -340,7 +330,7 @@ final class WarriorsCompanionDraw {
                 m.hasEmblem ? 0xFF34D399 : 0xFF94A3B8);
 
         drawButton(c, 796f, 728f, 1194f, 838f, m, false, m.primaryColor(),
-                "HARVEST LIVE BG", "CAPTURE FROM GAME SCREEN", 20f);
+                "RESCAN GAME ART", "PACK & MOVIES", 20f);
         drawButton(c, 796f, 862f, 1194f, 960f, m, false, m.borderColor(),
                 "CLEAR HARVESTED ART", "RETURN TO PROCEDURAL", 19f);
     }

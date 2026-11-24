@@ -2,6 +2,7 @@
 package dev.nxnative.android;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.hardware.display.DeviceProductInfo;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
@@ -12,10 +13,11 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.FrameLayout;
 import java.io.File;
+import java.nio.ByteBuffer;
 
 /**
  * Coordinates the Warriors second-screen Presentation (AYN Thor Display 4 via PnP match),
- * live game circular minimap mirroring, runtime target-game asset harvesting,
+ * native Vulkan offscreen minimap RT streaming, runtime BYOG asset harvesting,
  * Display 0 dev-HUD migration, and opt-in single-screen drawer fallback.
  */
 final class WarriorsCompanionController implements DisplayManager.DisplayListener {
@@ -23,7 +25,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     static final String AOI_TITLE_ID = "04003F40232DE000";
     private static final String TAG = "WarriorsCompanion";
     private static final long POLL_MS = 50L;
-    private static final long MINIMAP_INTERVAL_MS = 125L;
+    private static final int MINIMAP_MAX_BYTES = 512 * 512 * 4;
 
     private final GameActivity activity;
     private final FrameLayout rootView;
@@ -34,12 +36,14 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private final WarriorsAssetHarvester art = new WarriorsAssetHarvester();
     private final int[] ints = new int[WarriorsCompanionModel.DETAIL_INTS];
     private final float[] flts = new float[WarriorsCompanionModel.DETAIL_FLOATS];
+    private final byte[] minimapBytes = new byte[MINIMAP_MAX_BYTES];
+    private final int[] minimapMeta = new int[5];
 
     private WarriorsCompanionPresentation presentation;
     private WarriorsCompanionView presView, drawerView;
+    private Bitmap minimapBmp;
     private int presDisplayId = -1, lastPublishedTab = -1;
-    private boolean started, resumed, closed, drawerOpen, autoHarvestedLive;
-    private long lastMinimapMs;
+    private boolean started, resumed, closed, drawerOpen;
 
     private final Runnable pollTask = new Runnable() {
         @Override public void run() {
@@ -99,7 +103,11 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
 
     private WarriorsCompanionView.Actions makeActions() {
         return new WarriorsCompanionView.Actions() {
-            @Override public void onTabSelected(int tab) { syncPublishedTab(); refreshNow(); }
+            @Override public void onTabSelected(int tab) {
+                Native.companionMinimapEnable(tab == WarriorsCompanionModel.TAB_TACTICAL);
+                syncPublishedTab();
+                refreshNow();
+            }
             @Override public void onFireAction(int actionId) { Native.companionFire(actionId); refreshNow(); }
             @Override public void onAbortChord() { Native.companionAbortSeq(); refreshNow(); }
             @Override public void onToggleDevOnStatus() {
@@ -115,12 +123,17 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
                 model.stickSync = next;
                 invalidateViews();
             }
-            @Override public void onHarvestBackdrop() {
-                art.captureLiveBackdrop(activity, activity.gameSurface(), model.gameKind, WarriorsCompanionController.this::onArtUpdated);
+            @Override public void onCycleRt() {
+                model.minimapCandIdx = Native.companionMinimapCycle();
+                minimapMeta[2] = 0;
+                refreshNow();
+            }
+            @Override public void onRescanArt() {
+                File[] dirs = new File[] { AppStorage.pack(activity, titleId), activity.getExternalFilesDir(null) };
+                art.harvestFromGameDirsAsync(activity, dirs, model.gameKind, WarriorsCompanionController.this::onArtUpdated);
             }
             @Override public void onClearArt() {
                 art.clearCache(activity);
-                autoHarvestedLive = true;
                 onArtUpdated();
             }
             @Override public void onTouchPulse() { BifrostBridge.touched(); }
@@ -246,17 +259,27 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         model.stickSync = BifrostBridge.syncScreenBrightness;
         model.screenBrightnessPct = BifrostBridge.lastScreenPct;
         model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
+        if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
+                && !model.moviePlaying && !model.hostPaused) {
+            Native.companionMinimapEnable(true);
+            int got = Native.companionMinimap(minimapBytes, minimapMeta);
+            int rw = minimapMeta[0], rh = minimapMeta[1];
+            model.minimapW = rw;
+            model.minimapH = rh;
+            model.minimapCandCount = minimapMeta[3];
+            model.minimapCandIdx = minimapMeta[4];
+            if (got == 1 && rw > 0 && rw <= 512 && rh > 0 && rh <= 512 && rw * rh * 4 <= minimapBytes.length) {
+                if (minimapBmp == null || minimapBmp.getWidth() != rw || minimapBmp.getHeight() != rh) {
+                    minimapBmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
+                }
+                minimapBmp.copyPixelsFromBuffer(ByteBuffer.wrap(minimapBytes, 0, rw * rh * 4));
+                art.setMinimap(minimapBmp);
+            }
+        } else {
+            Native.companionMinimapEnable(false);
+        }
         syncArtFlags();
         syncPublishedTab();
-        if (!autoHarvestedLive && !model.hasBackdrop && model.inGame && model.presents >= 120 && !model.moviePlaying) {
-            autoHarvestedLive = true;
-            art.captureLiveBackdrop(activity, activity.gameSurface(), model.gameKind, this::onArtUpdated);
-        }
-        if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
-                && !model.moviePlaying && !model.hostPaused && (now - lastMinimapMs) >= MINIMAP_INTERVAL_MS) {
-            lastMinimapMs = now;
-            art.captureLiveMinimap(activity.gameSurface(), model.mapCropMode, this::onArtUpdated);
-        }
         invalidateViews();
     }
 
@@ -269,16 +292,22 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         schedulePoll();
     }
 
-    void onResume() { resumed = true; schedulePoll(); }
+    void onResume() {
+        resumed = true;
+        Native.companionMinimapEnable(model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL);
+        schedulePoll();
+    }
 
     void onPause() {
         resumed = false;
         ui.removeCallbacks(pollTask);
+        Native.companionMinimapEnable(false);
         Native.companionAbortSeq();
     }
 
     void onStop() {
         started = false;
+        Native.companionMinimapEnable(false);
         if (presentation != null) {
             try { presentation.hide(); } catch (RuntimeException ignored) {}
         }
@@ -291,8 +320,10 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         resumed = false;
         started = false;
         ui.removeCallbacks(pollTask);
+        Native.companionMinimapEnable(false);
         Native.companionAbortSeq();
-        art.shutdown();
+        art.setMinimap(null);
+        minimapBmp = null;
         dismissPresentation();
         if (drawerView != null && rootView != null) {
             rootView.removeView(drawerView);

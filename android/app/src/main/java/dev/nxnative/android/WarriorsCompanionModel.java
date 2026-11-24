@@ -22,7 +22,7 @@ public final class WarriorsCompanionModel {
     public boolean inGame, writeSafe, moviePlaying, hostPaused, saveBusy, seqActive, inputActive;
     public boolean headingUp = true, macroMode = true, autoDim = true;
     public boolean devOnStatus = true, stickSync = true, hasBackdrop, hasEmblem, hasLiveMinimap;
-    public int screenBrightnessPct = -1, mapCropMode = 1;
+    public int screenBrightnessPct = -1, minimapW, minimapH, minimapCandCount, minimapCandIdx;
     public String devBuildTag = "", devOverlayText = "", assetSource = "NONE";
     public float posX, posY, posZ, yawDeg, fps, frameMs;
     public final float[] trailX = new float[TRAIL_CAP], trailY = new float[TRAIL_CAP], trailZ = new float[TRAIL_CAP];
@@ -282,9 +282,14 @@ public final class WarriorsCompanionModel {
     }
 
 
-    public void cycleMapCrop() { mapCropMode = (mapCropMode + 1) % 3; }
-    public String mapCropLabel() {
-        return mapCropMode == 0 ? "TIGHT" : (mapCropMode == 2 ? "WIDE" : "NORMAL");
+    public String minimapLabel() {
+        return minimapW > 0 && minimapH > 0 ? ("RT " + minimapW + "x" + minimapH) : "SEARCHING RT";
+    }
+
+    public String rtCandLabel() {
+        if (minimapCandCount <= 0) return "WAIT";
+        int cur = ((minimapCandIdx % minimapCandCount) + minimapCandCount) % minimapCandCount;
+        return (cur + 1) + " / " + minimapCandCount;
     }
 
     public float fpsOnePercentLow() {

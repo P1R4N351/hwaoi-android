@@ -118,3 +118,7 @@ NXHOST_API int nxhost_companion_fire(int action_id);
 NXHOST_API void nxhost_companion_abort_seq(void);
 // Session waypoint pins (op: 0=add at current pose, 1=remove slot, 2=clear all)
 NXHOST_API int nxhost_companion_pin(int op, int slot, const char *label);
+// Native Vulkan offscreen minimap RT capture (vka_minimap.h); meta = {w, h, seq, cand_count, cand_idx}
+NXHOST_API int nxhost_companion_minimap(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
+NXHOST_API int nxhost_companion_minimap_cycle(void);
+NXHOST_API void nxhost_companion_minimap_enable(int on);

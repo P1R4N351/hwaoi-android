@@ -18,7 +18,8 @@ final class WarriorsCompanionView extends View {
         void onAbortChord();
         void onToggleDevOnStatus();
         void onToggleStickSync();
-        void onHarvestBackdrop();
+        void onCycleRt();
+        void onRescanArt();
         void onClearArt();
         void onTouchPulse();
     }
@@ -86,11 +87,11 @@ final class WarriorsCompanionView extends View {
 
     private boolean handleMapTap(float lx, float ly) {
         if (lx >= 24f && lx <= 756f && ly >= 108f && ly <= 1048f) {
-            model.cycleMapCrop();
+            actions.onCycleRt();
             return true;
         }
         if (lx < 774f) return false;
-        if (ly >= 170f && ly <= 250f) { model.cycleMapCrop(); return true; }
+        if (ly >= 170f && ly <= 250f) { actions.onCycleRt(); return true; }
         if (ly >= 268f && ly <= 348f) { actions.onFireAction(WarriorsCompanionModel.ACT_LOCKON); return true; }
         if (ly >= 366f && ly <= 496f) {
             actions.onFireAction(lx <= 995f ? (WarriorsCompanionModel.ACT_R_BASE + 1) : WarriorsCompanionModel.ACT_SPECIAL);
@@ -108,7 +109,7 @@ final class WarriorsCompanionView extends View {
             else model.resetKeep();
             return true;
         }
-        if (ly >= 944f && ly <= 1024f) { actions.onHarvestBackdrop(); return true; }
+        if (ly >= 944f && ly <= 1024f) { actions.onRescanArt(); return true; }
         return false;
     }
 
@@ -164,7 +165,7 @@ final class WarriorsCompanionView extends View {
         if (ly >= 180f && ly <= 290f) { actions.onToggleDevOnStatus(); return true; }
         if (ly >= 314f && ly <= 424f) { actions.onToggleStickSync(); return true; }
         if (ly >= 448f && ly <= 558f) { model.toggleAutoDim(); return true; }
-        if (ly >= 728f && ly <= 838f) { actions.onHarvestBackdrop(); return true; }
+        if (ly >= 728f && ly <= 838f) { actions.onRescanArt(); return true; }
         if (ly >= 862f && ly <= 960f) { actions.onClearArt(); return true; }
         return false;
     }

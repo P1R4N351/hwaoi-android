@@ -192,4 +192,10 @@ final class Native {
     static native int companionPin(int op, int slot, String label);
     /** Bifrost stick-LED bridge mode (DM_BIFROST): 0 off, 1 Pip-Boy feed (default), 2 classic public effects */
     static native int bifrostMode();
+    /** Reads native Vulkan minimap RT into RGBA buffer; meta = {w, h, seq, candCount, candIdx}. Returns 1 if updated. */
+    static native int companionMinimap(byte[] rgba, int[] meta);
+    /** Cycles active Vulkan minimap candidate index. */
+    static native int companionMinimapCycle();
+    /** Enables or disables native Vulkan minimap capture. */
+    static native void companionMinimapEnable(boolean on);
 }

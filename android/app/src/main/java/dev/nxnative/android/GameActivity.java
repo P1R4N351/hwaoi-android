@@ -57,7 +57,6 @@ import java.util.Map;
 public final class GameActivity extends Activity implements SurfaceHolder.Callback, InputManager.InputDeviceListener {
     private static final int KEEP_LOGS = 10;
 
-    private SurfaceView gameSurface;
     private TextView overlay;
     private TextView tag, fps;   // the build tag (top left) and the frame rate with the other items (top right, Overlay) as views over the game, shown only while the host's present does not draw them (fpsTick)
     private Overlay stats;
@@ -118,7 +117,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         FrameLayout root = new FrameLayout(this);
         rootView = root;
         SurfaceView surface = new SurfaceView(this);
-        gameSurface = surface;
         BifrostBridge.syncScreenBrightness = Prefs.bifrostScreenSync(this);
         surface.getHolder().addCallback(this);
         root.addView(surface);
@@ -1568,7 +1566,6 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     FrameLayout rootView() { return rootView; }
     View panelView() { return panel; }
     boolean gamepadConnected() { return !pads.isEmpty(); }
-    SurfaceView gameSurface() { return gameSurface; }
     boolean companionDrawerOpen() { return companion != null ? companion.isDrawerOpen() : Prefs.companionDrawer(this, titleId()); }
     void companionDrawer(boolean on) { if (companion != null) companion.setDrawerOpen(on); else Prefs.companionDrawer(this, titleId(), on); }
 }
