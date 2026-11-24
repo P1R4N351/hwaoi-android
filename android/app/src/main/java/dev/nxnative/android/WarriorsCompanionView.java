@@ -39,10 +39,11 @@ final class WarriorsCompanionView extends View {
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-        draw.drawAll(canvas, model, art.backdrop(), art.filter(), art.glyph(),
+        boolean moving = draw.drawAll(canvas, model, art.backdrop(), art.filter(), art.glyph(),
                 art.borderFrieze(), art.borderEdge(), art.borderSide(),
                 art.minimap(), art.objective(), art.leftHud(),
                 getWidth(), getHeight(), SystemClock.elapsedRealtime());
+        if (moving) postInvalidateOnAnimation();
     }
 
     @Override public boolean performClick() { return super.performClick(); }
@@ -69,9 +70,7 @@ final class WarriorsCompanionView extends View {
     }
 
     private boolean handleHeaderTap(float lx, float ly) {
-        if (ly > 92f) return false;
-        int next = lx <= 200f ? WarriorsCompanionModel.TAB_TACTICAL
-                : (lx >= 1040f ? WarriorsCompanionModel.TAB_LEDGER : -1);
+        int next = WarriorsCompanionLayout.headerTabAt(lx, ly);
         if (next < 0) return false;
         model.selectTab(next);
         actions.onTabSelected(next);
@@ -79,9 +78,8 @@ final class WarriorsCompanionView extends View {
     }
 
     private boolean handleStatusTap(float lx, float ly) {
-        if (lx < 720f || lx > 1180f || ly < 140f) return false;
-        int row = (int) ((ly - 140f) / 112f);
-        if (row < 0 || row > 6 || (ly - 140f - row * 112f) > 96f) return false;
+        int row = WarriorsCompanionLayout.statusRowAt(lx, ly);
+        if (row < 0) return false;
         if (row == 0) actions.onToggleDevOnStatus();
         else if (row == 1) actions.onToggleStickLights();
         else if (row == 2) actions.onToggleStickSync();

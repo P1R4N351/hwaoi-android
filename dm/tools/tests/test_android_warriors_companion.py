@@ -12,6 +12,7 @@ PURE_NAMES = (
     'CompanionState.java',
     'CompanionDisplay.java',
     'WarriorsCompanionModel.java',
+    'WarriorsCompanionLayout.java',
     'WarriorsKtglArt.java',
     'Nup.java',
     'Zstd.java',
@@ -31,6 +32,7 @@ CLOS_NAMES = (
 SRCS = [JAVA / n for n in PURE_NAMES]
 COMPILE_SRCS = [JAVA / n for n in PURE_NAMES + CLOS_NAMES]
 TEST = REPO / 'android/app/src/jvmtest/java/dev/nxnative/android/WarriorsCompanionJvmTest.java'
+LAYOUT_TEST = REPO / 'android/app/src/jvmtest/java/dev/nxnative/android/WarriorsCompanionLayoutTest.java'
 
 STUB_BUILD_CONFIG = '''package dev.nxnative.android;
 public final class BuildConfig {
@@ -534,6 +536,35 @@ class WarriorsCompanionTests(unittest.TestCase):
             )
             self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
             self.assertIn('WarriorsCompanionJvmTest: PASS', r.stdout)
+
+    @unittest.skipUnless(shutil.which('javac') and shutil.which('java'), 'no JDK')
+    def test_warriors_companion_layout_and_motion(self):
+        # Shared verbatim with the Age of Calamity port: rects in every state apart and inside the frame,
+        # frame-time easing, retargeting, size hold and HUD/minimap sequencing.
+        with tempfile.TemporaryDirectory(prefix='wc_layout_') as tmp:
+            c = subprocess.run(
+                ['javac', '-Xlint:all', '-Werror', '-encoding', 'UTF-8', '-d', tmp,
+                 str(JAVA / 'WarriorsCompanionLayout.java'), str(LAYOUT_TEST)],
+                capture_output=True, text=True, encoding='utf-8',
+            )
+            self.assertEqual(c.returncode, 0, c.stderr)
+            r = subprocess.run(
+                ['java', '-cp', tmp, 'dev.nxnative.android.WarriorsCompanionLayoutTest'],
+                capture_output=True, text=True, encoding='utf-8',
+            )
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertIn('WarriorsCompanionLayoutTest: PASS', r.stdout)
+
+    def test_draw_and_view_use_the_shared_layout(self):
+        draw_src = (JAVA / 'WarriorsCompanionDraw.java').read_text(encoding='utf-8')
+        view_src = (JAVA / 'WarriorsCompanionView.java').read_text(encoding='utf-8')
+        self.assertIn('scene.step(', draw_src)
+        self.assertNotIn('816f', draw_src)
+        self.assertIn('if (moving) postInvalidateOnAnimation();', view_src)
+        self.assertIn('WarriorsCompanionLayout.statusRowAt(', view_src)
+        self.assertIn('WarriorsCompanionLayout.headerTabAt(', view_src)
+        self.assertIn('scanLeftHud(', draw_src)
+        self.assertIn('c.drawBitmap(b, srcRect, dstF, imgPaint);', draw_src)
 
 
 if __name__ == '__main__':
