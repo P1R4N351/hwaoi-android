@@ -483,7 +483,7 @@ final class GameSettings {
         { Profile mp = Profile.of(id); if (mp != null && mp.mods) ModsUi.row(a, g, options::add, again); }   // game.tsv mods 1: folders of replacement files over the RomFS
         if (LinkPlay.has(id))
             options.add(new Ui.Setting(a, "🔗", Tx.s(R.string.game_link_play), v -> LinkPlay.dialog(a, g, again)).value(LinkPlay.label(a, id)).chevron(a));
-        if ("0400486024DEC000".equals(id))
+        if (BifrostBridge.supports(id))
             options.add(new Ui.Setting(a, "💡", Tx.s(R.string.game_stick_leds_bifrost), null)
                     .toggle(a, Prefs.bifrost(a, id), (b, on) -> Prefs.bifrost(a, id, on))
                     .says(Tx.s(R.string.game_stick_leds_bifrost_on),

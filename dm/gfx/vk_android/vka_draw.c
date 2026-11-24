@@ -329,7 +329,7 @@ static void ub_flush(void) {
     vka_barrier(g_cb);
     if (last_n) vka_rw_point(g_cb, 'u', 0, last_n, last_d);
 }
-static void inst_close(void);
+static void inst_close(void); static void inst_reset(void);
 static int ub_defer_slot(uint64_t dst, uint64_t n) {
     if (!vka_treg_ub_fast_on()) {
         for (int i = UB.n - 1; i >= 0; i--) {
@@ -590,7 +590,7 @@ void vka_rp_end(void) {
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
     vka_xp_ts(g_cb, 1);
     if (R.nci > 0 && R.cim[0]) {
-        vka_minimap_pass_end(g_cb, R.cim[0], R.clv[0], R.cl0[0]);
+        vka_minimap_pass_end(g_cb, R.cim[0]);
     } else vka_minimap_pass_abort();
     bcrt_flush();        // block-compressed targets drawn through shadows: their blocks back (bcrt_attach)
     ub_flush();          // inline uniform updates deferred during the pass: copied into placed guest RAM
@@ -786,10 +786,6 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
         if (dp || sp) snprintf(b + bn, bn < sizeof b ? sizeof b - bn : 0, " d:%d%s", R.df ? R.df : R.sf, (dp ? dp : sp)->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? "C" : "");
         vka_gp_pass(b);
     }
-    if (R.nci > 0 && R.cim[0] && s_im[0] == R.cim[0]) {
-        vka_minimap_pass_begin(g_cb, R.cim[0], R.clv[0], R.cl0[0], layers, w, h,
-                               ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD, sp != NULL);
-    } else vka_minimap_pass_abort();
     R.classic = 0;
     if (vka_classic_rp()) {   // DM_VK_CLASSIC_RP: the same pass as a VkRenderPass with an imageless framebuffer
         rpkey k; memset(&k, 0, sizeof k); fbkey fk; memset(&fk, 0, sizeof fk);
@@ -821,8 +817,12 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const p_scissor *sc, int has
         if ((!(sel & 1) || cur != last) && (!(sel & 2) || dp->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) && (!(sel & 4) || lastw >= 8192)) vka_xp_ts(g_cb, 4);
         last = cur; lastw = w;
     }
+    if (n == 1 && !R.classic && R.nci > 0 && R.cim[0] && s_im[0] == R.cim[0]) {
+        vka_minimap_pass_begin(g_cb, R.cim[0], layers, w, h, R.cf[0], R.area, ca[0].imageView, ca[0].imageLayout,
+                               dp, sp, ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD, R.classic);
+    } else vka_minimap_pass_abort();
+    if (vka_minimap_in_hud_pass()) inst_reset();
     if (!R.classic) vk.vkCmdBeginRendering(g_cb, &ri);
-    vka_minimap_pass_preclear(g_cb);
     R.on = 1; vka_n_rp++; if (g_dyn_filter == 2) vka_dyn_invalidate();   // DM_VK_DYN_FILTER=2: the dynamic state set again at each pass (bisect)
     g_zdir = 0;
     if (dp) { g_zs.npb++; if (dp->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) g_zs.nlc++; for (int k = 0; k < nlate; k++) if (late[k]->asp & VK_IMAGE_ASPECT_DEPTH_BIT) g_zs.ncl++; }
@@ -905,6 +905,7 @@ int vka_rp_clear(const p_set_rt *rt, int has_rt, const vka_dstate *d, const vka_
     if (ci >= 0 ? ci >= 8 || !R.cf[ci] || R.cnl[ci] != nl || nl != R.layers : ((c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) && !R.df) || ((c->asp & VK_IMAGE_ASPECT_STENCIL_BIT) && !R.sf) || R.dnl != nl || nl != R.layers) return 0;
     if ((uint32_t)rc.offset.x + rc.extent.width > R.area.extent.width || (uint32_t)rc.offset.y + rc.extent.height > R.area.extent.height) return 0;
     VkClearAttachment ca = {c->asp, ci >= 0 ? (uint32_t)ci : 0, c->in}; VkClearRect cr = {rc, 0, nl};
+    if (ci == 0 && vka_minimap_bind_main(g_cb)) vka_dyn_invalidate();
     vka_oq_pass_end();   // a clear adds no samples on NVN: outside any occlusion query (the next draw begins another)
     vk.vkCmdClearAttachments(g_cb, 1, &ca, 1, &cr);
     if (c->asp & VK_IMAGE_ASPECT_DEPTH_BIT) { g_zs.ncl++; if (g_zlog_pass && zlog_room()) VLOG("zlog depth clear inside pass %llu: %.6f at %d,%d %ux%u", (unsigned long long)vka_n_rp, c->in.depthStencil.depth, rc.offset.x, rc.offset.y, rc.extent.width, rc.extent.height); }
@@ -2782,7 +2783,7 @@ static void rd_run(const vka_dstate *d) {
 }
 static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
-    if (RUN.open && RUN.fast && di && !dw && g_inst_on && inst_fast(d, rt, has_rt, sc, has_sc, di)) {   // DM_VK_INSTANCE: the run's next object, no walk
+    if (RUN.open && RUN.fast && !vka_minimap_in_hud_pass() && di && !dw && g_inst_on && inst_fast(d, rt, has_rt, sc, has_sc, di)) {   // DM_VK_INSTANCE: the run's next object, no walk
         if (VKA_ENV("DM_VK_SHADER_STATS", 0) && g_ss_last >= 0) { ss_ent *e = &g_ss[g_ss_last]; e->draws++; e->joined++; e->inst++; e->verts += di->count > 0 ? di->count : 0; ss_tick(); }
         return;
     }
@@ -3003,6 +3004,14 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         }
     }
     if (src1_used) VRED_ONCE("a SRC1 blend factor with no dual-source module (MOD_DUAL; the profile's dual_want.tsv) or no dualSrcBlend: the second source reads as zero");
+    {
+        uint32_t mm_vin = (!mesh && sh[0] && sh[0]->e) ? sh[0]->e->vin_mask : 0u;
+        if (vka_minimap_select_target(g_cb, d, mm_vin, dw, di, mesh, ind, d->ds.st,
+                (R.df != VK_FORMAT_UNDEFINED && d->ds.dt), k.att[0].mask, k.att[0].en)) {
+            if (RUN.open) inst_close();
+            vka_dyn_invalidate();
+        }
+    }
 
     PT(3);
     if (!mesh) vin_build_kept(d, sh[0], &k);
@@ -3013,7 +3022,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     // instanced pipeline stays bound) or start one (decided at the sets, below)
     VkBuffer i_ib = VK_NULL_HANDLE; VkDeviceSize i_io = 0; VkIndexType i_it = VK_INDEX_TYPE_UINT16;
     if (g_inst_on && g_vi_vk_slot >= 0) vi_sync_from_slot();
-    int icand = g_inst_on && !mesh && di && !di->ind && !expand && di->instances <= 1 && d->b.base_instance == 0 && sh[1] && !sh[2] && !sh[3] && !sh[4] && !d->rast_discard
+    int icand = g_inst_on && !vka_minimap_in_hud_pass() && !mesh && di && !di->ind && !expand && di->instances <= 1 && d->b.base_instance == 0 && sh[1] && !sh[2] && !sh[3] && !sh[4] && !d->rast_discard
                 && !(k.vin_u | k.vin_s) && k.fs_variant == DMSH_VK_MOD_BASE && lay.push && vka_enc_on() && inst_ib(di, &i_ib, &i_io, &i_it);
     int ijoin = icand && RUN.open && p == RUN.base.p && DY.valid && DY.pipe == RUN.ipipe && vka_enc_total() == RUN.mark && inst_same_draw(&RUN.base, i_ib, i_io, i_it, di, d);
     if (!ijoin) {
@@ -3137,7 +3146,6 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     DY.valid = 1;
     if (dyn_fast) vka_dyn_guard_put(&g_dyn_guard, &dyn_k);
 dyn_done:
-    vka_minimap_note_draw(d, dw, di, mesh, ind, DY.stt, DY.dt, k.att[0].mask, k.att[0].en);
     if (!mesh && sh[1] && vka_minimap_want_ui_tex()) {
         int n_ = g_wk.n[1] < 16 ? g_wk.n[1] : 16;
         for (int i_ = 0; i_ < n_; i_++) {

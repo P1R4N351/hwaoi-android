@@ -529,6 +529,38 @@ final class Nup {
         return out;
     }
 
+    /** Streams at most maxOut bytes (<= 0: all) of f into sink without loading the compressed extent or output whole. */
+    void readPrefixTo(Node f, long maxOut, Zstd.Sink sink) throws IOException {
+        if (f.dir) throw new IOException(f.name + " is a directory");
+        long limit = maxOut < 0 ? f.size : Math.min(f.size, maxOut);
+        if (limit <= 0) return;
+        try (Source r = source(file)) {
+            if (f.codec == 0) {
+                if (f.extentSize != f.size) throw new IOException(f.name + ": a raw extent of another size than the file");
+                byte[] buf = new byte[256 << 10];
+                for (long at = 0; at < limit; ) {
+                    int k = (int) Math.min(buf.length, limit - at);
+                    r.read(f.extentOffset + at, buf, 0, k);
+                    sink.accept(buf, 0, k);
+                    at += k;
+                }
+                return;
+            }
+            long[] pos = {0L};
+            Zstd.ByteSource bs = (b, off, len) -> {
+                long rem = f.extentSize - pos[0];
+                if (rem <= 0) return -1;
+                int k = (int) Math.min(len, rem);
+                r.read(f.extentOffset + pos[0], b, off, k);
+                pos[0] += k;
+                return k;
+            };
+            Zstd.decodePrefixTo(bs, STREAM_WINDOW, limit, sink);
+        } catch (IOException e) {
+            throw new IOException(file.getName() + ": " + f.name + ": " + e.getMessage(), e);
+        }
+    }
+
     /** How much of a zstd extent {@link #read} takes first for a head (it takes four times more while the blocks reach past it) */
     static final long HEAD_EXTENT = 256L << 10;
 

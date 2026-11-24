@@ -77,47 +77,35 @@ public final class BifrostJvmTest {
         check(feed.want(s) == BifrostLooks.OCARINA, "exits LOW at lowOff=8");
     }
 
-    private static void testFeedBurstRateFallbackMuteAndStop() {
+    private static void testFeedBurstAndRateLimit() {
         BifrostLooks.Feed feed = new BifrostLooks.Feed(false);
         BifrostLooks.State s = new BifrostLooks.State();
         CompanionState cs = makeWaist(CompanionState.READY, 1, 0, 24, 36, -1, 10);
         check(BifrostLooks.fromState(cs, s), "fromState succeeds on READY");
-
-        // 2-poll debounce before sending display.
-        List<BifrostLooks.Command> c0 = feed.poll(1000, s);
-        check(c0.isEmpty(), "poll 1 debounces");
+        check(feed.poll(1000, s).isEmpty(), "poll 1 debounces");
         List<BifrostLooks.Command> c1 = feed.poll(1125, s);
         check(c1.size() == 1 && BifrostLooks.ACTION_DISPLAY.equals(c1.get(0).action), "poll 2 displays BASE");
         check("PIPBOY".equals(c1.get(0).extras.get("effect")), "default uses PIPBOY");
         check(Integer.valueOf(BifrostLooks.BASE.color).equals(c1.get(0).extras.get("color")), "BASE color matches");
-
-        // Life drop triggers burstWallMs.
         s.life = 20;
         List<BifrostLooks.Command> hit = feed.poll(1450, s);
         check(hit.size() == 1 && Long.valueOf(1450L).equals(hit.get(0).extras.get("burstWallMs")), "damage attaches burstWallMs");
-
-        // Rate limiting <= 3 DISPLAYS_PER_SECOND within a 1000 ms window (1125, 1450, 1775 -> 2085 blocked, 2130 allowed).
         s.life = 16;
-        List<BifrostLooks.Command> h2 = feed.poll(1775, s);
-        check(h2.size() == 1, "display 3 within 1s allowed");
+        check(feed.poll(1775, s).size() == 1, "display 3 within 1s allowed");
         s.life = 12;
-        List<BifrostLooks.Command> h3 = feed.poll(2085, s);
-        check(h3.isEmpty(), "display 4 within 1s window blocked by 3/s limit");
-        List<BifrostLooks.Command> h4 = feed.poll(2130, s);
-        check(h4.size() == 1, "display allowed once oldest leaves 1s window");
+        check(feed.poll(2085, s).isEmpty(), "display 4 within 1s window blocked by 3/s limit");
+        check(feed.poll(2130, s).size() == 1, "display allowed once oldest leaves 1s window");
+        testFeedFallbackMuteAndStop(feed, s);
+    }
 
-        // -3 validation error falls back permanently to classic public effects.
+    private static void testFeedFallbackMuteAndStop(BifrostLooks.Feed feed, BifrostLooks.State s) {
         feed.result(2200, BifrostLooks.RESULT_VALIDATION);
         check(feed.classic(), "-3 switches to classic");
         List<BifrostLooks.Command> fb = feed.poll(2600, s);
         check(fb.size() == 1 && "BREATH".equals(fb.get(0).extras.get("effect")), "classic effect sent after -3");
-
-        // -1 or 7001 mutes for 30 s.
         feed.result(3000, BifrostLooks.RESULT_DISABLED);
         check(!feed.muteReason(3500).isEmpty(), "disabled sets mute reason");
         check(feed.poll(10_000, s).isEmpty(), "muted suppresses commands within 30s");
-
-        // Fresh feed stop() sends immediate ACTION_CLEAR when active.
         BifrostLooks.Feed activeFeed = new BifrostLooks.Feed(false);
         activeFeed.poll(1000, s);
         check(activeFeed.poll(1125, s).size() == 1, "active feed displays");
@@ -130,14 +118,22 @@ public final class BifrostJvmTest {
         BifrostLooks.Feed feed = new BifrostLooks.Feed(false, true);
         BifrostLooks.State s = new BifrostLooks.State();
         s.inGame = true;
-        check(feed.want(s) == BifrostLooks.AOI_BASE, "AoI world -> AOI_BASE");
+        check(feed.want(s) == BifrostLooks.AOI_BASE && BifrostLooks.AOI_BASE.color == 0xff00ff88
+                && "zonai-teal".equals(BifrostLooks.AOI_BASE.name), "AoI world -> zonai-teal");
         s.open = true;
-        check(feed.want(s) == BifrostLooks.AOI_OPEN, "AoI menu -> AOI_OPEN");
+        check(feed.want(s) == BifrostLooks.AOI_OPEN && BifrostLooks.AOI_OPEN.color == 0xff24ffa8
+                && "zonai-teal-open".equals(BifrostLooks.AOI_OPEN.name), "AoI menu -> zonai-teal-open");
         s.open = false;
         feed.poll(1000L, s);
         check(feed.poll(1125L, s).size() == 1, "AoI feed activates");
         List<BifrostLooks.Command> tcmds = feed.touch(1400L);
         check(tcmds.size() == 1 && BifrostLooks.ACTION_PULSE.equals(tcmds.get(0).action), "touch emits ACTION_PULSE");
+        BifrostLooks.Feed aoc = new BifrostLooks.Feed(false, BifrostLooks.PAL_AOC);
+        check(aoc.want(s) == BifrostLooks.AOC_BASE && BifrostLooks.AOC_BASE.color == 0xff0060ff
+                && "sheikah-blue".equals(BifrostLooks.AOC_BASE.name), "AoC world -> sheikah-blue");
+        s.open = true;
+        check(aoc.want(s) == BifrostLooks.AOC_OPEN && BifrostLooks.AOC_OPEN.color == 0xff3888ff
+                && "sheikah-blue-open".equals(BifrostLooks.AOC_OPEN.name), "AoC menu -> sheikah-blue-open");
     }
 
     private static void testScreenBrightnessScaling() {
@@ -179,7 +175,7 @@ public final class BifrostJvmTest {
     public static void main(String[] args) {
         testCompanionStateBounds();
         testLookPriorityAndHysteresis();
-        testFeedBurstRateFallbackMuteAndStop();
+        testFeedBurstAndRateLimit();
         testAoiPaletteAndTouch();
         testScreenBrightnessScaling();
         System.out.println("BifrostJvmTest: PASS");

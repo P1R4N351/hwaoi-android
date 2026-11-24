@@ -29,6 +29,9 @@ final class Zstd {
     /** Where {@link #decodeTo} puts the content, in order, in pieces */
     interface Sink { void accept(byte[] b, int off, int n) throws IOException; }
 
+    /** Supplies compressed bytes sequentially for {@link #decodePrefixTo}. */
+    interface ByteSource { int read(byte[] b, int off, int len) throws IOException; }
+
     /**
      * Decodes the frame in src[off, off+len) into sink without keeping the content: memory is the frame's window (plus two blocks), not its size. A frame whose
      * window is larger than maxWindow (a single-segment frame's window is its whole content) is refused with an IOException before any output
@@ -38,6 +41,14 @@ final class Zstd {
         Frame f = new Frame(src, off, len);
         if (f.window > maxWindow) throw bad(WINDOW_TOO_LARGE + " (" + f.window + " bytes)");
         return f.runTo(sink);
+    }
+
+    /** Streams a zstd prefix up to maxOut uncompressed bytes from bs into sink with bounded window memory. */
+    static long decodePrefixTo(ByteSource bs, long maxWindow, long maxOut, Sink sink) throws IOException {
+        Frame f = new Frame(bs);
+        long effWin = (maxOut >= 0 && f.window > maxOut) ? maxOut : f.window;
+        if (effWin > maxWindow) throw bad(WINDOW_TOO_LARGE + " (" + f.window + " bytes)");
+        return f.runPrefixTo(maxOut, sink);
     }
 
     static final String WINDOW_TOO_LARGE = "window too large to stream";
@@ -268,11 +279,11 @@ final class Zstd {
 
     private static final class Frame {
         final byte[] src;
-        final int end;
-        int pos;
+        final ByteSource bs;
+        int end, pos;
         final long fcs;
         final boolean checksum;
-        long window;        // the bytes a match may reach back (RFC 8878 3.1.1.1.2); a single-segment frame's is its content size
+        long window, streamWin;
         Sink sink;          // streaming (runTo): out holds the window and the newest blocks, the rest has gone to the sink
         long done;          // bytes already given to the sink
         byte[] out;
@@ -285,17 +296,34 @@ final class Zstd {
 
         Frame(byte[] src, int off, int len) throws IOException {
             this.src = src;
+            this.bs = null;
             this.end = off + len;
-            pos = off;
-            if (len < 6 || le32(src, pos) != MAGIC) throw bad("not a zstd frame");
+            this.pos = off;
+            long[] hdr = parseHeader(len);
+            this.fcs = hdr[0];
+            this.checksum = hdr[1] != 0;
+            this.window = hdr[2];
+        }
+
+        Frame(ByteSource bs) throws IOException {
+            this.src = new byte[2 * BLOCK_MAX];
+            this.bs = bs;
+            this.pos = 0;
+            this.end = 0;
+            ensure(18);
+            long[] hdr = parseHeader(end);
+            this.fcs = hdr[0];
+            this.checksum = hdr[1] != 0;
+            this.window = hdr[2];
+        }
+
+        private long[] parseHeader(int avail) throws IOException {
+            if (avail < 6 || le32(src, pos) != MAGIC) throw bad("not a zstd frame");
             pos += 4;
-            int fhd = src[pos++] & 0xff;
-            int fcsFlag = fhd >> 6, dictFlag = fhd & 3;
-            boolean single = (fhd & 0x20) != 0;
+            int fhd = src[pos++] & 0xff, fcsFlag = fhd >> 6, dictFlag = fhd & 3;
+            boolean single = (fhd & 0x20) != 0, cksum = (fhd & 0x04) != 0;
             if ((fhd & 0x08) != 0) throw bad("reserved bit set");
-            checksum = (fhd & 0x04) != 0;
-            long wd = 0;
-            if (!single) { wd = src[pos++] & 0xff; }   // window descriptor: exponent in the top 5 bits, mantissa in the low 3
+            long wd = single ? 0 : (src[pos++] & 0xff);
             int dictSize = dictFlag == 0 ? 0 : dictFlag == 1 ? 1 : dictFlag == 2 ? 2 : 4;
             long dict = 0;
             for (int i = 0; i < dictSize; i++) dict |= (src[pos + i] & 0xffL) << (8 * i);
@@ -306,14 +334,28 @@ final class Zstd {
             for (int i = 0; i < fcsSize; i++) v |= (src[pos + i] & 0xffL) << (8 * i);
             pos += fcsSize;
             if (pos > end) throw bad("frame header past the end");
-            fcs = fcsSize == 0 ? -1 : fcsSize == 2 ? v + 256 : v;
-            if (single) window = fcs;
-            else { long base = 1L << (10 + (wd >> 3)); window = base + base / 8 * (wd & 7); }
+            long fcsVal = fcsSize == 0 ? -1 : fcsSize == 2 ? v + 256 : v;
+            long winVal = single ? fcsVal : ((1L << (10 + (wd >> 3))) + ((1L << (10 + (wd >> 3))) / 8) * (wd & 7));
+            return new long[] {fcsVal, cksum ? 1L : 0L, winVal};
+        }
+
+        private void ensure(int need) throws IOException {
+            if (bs == null || end - pos >= need) return;
+            int rem = end - pos;
+            if (rem > 0 && pos > 0) System.arraycopy(src, pos, src, 0, rem);
+            pos = 0;
+            end = rem;
+            for (int i = 0; i < 1024 && end < need; i++) {
+                int k = bs.read(src, end, src.length - end);
+                if (k <= 0) break;
+                end += k;
+            }
         }
 
         /** The same loop as run, for a sink: the buffer is window + 2 blocks, filled, then all but the last window bytes go out and the window slides to the front */
         long runTo(Sink s) throws IOException {
             sink = s;
+            streamWin = window;
             long cap = Math.min(window, fcs >= 0 ? fcs : window) + 2L * BLOCK_MAX;
             if (cap > Integer.MAX_VALUE - 16) throw bad(WINDOW_TOO_LARGE);
             out = new byte[(int) cap];
@@ -321,6 +363,32 @@ final class Zstd {
             sink.accept(out, 0, op);
             done += op;
             if (fcs >= 0 && done != fcs) throw bad("content is " + done + " bytes, the header says " + fcs);
+            return done;
+        }
+
+        long runPrefixTo(long maxOut, Sink s) throws IOException {
+            sink = s;
+            streamWin = (maxOut >= 0 && window > maxOut) ? maxOut : window;
+            long cap = Math.min(streamWin, fcs >= 0 ? fcs : streamWin) + 2L * BLOCK_MAX;
+            if (cap > Integer.MAX_VALUE - 16) throw bad(WINDOW_TOO_LARGE);
+            out = new byte[(int) cap];
+            long maxBlocks = maxOut >= 0 ? maxOut + 65536L : 1_000_000_000L;
+            for (long it = 0; it < maxBlocks; it++) {
+                ensure(3);
+                if (pos + 3 > end) throw bad("block header past the end");
+                int h = (src[pos] & 0xff) | (src[pos + 1] & 0xff) << 8 | (src[pos + 2] & 0xff) << 16;
+                pos += 3;
+                boolean last = (h & 1) != 0;
+                int type = (h >> 1) & 3, size = h >>> 3;
+                if (type == 0 || type == 2) { if (size > BLOCK_MAX) throw bad("block too large"); ensure(size); }
+                else if (type == 1) ensure(1);
+                execBlock(type, size);
+                if (last || (maxOut >= 0 && done + op >= maxOut)) break;
+            }
+            int emit = maxOut >= 0 ? (int) Math.min(op, Math.max(0L, maxOut - done)) : op;
+            if (emit > 0) sink.accept(out, 0, emit);
+            done += emit;
+            if (maxOut < 0 && fcs >= 0 && done != fcs) throw bad("content is " + done + " bytes, the header says " + fcs);
             return done;
         }
 
@@ -333,30 +401,34 @@ final class Zstd {
             return body(max);
         }
 
+        private void execBlock(int type, int size) throws IOException {
+            if (type == 0) {
+                if (pos + size > end) throw bad("raw block past the end");
+                room(size);
+                System.arraycopy(src, pos, out, op, size);
+                op += size;
+                pos += size;
+            } else if (type == 1) {
+                if (pos + 1 > end) throw bad("RLE block past the end");
+                room(size);
+                Arrays.fill(out, op, op + size, src[pos]);
+                op += size;
+                pos += 1;
+            } else if (type == 2) {
+                if (size > BLOCK_MAX || pos + size > end) throw bad("compressed block too large or past the end");
+                block(pos, pos + size);
+                pos += size;
+            } else throw bad("reserved block type");
+        }
+
         private byte[] body(long max) throws IOException {
-            while (true) {
+            long maxBlocks = 1_000_000_000L;
+            for (long it = 0; it < maxBlocks; it++) {
                 if (pos + 3 > end) throw bad("block header past the end");
                 int h = (src[pos] & 0xff) | (src[pos + 1] & 0xff) << 8 | (src[pos + 2] & 0xff) << 16;
                 pos += 3;
                 boolean last = (h & 1) != 0;
-                int type = (h >> 1) & 3, size = h >>> 3;
-                if (type == 0) {
-                    if (pos + size > end) throw bad("raw block past the end");
-                    room(size);
-                    System.arraycopy(src, pos, out, op, size);
-                    op += size;
-                    pos += size;
-                } else if (type == 1) {
-                    if (pos + 1 > end) throw bad("RLE block past the end");
-                    room(size);
-                    Arrays.fill(out, op, op + size, src[pos]);
-                    op += size;
-                    pos += 1;
-                } else if (type == 2) {
-                    if (size > BLOCK_MAX || pos + size > end) throw bad("compressed block too large or past the end");
-                    block(pos, pos + size);
-                    pos += size;
-                } else throw bad("reserved block type");
+                execBlock((h >> 1) & 3, h >>> 3);
                 if (last) break;
                 if (max >= 0 && op >= max) return Arrays.copyOf(out, op);
             }
@@ -368,7 +440,7 @@ final class Zstd {
         private void room(int n) throws IOException {
             if ((long) op + n <= out.length) return;
             if (sink != null) {   // out is full: the part older than the window goes out, the window moves to the front (a match then never reaches before out[0])
-                int keep = (int) Math.min(op, window);
+                int keep = (int) Math.min(op, streamWin > 0 ? streamWin : window);
                 sink.accept(out, 0, op - keep);
                 done += op - keep;
                 System.arraycopy(out, op - keep, out, 0, keep);

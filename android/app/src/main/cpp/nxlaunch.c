@@ -656,6 +656,8 @@ int nxhost_companion_minimap_cycle(void);
 void nxhost_companion_minimap_enable(int on);
 #pragma weak nxhost_companion_objective
 int nxhost_companion_objective(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
+#pragma weak nxhost_companion_lhud
+int nxhost_companion_lhud(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
 #pragma weak nxhost_companion_ui_tex
 int nxhost_companion_ui_tex(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request);
 
@@ -756,6 +758,12 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionObjective(
         JNIEnv *env, jclass cls, jbyteArray rgba, jintArray meta) {
     (void)cls;
     return nxhost_companion_objective ? companion_read_buf(env, rgba, meta, 4, nxhost_companion_objective, NULL, 0) : 0;
+}
+
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionLeftHud(
+        JNIEnv *env, jclass cls, jbyteArray rgba, jintArray meta) {
+    (void)cls;
+    return nxhost_companion_lhud ? companion_read_buf(env, rgba, meta, 4, nxhost_companion_lhud, NULL, 0) : 0;
 }
 
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionUiTex(

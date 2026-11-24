@@ -6,25 +6,22 @@ import java.util.Locale;
 /**
  * Pure-JVM model for the converged Age of Calamity / Age of Imprisonment second screen.
  * Holds telemetry unpacked from ktgl_companion.h, live Vulkan minimap & objective metadata,
- * Purah Pad theme palette, chord/combo catalogs, cutscene auto-dimming, and AMOLED pixel orbit.
+ * Purah Pad theme palette, cutscene auto-dimming, and AMOLED pixel orbit.
  */
 public final class WarriorsCompanionModel {
     public static final int DETAIL_INTS = 32, DETAIL_FLOATS = 416;
     public static final int TRAIL_CAP = 128, PIN_CAP = 8, FPS_CAP = 64;
-    public static final int TAB_TACTICAL = 0, TAB_COMMAND = 1, TAB_GRIMOIRE = 2, TAB_LEDGER = 3, TAB_COUNT = 4;
+    public static final int TAB_TACTICAL = 0, TAB_LEDGER = 1, TAB_COUNT = 2;
     public static final int GAME_AOC = 1, GAME_AOI = 2;
-
-    public static final int ACT_PARTY_BASE = 0, ACT_R_BASE = 10, ACT_L_BASE = 20;
-    public static final int ACT_LOCKON = 30, ACT_SPECIAL = 31, ACT_DODGE = 32, ACT_COMBO_BASE = 40;
 
     public int status, gameKind = GAME_AOI, activeParty, presents, saveCommits, lastSaveAgeS = -1;
     public int trailCount, seqTag = -1, seqStep, seqCount;
     public boolean inGame, writeSafe, moviePlaying, hostPaused, saveBusy, seqActive, inputActive;
     public boolean headingUp = true, macroMode = true, autoDim = true;
     public boolean devOnStatus = true, stickLights = true, stickSync = true;
-    public boolean hasBackdrop, hasEmblem, hasLiveMinimap, hasLiveObjective, hasPurahTex;
+    public boolean hasBackdrop, hasFilter, hasGlyph, hasBorders, hasLiveMinimap, hasLiveObjective, hasLiveLeftHud;
     public int screenBrightnessPct = -1, minimapW, minimapH, minimapCandCount, minimapCandIdx;
-    public int objectiveW, objectiveH;
+    public int objectiveW, objectiveH, leftHudW, leftHudH;
     public String devBuildTag = "", devOverlayText = "", assetSource = "NONE";
     public float posX, posY, posZ, yawDeg, fps, frameMs;
     public final float[] trailX = new float[TRAIL_CAP], trailY = new float[TRAIL_CAP], trailZ = new float[TRAIL_CAP];
@@ -188,97 +185,20 @@ public final class WarriorsCompanionModel {
     /** Pure #000000 OLED black unless filled by a harvested game asset. */
     public int bgColor() { return 0xFF000000; }
     public int cardColor() { return 0xCC0A0F14; }
-    /** Borderless cards and buttons (zero cell borders). */
+    /** Borderless layout (zero cell borders). */
     public int borderColor() { return 0x00000000; }
     /** Purah Pad luminous cyan/teal accent. */
     public int primaryColor() { return 0xFF5CE6C4; }
     /** Purah Pad antique gold accent. */
     public int secondaryColor() { return 0xFFDCC08A; }
     public String saveFileName() { return gameKind == GAME_AOC ? "svdt" : "DATA.BIN"; }
-    public String bifrostLookDesc() {
-        return gameKind == GAME_AOC ? "Cyan / Gold" : "Jade / Amber";
-    }
 
     public static String tabName(int t) {
         switch (t) {
-            case TAB_TACTICAL: return "MAP";
-            case TAB_COMMAND: return "ACTIONS";
-            case TAB_GRIMOIRE: return "COMBOS";
+            case TAB_TACTICAL: return "PAD";
             case TAB_LEDGER: return "STATUS";
             default: return "";
         }
-    }
-
-    public static String pinPreset(int idx) {
-        switch (idx) {
-            case 0: return "KEEP";
-            case 1: return "BOSS";
-            case 2: return "KOROK";
-            case 3: return "CHEST";
-            case 4: return "RALLY";
-            default: return "PIN";
-        }
-    }
-
-    public static String rDeckTitle(int kind, int slot) {
-        if (kind == GAME_AOC) {
-            switch (slot) {
-                case 0: return "Bombs"; case 1: return "Stasis";
-                case 2: return "Cryonis"; default: return "Magnesis";
-            }
-        }
-        switch (slot) {
-            case 0: return "Sync"; case 1: return "Art X";
-            case 2: return "Art B"; default: return "Art A";
-        }
-    }
-
-    public static String lDeckTitle(int kind, int slot) {
-        if (kind == GAME_AOC) {
-            switch (slot) {
-                case 0: return "Fire Rod"; case 1: return "Ice Rod";
-                case 2: return "Lightning"; default: return "Heal";
-            }
-        }
-        switch (slot) {
-            case 0: return "Flame"; case 1: return "Frost";
-            case 2: return "Shock"; default: return "Ration";
-        }
-    }
-
-    public static String deckChord(String shoulder, int slot) {
-        switch (slot) {
-            case 0: return shoulder + " + Y"; case 1: return shoulder + " + X";
-            case 2: return shoulder + " + B"; default: return shoulder + " + A";
-        }
-    }
-
-    public static String partyDirLabel(int slot) {
-        switch (slot) {
-            case 0: return "\u2191 UP"; case 1: return "\u2192 RIGHT";
-            case 2: return "\u2193 DOWN"; default: return "\u2190 LEFT";
-        }
-    }
-
-    public static String comboTitle(int idx) {
-        return "C" + (idx + 1);
-    }
-
-    public static String comboRole(int idx) {
-        switch (idx) {
-            case 0: return "STRONG"; case 1: return "LAUNCH";
-            case 2: return "STUN"; case 3: return "SWEEP";
-            case 4: return "VORTEX"; default: return "FINISHER";
-        }
-    }
-
-    public String minimapLabel() {
-        return minimapW > 0 && minimapH > 0 ? ("RT " + minimapW + "x" + minimapH) : "SEARCHING RT";
-    }
-
-    public String objectiveLabel() {
-        return hasLiveObjective && objectiveW > 0 && objectiveH > 0
-                ? ("OBJ " + objectiveW + "x" + objectiveH) : "SEARCHING OBJ";
     }
 
     public String rtCandLabel() {

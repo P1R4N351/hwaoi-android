@@ -123,4 +123,5 @@ NXHOST_API int nxhost_companion_minimap(uint8_t *rgba_out, int max_bytes, int32_
 NXHOST_API int nxhost_companion_minimap_cycle(void);
 NXHOST_API void nxhost_companion_minimap_enable(int on);
 NXHOST_API int nxhost_companion_objective(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
+NXHOST_API int nxhost_companion_lhud(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
 NXHOST_API int nxhost_companion_ui_tex(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request);

@@ -26,7 +26,8 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private static final String TAG = "WarriorsCompanion";
     private static final long POLL_MS = 50L;
     private static final int MINIMAP_MAX_BYTES = 768 * 768 * 4;
-    private static final int OBJ_MAX_BYTES = 768 * 224 * 4, UI_TEX_BYTES = 512 * 512 * 4;
+    private static final int OBJ_MAX_BYTES = 1152 * 224 * 4;
+    private static final int LHUD_MAX_BYTES = 640 * 1440 * 4;
 
     private final GameActivity activity;
     private final FrameLayout rootView;
@@ -40,14 +41,15 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private final byte[] minimapBytes = new byte[MINIMAP_MAX_BYTES];
     private final int[] minimapMeta = new int[5];
     private final byte[] objBytes = new byte[OBJ_MAX_BYTES];
+    private final byte[] objCropBytes = new byte[OBJ_MAX_BYTES];
     private final int[] objMeta = new int[4];
-    private final byte[] uiBytes = new byte[UI_TEX_BYTES];
-    private final int[] uiMeta = new int[4];
+    private final byte[] lhudBytes = new byte[LHUD_MAX_BYTES];
+    private final int[] lhudMeta = new int[4];
 
     private WarriorsCompanionPresentation presentation;
     private WarriorsCompanionView presView, drawerView;
-    private Bitmap minimapBmp, objBmp;
-    private int presDisplayId = -1, lastPublishedTab = -1, uiTexTick, uiTexTries;
+    private Bitmap minimapBmp, objBmp, lhudBmp;
+    private int presDisplayId = -1, lastPublishedTab = -1;
     private boolean started, resumed, closed, drawerOpen;
 
     private final Runnable pollTask = new Runnable() {
@@ -79,7 +81,9 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         this.drawerOpen = Prefs.companionDrawer(activity, titleId);
         this.art.loadCached(activity);
         syncArtFlags();
-        this.art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, this::onArtUpdated);
+        if (!this.art.hasAllPadArt()) {
+            this.art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, this::onArtUpdated);
+        }
         this.dm = (DisplayManager) activity.getSystemService(Context.DISPLAY_SERVICE);
         if (this.dm != null) this.dm.registerDisplayListener(this, ui);
         ensurePresentation();
@@ -101,57 +105,65 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
 
     private void syncArtFlags() {
         model.hasBackdrop = art.backdrop() != null;
-        model.hasEmblem = art.emblem() != null;
+        model.hasFilter = art.filter() != null;
+        model.hasGlyph = art.glyph() != null;
+        model.hasBorders = art.borderFrieze() != null && art.borderEdge() != null && art.borderSide() != null;
         model.hasLiveMinimap = art.minimap() != null;
         model.hasLiveObjective = art.objective() != null;
-        model.hasPurahTex = art.purahTex() != null;
+        model.hasLiveLeftHud = art.leftHud() != null;
         model.assetSource = art.source();
     }
 
     private WarriorsCompanionView.Actions makeActions() {
         return new WarriorsCompanionView.Actions() {
-            @Override public void onTabSelected(int tab) {
-                Native.companionMinimapEnable(minimapWantActive());
-                syncPublishedTab();
-                refreshNow();
-            }
-            @Override public void onFireAction(int actionId) { Native.companionFire(actionId); refreshNow(); }
-            @Override public void onAbortChord() { Native.companionAbortSeq(); refreshNow(); }
-            @Override public void onToggleDevOnStatus() {
-                boolean next = !Prefs.overlayOnSecondScreen(activity);
-                Prefs.overlayOnSecondScreen(activity, next);
-                model.devOnStatus = next;
-                invalidateViews();
-            }
-            @Override public void onToggleStickLights() {
-                boolean next = !Prefs.bifrost(activity, titleId);
-                Prefs.bifrost(activity, titleId, next);
-                BifrostBridge.setEnabled(next);
-                model.stickLights = next;
-                invalidateViews();
-            }
-            @Override public void onToggleStickSync() {
-                boolean next = !Prefs.bifrostScreenSync(activity);
-                Prefs.bifrostScreenSync(activity, next);
-                BifrostBridge.syncScreenBrightness = next;
-                model.stickSync = next;
-                invalidateViews();
-            }
-            @Override public void onCycleRt() {
-                model.minimapCandIdx = Native.companionMinimapCycle();
-                minimapMeta[2] = 0;
-                refreshNow();
-            }
-            @Override public void onRescanArt() {
-                uiTexTries = 0; uiTexTick = 0;
-                art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, WarriorsCompanionController.this::onArtUpdated);
-            }
-            @Override public void onClearArt() {
-                art.clearCache(activity);
-                onArtUpdated();
-            }
+            @Override public void onTabSelected(int tab) { handleTabSelected(); }
+            @Override public void onToggleDevOnStatus() { toggleDevOnStatus(); }
+            @Override public void onToggleStickLights() { toggleStickLights(); }
+            @Override public void onToggleStickSync() { toggleStickSync(); }
+            @Override public void onCycleRt() { cycleRt(); }
+            @Override public void onRescanArt() { rescanArt(); }
+            @Override public void onClearArt() { art.clearCache(activity); onArtUpdated(); }
             @Override public void onTouchPulse() { BifrostBridge.touched(); }
         };
+    }
+
+    private void handleTabSelected() {
+        Native.companionMinimapEnable(minimapWantActive());
+        syncPublishedTab();
+        refreshNow();
+    }
+
+    private void toggleDevOnStatus() {
+        boolean next = !Prefs.overlayOnSecondScreen(activity);
+        Prefs.overlayOnSecondScreen(activity, next);
+        model.devOnStatus = next;
+        invalidateViews();
+    }
+
+    private void toggleStickLights() {
+        boolean next = !Prefs.bifrost(activity, titleId);
+        Prefs.bifrost(activity, titleId, next);
+        BifrostBridge.setEnabled(next);
+        model.stickLights = next;
+        invalidateViews();
+    }
+
+    private void toggleStickSync() {
+        boolean next = !Prefs.bifrostScreenSync(activity);
+        Prefs.bifrostScreenSync(activity, next);
+        BifrostBridge.syncScreenBrightness = next;
+        model.stickSync = next;
+        invalidateViews();
+    }
+
+    private void cycleRt() {
+        model.minimapCandIdx = Native.companionMinimapCycle();
+        minimapMeta[2] = 0;
+        refreshNow();
+    }
+
+    private void rescanArt() {
+        art.harvestFromGameDirsAsync(activity, harvestDirs(), model.gameKind, this::onArtUpdated);
     }
 
     private void syncPublishedTab() {
@@ -278,10 +290,12 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
             Native.companionMinimapEnable(true);
             pollMinimapStream();
             pollObjectiveStream();
-            pollGpuUiTex();
+            pollLeftHudStream();
         } else {
             Native.companionMinimapEnable(false);
+            minimapMeta[2] = 0; objMeta[2] = 0; lhudMeta[2] = 0;
             art.setObjective(null);
+            art.setLeftHud(null);
         }
         syncArtFlags();
         syncPublishedTab();
@@ -320,22 +334,60 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         model.objectiveH = oh;
         if (active == 0) {
             art.setObjective(null);
-        } else if (got == 1 && ow > 0 && ow <= 768 && oh > 0 && oh <= 224 && ow * oh * 4 <= objBytes.length) {
-            if (objBmp == null || objBmp.getWidth() != ow || objBmp.getHeight() != oh) {
-                objBmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888);
-            }
-            objBmp.copyPixelsFromBuffer(ByteBuffer.wrap(objBytes, 0, ow * oh * 4));
-            art.setObjective(objBmp);
+        } else if (got == 1 && ow > 0 && ow <= 1152 && oh > 0 && oh <= 224 && ow * oh * 4 <= objBytes.length) {
+            art.setObjective(cropObjective(objBytes, ow, oh));
         }
     }
 
-    private void pollGpuUiTex() {
-        if (art.purahTex() != null || art.isSuppressed() || uiTexTries >= 8) return;
-        boolean req = (uiTexTick % 30) == 0 && uiMeta[3] == 0;
-        uiTexTick++;
-        if (Native.companionUiTex(uiBytes, uiMeta, req) == 1) {
-            uiTexTries++;
-            art.ingestGpuUiTex(activity, uiBytes, uiMeta[0], uiMeta[1], model.gameKind);
+    private void pollLeftHudStream() {
+        int got = Native.companionLeftHud(lhudBytes, lhudMeta);
+        int lw = lhudMeta[0], lh = lhudMeta[1], active = lhudMeta[3];
+        model.leftHudW = lw;
+        model.leftHudH = lh;
+        if (active == 0) {
+            art.setLeftHud(null);
+        } else if (got == 1 && lw > 0 && lw <= 640 && lh > 0 && lh <= 1440 && lw * lh * 4 <= lhudBytes.length) {
+            if (lhudBmp == null || lhudBmp.getWidth() != lw || lhudBmp.getHeight() != lh) {
+                lhudBmp = Bitmap.createBitmap(lw, lh, Bitmap.Config.ARGB_8888);
+            }
+            lhudBmp.copyPixelsFromBuffer(ByteBuffer.wrap(lhudBytes, 0, lw * lh * 4));
+            art.setLeftHud(lhudBmp);
+        }
+    }
+
+    private Bitmap cropObjective(byte[] rgba, int ow, int oh) {
+        int xMin = Math.min(ow - 1, 96), rightmost = xMin - 1;
+        for (int x = ow - 1; x >= xMin && rightmost < xMin; x--) {
+            for (int y = 0; y < oh; y += 2) {
+                int idx = (y * ow + x) * 4;
+                if ((rgba[idx + 3] & 0xFF) > 32 && ((rgba[idx] & 0xFF) > 28
+                        || (rgba[idx + 1] & 0xFF) > 28 || (rgba[idx + 2] & 0xFF) > 28)) { rightmost = x; break; }
+            }
+        }
+        int cw = Math.min(ow, Math.max(Math.min(ow, 160), (rightmost + 40) & ~3));
+        if (objBmp == null || objBmp.getWidth() != cw || objBmp.getHeight() != oh) {
+            objBmp = Bitmap.createBitmap(cw, oh, Bitmap.Config.ARGB_8888);
+        }
+        int rowBytes = cw * 4, srcStride = ow * 4;
+        for (int y = 0; y < oh; y++) softenObjectiveRow(rgba, y * srcStride, objCropBytes, y * rowBytes, cw, y, oh);
+        objBmp.copyPixelsFromBuffer(ByteBuffer.wrap(objCropBytes, 0, cw * oh * 4));
+        return objBmp;
+    }
+
+    private static void softenObjectiveRow(byte[] src, int sOff, byte[] dst, int dOff, int cw, int y, int oh) {
+        int fy = y < 10 ? (y * 25) : (y >= oh - 10 ? ((oh - 1 - y) * 25) : 255);
+        for (int x = 0; x < cw; x++) {
+            int si = sOff + x * 4, di = dOff + x * 4;
+            int a = src[si + 3] & 0xFF;
+            if (a == 0) { dst[di] = 0; dst[di + 1] = 0; dst[di + 2] = 0; dst[di + 3] = 0; continue; }
+            int r = src[si] & 0xFF, g = src[si + 1] & 0xFF, b = src[si + 2] & 0xFF;
+            int mx = Math.max(r, Math.max(g, b));
+            int na = mx < 24 ? ((a * 112) >> 8) : a;
+            int fx = x < 16 ? (x * 16) : (x >= cw - 28 ? ((cw - 1 - x) * 255 / 27) : 255);
+            int edge = Math.min(fx, fy);
+            if (edge < 255) na = (na * edge) >> 8;
+            if (na < a) { r = (r * na) / a; g = (g * na) / a; b = (b * na) / a; }
+            dst[di] = (byte) r; dst[di + 1] = (byte) g; dst[di + 2] = (byte) b; dst[di + 3] = (byte) na;
         }
     }
 
@@ -346,15 +398,25 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private File[] harvestDirs() {
         String g = activity.getIntent() != null ? activity.getIntent().getStringExtra("game") : null;
         String p = activity.getIntent() != null ? activity.getIntent().getStringExtra("pack") : null;
+        Nup.Ref ref = parseNupSafe(g);
+        File nupFile = ref != null ? new File(ref.path) : null;
         File gd = g != null && !g.isEmpty() ? new File(g) : null;
+        File parent = nupFile != null ? nupFile.getParentFile() : (gd != null ? gd.getParentFile() : null);
         return new File[] {
-            gd != null && gd.isDirectory() ? new File(gd, "romfs/Movie") : null,
+            nupFile,
+            parent,
             gd != null && gd.isDirectory() ? new File(gd, "romfs") : null,
             gd,
             p != null && !p.isEmpty() ? new File(p) : null,
             AppStorage.pack(activity, titleId),
             activity.getExternalFilesDir(null),
+            new File("/sdcard/Games/Switch 2"),
         };
+    }
+
+    private static Nup.Ref parseNupSafe(String spec) {
+        if (spec == null || spec.isEmpty()) return null;
+        try { return Nup.parse(spec); } catch (IllegalArgumentException ignored) { return null; }
     }
 
     void onResume() {
@@ -389,8 +451,10 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         Native.companionAbortSeq();
         art.setMinimap(null);
         art.setObjective(null);
+        art.setLeftHud(null);
         minimapBmp = null;
         objBmp = null;
+        lhudBmp = null;
         dismissPresentation();
         if (drawerView != null && rootView != null) {
             rootView.removeView(drawerView);

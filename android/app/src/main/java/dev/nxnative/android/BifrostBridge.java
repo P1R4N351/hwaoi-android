@@ -23,6 +23,7 @@ final class BifrostBridge {
     private static final String TAG = "OotBifrost";
     private static final String OOT_TITLE_ID = "0400486024DEC000";
     private static final String AOI_TITLE_ID = "04003F40232DE000";
+    private static final String AOC_TITLE_ID = "01002B00111A2000";
     private static volatile BifrostBridge current;
     static volatile boolean enabled = true;
     static volatile boolean syncScreenBrightness = true;
@@ -52,17 +53,22 @@ final class BifrostBridge {
     private volatile int generation;
     private String said = "";
 
-    static BifrostBridge create(Activity activity, String gameId) {
-        boolean aoi = AOI_TITLE_ID.equals(gameId);
-        if (!OOT_TITLE_ID.equals(gameId) && !aoi) return null;
-        int mode = Native.bifrostMode();
-        if (mode == 0) return null;
-        return new BifrostBridge(activity.getApplicationContext(), mode == 2, aoi);
+    static boolean supports(String gameId) {
+        return OOT_TITLE_ID.equals(gameId) || AOI_TITLE_ID.equals(gameId) || AOC_TITLE_ID.equals(gameId);
     }
 
-    private BifrostBridge(Context context, boolean classic, boolean aoi) {
+    static BifrostBridge create(Activity activity, String gameId) {
+        if (!supports(gameId)) return null;
+        int mode = Native.bifrostMode();
+        if (mode == 0) return null;
+        int pal = AOI_TITLE_ID.equals(gameId) ? BifrostLooks.PAL_AOI
+                : (AOC_TITLE_ID.equals(gameId) ? BifrostLooks.PAL_AOC : BifrostLooks.PAL_OOT);
+        return new BifrostBridge(activity.getApplicationContext(), mode == 2, pal);
+    }
+
+    private BifrostBridge(Context context, boolean classic, int pal) {
         this.context = context;
-        this.feed = new BifrostLooks.Feed(classic, aoi);
+        this.feed = new BifrostLooks.Feed(classic, pal);
     }
 
     static void setEnabled(boolean on) {
@@ -81,53 +87,60 @@ final class BifrostBridge {
     void start() {
         foreground = true;
         current = this;
-        if (!enabled || running || dead) return;
-        try {
-            if (worker == null) {
-                context.getPackageManager().getPackageInfo(BifrostLooks.PACKAGE, 0);
-                thread = new HandlerThread("oot-bifrost", Process.THREAD_PRIORITY_BACKGROUND);
-                thread.start();
-                worker = new Handler(thread.getLooper());
-                Log.i(TAG, "Bifrost installed: stick LEDs active" + (feed.classic() ? " (classic)" : ""));
-            }
-        } catch (PackageManager.NameNotFoundException absent) {
-            return;
-        } catch (Throwable failed) {
-            fail(failed);
-            return;
-        }
+        if (!enabled || running || dead || !ensureWorker()) return;
         running = true;
-        current = this;
         int token = ++generation;
         Handler queue = worker;
         queue.post(new Runnable() {
             @Override public void run() {
-                if (token != generation || dead) return;
-                try {
-                    boolean have = Native.companionState(words)
-                            && waist.set(words)
-                            && BifrostLooks.fromState(waist, state);
-                    long now = SystemClock.elapsedRealtime();
-                    List<BifrostLooks.Command> cmds;
-                    String reason;
-                    float bri = syncScreenBrightness ? readScreenBrightness(context) : -1f;
-                    synchronized (feed) {
-                        feed.setScreenBrightness(bri);
-                        cmds = feed.poll(now, have ? state : null);
-                        reason = feed.muteReason(now);
-                    }
-                    send(cmds);
-                    if (!reason.equals(said)) {
-                        said = reason;
-                        if (!reason.isEmpty()) Log.i(TAG, reason + "; retrying later");
-                    }
-                } catch (Throwable failed) {
-                    fail(failed);
-                    return;
+                if (token == generation && !dead && pollOnce()) {
+                    queue.postDelayed(this, BifrostLooks.Feed.POLL_MS);
                 }
-                if (token == generation) queue.postDelayed(this, BifrostLooks.Feed.POLL_MS);
             }
         });
+    }
+
+    private boolean ensureWorker() {
+        if (worker != null) return true;
+        try {
+            context.getPackageManager().getPackageInfo(BifrostLooks.PACKAGE, 0);
+            thread = new HandlerThread("oot-bifrost", Process.THREAD_PRIORITY_BACKGROUND);
+            thread.start();
+            worker = new Handler(thread.getLooper());
+            Log.i(TAG, "Bifrost installed: stick LEDs active" + (feed.classic() ? " (classic)" : ""));
+            return true;
+        } catch (PackageManager.NameNotFoundException absent) {
+            return false;
+        } catch (Throwable failed) {
+            fail(failed);
+            return false;
+        }
+    }
+
+    private boolean pollOnce() {
+        try {
+            boolean have = Native.companionState(words)
+                    && waist.set(words)
+                    && BifrostLooks.fromState(waist, state);
+            long now = SystemClock.elapsedRealtime();
+            List<BifrostLooks.Command> cmds;
+            String reason;
+            float bri = syncScreenBrightness ? readScreenBrightness(context) : -1f;
+            synchronized (feed) {
+                feed.setScreenBrightness(bri);
+                cmds = feed.poll(now, have ? state : null);
+                reason = feed.muteReason(now);
+            }
+            send(cmds);
+            if (!reason.equals(said)) {
+                said = reason;
+                if (!reason.isEmpty()) Log.i(TAG, reason + "; retrying later");
+            }
+            return true;
+        } catch (Throwable failed) {
+            fail(failed);
+            return false;
+        }
     }
 
     void stop() {

@@ -61,8 +61,11 @@ final class BifrostLooks {
     static final Look OPEN = new Look("pause-subscreen", 0xf0d678, 85, false, 60, "STATIC", 0.5f, 255);
     static final Look OCARINA = new Look("ocarina-play", hue(0x3b9eff), 95, false, 70, "BREATH", 0.25f, 200);
     static final Look LOW = new Look("low-hearts", hue(0xff2a1a), 110, true, 80, "PULSE", 0.8f, 255);
-    static final Look AOI_BASE = new Look("zonai-jade", hue(0x5ac8b8), 77, false, 60, "BREATH", 0.10f, 150);
-    static final Look AOI_OPEN = new Look("zonai-open", 0xe8b84b, 85, false, 60, "STATIC", 0.5f, 255);
+    static final int PAL_OOT = 0, PAL_AOI = 1, PAL_AOC = 2;
+    static final Look AOI_BASE = new Look("zonai-teal", 0x00ff88, 82, false, 60, "BREATH", 0.10f, 160);
+    static final Look AOI_OPEN = new Look("zonai-teal-open", 0x24ffa8, 85, false, 60, "STATIC", 0.5f, 255);
+    static final Look AOC_BASE = new Look("sheikah-blue", 0x0060ff, 82, false, 60, "BREATH", 0.10f, 160);
+    static final Look AOC_OPEN = new Look("sheikah-blue-open", 0x3888ff, 85, false, 60, "STATIC", 0.5f, 255);
 
     static final class State {
         boolean inGame;
@@ -131,7 +134,7 @@ final class BifrostLooks {
         static final long ENTRY_PULSE_DELAY_MS = 600;
 
         private boolean classic;
-        private final boolean aoiPalette;
+        private final int palette;
         private Look shown, candidate;
         private int candidateCount;
         private boolean low, wasOpen, wasOcarina, sawNoGame, dirty, active;
@@ -142,8 +145,9 @@ final class BifrostLooks {
         private int sentCount;
         private String muteReason = "";
 
-        Feed(boolean classic) { this(classic, false); }
-        Feed(boolean classic, boolean aoiPalette) { this.classic = classic; this.aoiPalette = aoiPalette; }
+        Feed(boolean classic) { this(classic, PAL_OOT); }
+        Feed(boolean classic, boolean aoiPalette) { this(classic, aoiPalette ? PAL_AOI : PAL_OOT); }
+        Feed(boolean classic, int palette) { this.classic = classic; this.palette = palette; }
 
         boolean classic() { return classic; }
         Look shown() { return shown; }
@@ -160,7 +164,8 @@ final class BifrostLooks {
             }
             if (low) return LOW;
             if (s.ocarina) return OCARINA;
-            if (aoiPalette) return s.open ? AOI_OPEN : AOI_BASE;
+            if (palette == PAL_AOI) return s.open ? AOI_OPEN : AOI_BASE;
+            if (palette == PAL_AOC) return s.open ? AOC_OPEN : AOC_BASE;
             return s.open ? OPEN : BASE;
         }
 
