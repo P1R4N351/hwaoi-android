@@ -57,6 +57,7 @@ import java.util.Map;
 public final class GameActivity extends Activity implements SurfaceHolder.Callback, InputManager.InputDeviceListener {
     private static final int KEEP_LOGS = 10;
 
+    private SurfaceView gameSurface;
     private TextView overlay;
     private TextView tag, fps;   // the build tag (top left) and the frame rate with the other items (top right, Overlay) as views over the game, shown only while the host's present does not draw them (fpsTick)
     private Overlay stats;
@@ -117,6 +118,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         FrameLayout root = new FrameLayout(this);
         rootView = root;
         SurfaceView surface = new SurfaceView(this);
+        gameSurface = surface;
+        BifrostBridge.syncScreenBrightness = Prefs.bifrostScreenSync(this);
         surface.getHolder().addCallback(this);
         root.addView(surface);
         // The log's last lines (tail()): bottom left, one block only as high as its text, so it stays clear of the build tag in the corner above
@@ -386,13 +389,21 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private void fpsTick() {
         if (stopped || paused) { ui.postDelayed(this::fpsTick, 2000); return; }   // nothing to show: no readings (thermal, battery, the host's counters) while suspended
         boolean on = overlayOn();
-        CharSequence t = on ? stats.tick() : null, g = on && Prefs.overlayItem(this, "tag") ? tag.getText() : null;
-        boolean host = tagBlock.host(g) & fpsBlock.host(t);   // both every time: a block that is off empties its corner
-        fps.setVisibility(!host && t != null ? View.VISIBLE : View.GONE);
-        tag.setVisibility(!host && g != null ? View.VISIBLE : View.GONE);
-        if (!host && t != null) {
-            String k = Overlay.key(t);
-            if (!k.equals(fpsShown)) { fps.setText(t); fpsShown = k; }   // the same text again would lay the window out again for nothing
+        boolean toSecond = Prefs.overlayOnSecondScreen(this)
+                && companion != null && companion.isSecondaryActive();
+        CharSequence t = (on || toSecond) ? stats.tick() : null;
+        CharSequence g = (on || toSecond) && Prefs.overlayItem(this, "tag") ? tag.getText() : null;
+        if (companion != null) {
+            companion.setDevOverlay(g != null ? g.toString() : "", t != null ? t.toString() : "", toSecond);
+        }
+        CharSequence cornerT = toSecond ? null : t;
+        CharSequence cornerG = toSecond ? null : g;
+        boolean host = tagBlock.host(cornerG) & fpsBlock.host(cornerT);   // both every time: a block that is off empties its corner
+        fps.setVisibility(!host && cornerT != null ? View.VISIBLE : View.GONE);
+        tag.setVisibility(!host && cornerG != null ? View.VISIBLE : View.GONE);
+        if (!host && cornerT != null) {
+            String k = Overlay.key(cornerT);
+            if (!k.equals(fpsShown)) { fps.setText(cornerT); fpsShown = k; }   // the same text again would lay the window out again for nothing
         }
         ui.postDelayed(this::fpsTick, 500);
     }
@@ -1557,6 +1568,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     FrameLayout rootView() { return rootView; }
     View panelView() { return panel; }
     boolean gamepadConnected() { return !pads.isEmpty(); }
+    SurfaceView gameSurface() { return gameSurface; }
     boolean companionDrawerOpen() { return companion != null ? companion.isDrawerOpen() : Prefs.companionDrawer(this, titleId()); }
     void companionDrawer(boolean on) { if (companion != null) companion.setDrawerOpen(on); else Prefs.companionDrawer(this, titleId(), on); }
 }

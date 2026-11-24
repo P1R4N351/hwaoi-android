@@ -25,6 +25,12 @@ final class Prefs {
     static boolean overlay(Context c) { return of(c).getBoolean("overlay", true); }
     static void overlay(Context c, boolean on) { of(c).edit().putBoolean("overlay", on).commit(); }
 
+    static boolean overlayOnSecondScreen(Context c) { return of(c).getBoolean("overlay_second_screen", true); }
+    static void overlayOnSecondScreen(Context c, boolean on) { of(c).edit().putBoolean("overlay_second_screen", on).commit(); }
+
+    static boolean bifrostScreenSync(Context c) { return of(c).getBoolean("bifrost_screen_sync", true); }
+    static void bifrostScreenSync(Context c, boolean on) { of(c).edit().putBoolean("bifrost_screen_sync", on).commit(); }
+
     /** The in-game clean picture: stats, log, build tag, on-screen controls and the panel arrow hidden together. One saved flag, so hiding survives a
      *  restart as a whole; the overlay and log settings themselves are not changed, and showing everything returns to them. */
     static boolean clean(Context c) { return of(c).getBoolean("clean", false); }

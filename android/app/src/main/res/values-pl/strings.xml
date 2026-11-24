@@ -1376,4 +1376,6 @@
     <string name="game_stick_leds_bifrost_off">Pozostaw diody drążków AYN Thor pod własną kontrolą Bifrost</string>
     <string name="game_companion_hud">Drugi ekran</string>
     <string name="game_companion_drawer">Pokaż na głównym ekranie</string>
+    <string name="game_overlay_second_screen">Przenieś HUD dev na drugi ekran</string>
+    <string name="game_bifrost_brightness">Synchronizuj LED gałek z jasnością ekranu</string>
 </resources>

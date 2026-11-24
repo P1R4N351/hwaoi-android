@@ -11,16 +11,19 @@ import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.FrameLayout;
+import java.io.File;
 
 /**
  * Coordinates the Warriors second-screen Presentation (AYN Thor Display 4 via PnP match),
- * opt-in single-screen drawer fallback, 50 ms native polling, and safe cleanup.
+ * live game circular minimap mirroring, runtime target-game asset harvesting,
+ * Display 0 dev-HUD migration, and opt-in single-screen drawer fallback.
  */
 final class WarriorsCompanionController implements DisplayManager.DisplayListener {
     static final String AOC_TITLE_ID = "01002B00111A2000";
     static final String AOI_TITLE_ID = "04003F40232DE000";
     private static final String TAG = "WarriorsCompanion";
     private static final long POLL_MS = 50L;
+    private static final long MINIMAP_INTERVAL_MS = 125L;
 
     private final GameActivity activity;
     private final FrameLayout rootView;
@@ -28,13 +31,15 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private final String titleId;
     private final DisplayManager dm;
     private final WarriorsCompanionModel model = new WarriorsCompanionModel();
+    private final WarriorsAssetHarvester art = new WarriorsAssetHarvester();
     private final int[] ints = new int[WarriorsCompanionModel.DETAIL_INTS];
     private final float[] flts = new float[WarriorsCompanionModel.DETAIL_FLOATS];
 
     private WarriorsCompanionPresentation presentation;
     private WarriorsCompanionView presView, drawerView;
     private int presDisplayId = -1, lastPublishedTab = -1;
-    private boolean started, resumed, closed, drawerOpen;
+    private boolean started, resumed, closed, drawerOpen, autoHarvestedLive;
+    private long lastMinimapMs;
 
     private final Runnable pollTask = new Runnable() {
         @Override public void run() {
@@ -58,11 +63,38 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         this.titleId = titleId;
         this.model.gameKind = AOC_TITLE_ID.equals(titleId)
                 ? WarriorsCompanionModel.GAME_AOC : WarriorsCompanionModel.GAME_AOI;
+        this.model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
+        this.model.stickSync = Prefs.bifrostScreenSync(activity);
         this.drawerOpen = Prefs.companionDrawer(activity, titleId);
+        this.art.loadCached(activity);
+        syncArtFlags();
+        File packDir = AppStorage.pack(activity, titleId);
+        File extDir = activity.getExternalFilesDir(null);
+        this.art.harvestFromGameDirsAsync(activity, new File[] { packDir, extDir }, model.gameKind, this::onArtUpdated);
         this.dm = (DisplayManager) activity.getSystemService(Context.DISPLAY_SERVICE);
         if (this.dm != null) this.dm.registerDisplayListener(this, ui);
         ensurePresentation();
         applyDrawerVisibility();
+    }
+
+    boolean isSecondaryActive() { return presentation != null && started && !closed; }
+
+    void setDevOverlay(String buildTag, String overlayText, boolean movedToStatus) {
+        model.devBuildTag = buildTag != null ? buildTag : "";
+        model.devOverlayText = overlayText != null ? overlayText : "";
+        model.devOnStatus = movedToStatus;
+    }
+
+    private void onArtUpdated() {
+        syncArtFlags();
+        invalidateViews();
+    }
+
+    private void syncArtFlags() {
+        model.hasBackdrop = art.backdrop() != null;
+        model.hasEmblem = art.emblem() != null;
+        model.hasLiveMinimap = art.minimap() != null;
+        model.assetSource = art.source();
     }
 
     private WarriorsCompanionView.Actions makeActions() {
@@ -70,9 +102,27 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
             @Override public void onTabSelected(int tab) { syncPublishedTab(); refreshNow(); }
             @Override public void onFireAction(int actionId) { Native.companionFire(actionId); refreshNow(); }
             @Override public void onAbortChord() { Native.companionAbortSeq(); refreshNow(); }
-            @Override public int onPinAdd(String label) { int r = Native.companionPin(0, -1, label); refreshNow(); return r; }
-            @Override public void onPinRemove(int slot) { Native.companionPin(1, slot, null); refreshNow(); }
-            @Override public void onPinClear() { Native.companionPin(2, -1, null); refreshNow(); }
+            @Override public void onToggleDevOnStatus() {
+                boolean next = !Prefs.overlayOnSecondScreen(activity);
+                Prefs.overlayOnSecondScreen(activity, next);
+                model.devOnStatus = next;
+                invalidateViews();
+            }
+            @Override public void onToggleStickSync() {
+                boolean next = !Prefs.bifrostScreenSync(activity);
+                Prefs.bifrostScreenSync(activity, next);
+                BifrostBridge.syncScreenBrightness = next;
+                model.stickSync = next;
+                invalidateViews();
+            }
+            @Override public void onHarvestBackdrop() {
+                art.captureLiveBackdrop(activity, activity.gameSurface(), model.gameKind, WarriorsCompanionController.this::onArtUpdated);
+            }
+            @Override public void onClearArt() {
+                art.clearCache(activity);
+                autoHarvestedLive = true;
+                onArtUpdated();
+            }
             @Override public void onTouchPulse() { BifrostBridge.touched(); }
         };
     }
@@ -120,7 +170,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         if (presentation != null && target.getDisplayId() == presDisplayId) return;
         dismissPresentation();
         try {
-            WarriorsCompanionPresentation p = new WarriorsCompanionPresentation(activity, target, model, makeActions());
+            WarriorsCompanionPresentation p = new WarriorsCompanionPresentation(activity, target, model, art, makeActions());
             p.setOnDismissListener(dlg -> {
                 if (presentation == p) { presentation = null; presView = null; presDisplayId = -1; }
             });
@@ -150,7 +200,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
     private void applyDrawerVisibility() {
         if (drawerOpen) {
             if (drawerView == null && rootView != null) {
-                drawerView = new WarriorsCompanionView(activity, model, makeActions());
+                drawerView = new WarriorsCompanionView(activity, model, art, makeActions());
                 int rootW = rootView.getWidth() > 0 ? rootView.getWidth()
                         : activity.getResources().getDisplayMetrics().widthPixels;
                 int dw = Math.max(460, Math.round(rootW * 0.48f));
@@ -183,13 +233,31 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         if (!closed && resumed && anyVisible()) ui.post(pollTask);
     }
 
-    private void refreshNow() {
-        String text = Native.companionDetail(ints, flts);
-        if (text != null) model.update(ints, flts, text, SystemClock.elapsedRealtime());
-        else model.updateOrbit(SystemClock.elapsedRealtime());
-        syncPublishedTab();
+    private void invalidateViews() {
         if (presView != null) presView.invalidate();
         if (drawerView != null && drawerOpen) drawerView.invalidate();
+    }
+
+    private void refreshNow() {
+        long now = SystemClock.elapsedRealtime();
+        String text = Native.companionDetail(ints, flts);
+        if (text != null) model.update(ints, flts, text, now);
+        else model.updateOrbit(now);
+        model.stickSync = BifrostBridge.syncScreenBrightness;
+        model.screenBrightnessPct = BifrostBridge.lastScreenPct;
+        model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
+        syncArtFlags();
+        syncPublishedTab();
+        if (!autoHarvestedLive && !model.hasBackdrop && model.inGame && model.presents >= 120 && !model.moviePlaying) {
+            autoHarvestedLive = true;
+            art.captureLiveBackdrop(activity, activity.gameSurface(), model.gameKind, this::onArtUpdated);
+        }
+        if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
+                && !model.moviePlaying && !model.hostPaused && (now - lastMinimapMs) >= MINIMAP_INTERVAL_MS) {
+            lastMinimapMs = now;
+            art.captureLiveMinimap(activity.gameSurface(), model.mapCropMode, this::onArtUpdated);
+        }
+        invalidateViews();
     }
 
     void onStart() {
@@ -224,6 +292,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         started = false;
         ui.removeCallbacks(pollTask);
         Native.companionAbortSeq();
+        art.shutdown();
         dismissPresentation();
         if (drawerView != null && rootView != null) {
             rootView.removeView(drawerView);

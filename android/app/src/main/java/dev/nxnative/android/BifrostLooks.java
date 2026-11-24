@@ -80,6 +80,16 @@ final class BifrostLooks {
     }
 
     /** Quarter-heart thresholds with 1-heart hysteresis to prevent edge chatter. */
+    /** Scales a look's base LED intensity by the device screen brightness ([0..1], or <0 to disable). */
+    static int scaleIntensity(int base, float screenLevel) {
+        int clamped = Math.max(0, Math.min(255, base));
+        if (!Float.isFinite(screenLevel) || screenLevel < 0f) return clamped;
+        if (screenLevel <= 0.001f) return 0;
+        float s = Math.min(1f, screenLevel);
+        float factor = 0.08f + 0.92f * (float) Math.pow(s, 0.85);
+        return Math.max(1, Math.min(255, Math.round(clamped * factor)));
+    }
+
     static int lowOn(int maxLife) { return Math.max(4, (maxLife + 3) / 4); }
     static int lowOff(int maxLife) { return Math.min(maxLife, lowOn(maxLife) + 4); }
 
@@ -256,13 +266,25 @@ final class BifrostLooks {
             if (sentCount >= 2 * sent.length) sentCount -= sent.length;
         }
 
+        private float screenLevel = -1f;
+
+        /** Updates screen brightness ([0..1], or <0 for unscaled); marks dirty on >=4% change. */
+        void setScreenBrightness(float level) {
+            float next = (!Float.isFinite(level) || level < 0f) ? -1f : Math.min(1f, level);
+            boolean modeFlip = (next < 0f) != (screenLevel < 0f);
+            if (modeFlip || Math.abs(next - screenLevel) >= 0.04f) {
+                screenLevel = next;
+                if (shown != null) dirty = true;
+            }
+        }
+
         private Command display(long now) {
             Look look = shown;
             Command c = new Command(ACTION_DISPLAY, true);
             c.extras.put("effect", classic ? look.classicEffect : "PIPBOY");
             c.extras.put("color", look.color);
             c.extras.put("colorRight", look.color);
-            c.extras.put("intensity", classic ? look.classicIntensity : look.intensity);
+            c.extras.put("intensity", scaleIntensity(classic ? look.classicIntensity : look.intensity, screenLevel));
             c.extras.put("intensityScale", 255);
             c.extras.put("speed", classic ? look.classicSpeed : 0.5f);
             c.extras.put("priority", look.priority);

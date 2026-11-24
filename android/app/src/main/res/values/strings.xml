@@ -1445,4 +1445,6 @@
     <string name="game_stick_leds_bifrost_off">Leave AYN Thor stick LEDs under Bifrost\'s own control</string>
     <string name="game_companion_hud">Second screen</string>
     <string name="game_companion_drawer">Show on main screen</string>
+    <string name="game_overlay_second_screen">Move dev HUD to second screen</string>
+    <string name="game_bifrost_brightness">Sync stick LEDs to screen brightness</string>
 </resources>

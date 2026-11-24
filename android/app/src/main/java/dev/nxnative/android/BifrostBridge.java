@@ -10,6 +10,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Process;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +24,21 @@ final class BifrostBridge {
     private static final String OOT_TITLE_ID = "0400486024DEC000";
     private static final String AOI_TITLE_ID = "04003F40232DE000";
     private static volatile BifrostBridge current;
+    static volatile boolean syncScreenBrightness = true;
+    static volatile int lastScreenPct = -1;
+
+    static float readScreenBrightness(Context ctx) {
+        try {
+            int raw = Settings.System.getInt(ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, -1);
+            if (raw < 0) return -1f;
+            float denom = raw <= 255 ? 255f : (raw <= 1023 ? 1023f : 4095f);
+            float norm = Math.max(0f, Math.min(1f, raw / denom));
+            lastScreenPct = Math.round(norm * 100f);
+            return norm;
+        } catch (RuntimeException e) {
+            return -1f;
+        }
+    }
 
     private final Context context;
     private final BifrostLooks.Feed feed;
@@ -78,7 +94,9 @@ final class BifrostBridge {
                     long now = SystemClock.elapsedRealtime();
                     List<BifrostLooks.Command> cmds;
                     String reason;
+                    float bri = syncScreenBrightness ? readScreenBrightness(context) : -1f;
                     synchronized (feed) {
+                        feed.setScreenBrightness(bri);
                         cmds = feed.poll(now, have ? state : null);
                         reason = feed.muteReason(now);
                     }

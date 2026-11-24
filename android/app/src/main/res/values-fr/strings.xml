@@ -1369,4 +1369,6 @@
     <string name="game_stick_leds_bifrost_off">Laisser Bifrost gérer les LED des sticks sur AYN Thor</string>
     <string name="game_companion_hud">Second écran</string>
     <string name="game_companion_drawer">Afficher sur l’écran principal</string>
+    <string name="game_overlay_second_screen">Déplacer le HUD dev sur le second écran</string>
+    <string name="game_bifrost_brightness">Synchroniser les LEDs avec la luminosité</string>
 </resources>

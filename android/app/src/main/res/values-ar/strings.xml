@@ -1390,4 +1390,6 @@
     <string name="game_stick_leds_bifrost_off">ترك إضاءة العصي على AYN Thor تحت تحكم Bifrost نفسه</string>
     <string name="game_companion_hud">الشاشة الثانية</string>
     <string name="game_companion_drawer">إظهار على الشاشة الرئيسية</string>
+    <string name="game_overlay_second_screen">نقل معلومات المطور إلى الشاشة الثانية</string>
+    <string name="game_bifrost_brightness">مزامنة إضاءة العصي مع سطوع الشاشة</string>
 </resources>

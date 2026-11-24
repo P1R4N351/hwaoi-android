@@ -1369,4 +1369,6 @@
     <string name="game_stick_leds_bifrost_off">Dejar los LED del AYN Thor bajo el control propio de Bifrost</string>
     <string name="game_companion_hud">Segunda pantalla</string>
     <string name="game_companion_drawer">Mostrar en pantalla principal</string>
+    <string name="game_overlay_second_screen">Mover HUD de rendimiento a segunda pantalla</string>
+    <string name="game_bifrost_brightness">Sincronizar LEDs con brillo de pantalla</string>
 </resources>

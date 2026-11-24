@@ -560,6 +560,19 @@ final class SidePanel extends FrameLayout {
             drawer.setChecked(ga.companionDrawerOpen());
             drawer.setOnCheckedChangeListener((b, on) -> ga.companionDrawer(on));
             box.addView(drawer);
+            CheckBox ovSecond = new CheckBox(act);
+            ovSecond.setText(Tx.s(R.string.game_overlay_second_screen));
+            ovSecond.setChecked(Prefs.overlayOnSecondScreen(act));
+            ovSecond.setOnCheckedChangeListener((b, on) -> Prefs.overlayOnSecondScreen(act, on));
+            box.addView(ovSecond);
+            CheckBox stickSync = new CheckBox(act);
+            stickSync.setText(Tx.s(R.string.game_bifrost_brightness));
+            stickSync.setChecked(Prefs.bifrostScreenSync(act));
+            stickSync.setOnCheckedChangeListener((b, on) -> {
+                Prefs.bifrostScreenSync(act, on);
+                BifrostBridge.syncScreenBrightness = on;
+            });
+            box.addView(stickSync);
         }
         final boolean allHidden = Prefs.clean(act);
         Button clean = actionButton(Tx.s(allHidden ? R.string.game_show_everything : R.string.game_hide_everything_clean_picture), false);

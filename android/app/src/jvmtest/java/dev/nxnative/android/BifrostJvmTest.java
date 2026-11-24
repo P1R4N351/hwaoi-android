@@ -140,11 +140,48 @@ public final class BifrostJvmTest {
         check(tcmds.size() == 1 && BifrostLooks.ACTION_PULSE.equals(tcmds.get(0).action), "touch emits ACTION_PULSE");
     }
 
+    private static void testScreenBrightnessScaling() {
+        check(BifrostLooks.scaleIntensity(200, 0.0f) == 0, "0% brightness -> 0 intensity");
+        check(BifrostLooks.scaleIntensity(200, 1.0f) == 200, "100% brightness -> base intensity");
+        check(BifrostLooks.scaleIntensity(200, -1.0f) == 200, "negative disables scaling");
+        check(BifrostLooks.scaleIntensity(200, Float.NaN) == 200, "NaN disables scaling");
+        int b20 = BifrostLooks.scaleIntensity(200, 0.20f);
+        int b50 = BifrostLooks.scaleIntensity(200, 0.50f);
+        int b100 = BifrostLooks.scaleIntensity(200, 1.0f);
+        check(b20 > 0 && b20 < b50 && b50 < b100, "monotonic brightness scaling");
+
+        BifrostLooks.Feed feed = new BifrostLooks.Feed(false, true);
+        BifrostLooks.State s = new BifrostLooks.State();
+        s.inGame = true;
+        feed.setScreenBrightness(0.25f);
+        feed.poll(1000L, s);
+        List<BifrostLooks.Command> c0 = feed.poll(1125L, s);
+        check(c0.size() == 1, "feed displays scaled command");
+        int baseInt = BifrostLooks.AOI_BASE.intensity;
+        int expectLow = BifrostLooks.scaleIntensity(baseInt, 0.25f);
+        check(Integer.valueOf(255).equals(c0.get(0).extras.get("intensityScale")), "intensityScale stays 255");
+        check(Integer.valueOf(expectLow).equals(c0.get(0).extras.get("intensity")), "intensity scaled at 25%");
+
+        feed.setScreenBrightness(0.27f); // < 4% delta (< 500ms heartbeat): hysteresis suppresses extra send
+        check(feed.poll(1475L, s).isEmpty(), "small brightness delta suppressed by hysteresis");
+
+        feed.setScreenBrightness(0.65f); // >= 4% delta (>= 300ms gap, < 500ms heartbeat): marks dirty immediately
+        List<BifrostLooks.Command> c1 = feed.poll(1475L, s);
+        check(c1.size() == 1 && Integer.valueOf(BifrostLooks.scaleIntensity(baseInt, 0.65f)).equals(c1.get(0).extras.get("intensity")),
+                "significant brightness change triggers immediate update");
+
+        feed.setScreenBrightness(-1f);
+        List<BifrostLooks.Command> c2 = feed.poll(1825L, s);
+        check(c2.size() == 1 && Integer.valueOf(baseInt).equals(c2.get(0).extras.get("intensity")),
+                "disabling brightness sync restores full base intensity");
+    }
+
     public static void main(String[] args) {
         testCompanionStateBounds();
         testLookPriorityAndHysteresis();
         testFeedBurstRateFallbackMuteAndStop();
         testAoiPaletteAndTouch();
+        testScreenBrightnessScaling();
         System.out.println("BifrostJvmTest: PASS");
     }
 }

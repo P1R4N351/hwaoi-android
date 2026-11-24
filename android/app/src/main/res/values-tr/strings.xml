@@ -1362,4 +1362,6 @@
     <string name="game_stick_leds_bifrost_off">AYN Thor çubuk LED\'lerini Bifrost\'un kendi denetimine bırak</string>
     <string name="game_companion_hud">İkinci ekran</string>
     <string name="game_companion_drawer">Ana ekranda göster</string>
+    <string name="game_overlay_second_screen">Geliştirici HUD’unu ikinci ekrana taşı</string>
+    <string name="game_bifrost_brightness">Çubuk LED’lerini ekran parlaklığına eşitle</string>
 </resources>

@@ -18,13 +18,16 @@ import android.view.WindowManager;
  */
 final class WarriorsCompanionPresentation extends Presentation {
     private final WarriorsCompanionModel model;
+    private final WarriorsAssetHarvester art;
     private final WarriorsCompanionView.Actions actions;
     private WarriorsCompanionView contentView;
 
     WarriorsCompanionPresentation(
-        Context outerContext, Display display, WarriorsCompanionModel model, WarriorsCompanionView.Actions actions) {
+        Context outerContext, Display display, WarriorsCompanionModel model,
+        WarriorsAssetHarvester art, WarriorsCompanionView.Actions actions) {
         super(outerContext, display);
         this.model = model;
+        this.art = art;
         this.actions = actions;
     }
 
@@ -54,7 +57,7 @@ final class WarriorsCompanionPresentation extends Presentation {
             Runnable apply = () -> decor.setSystemUiVisibility(vis);
             apply.run();
         }
-        contentView = new WarriorsCompanionView(getContext(), model, actions);
+        contentView = new WarriorsCompanionView(getContext(), model, art, actions);
         setContentView(contentView);
     }
 }

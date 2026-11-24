@@ -21,6 +21,9 @@ public final class WarriorsCompanionModel {
     public int trailCount, seqTag = -1, seqStep, seqCount, keepCount;
     public boolean inGame, writeSafe, moviePlaying, hostPaused, saveBusy, seqActive, inputActive;
     public boolean headingUp = true, macroMode = true, autoDim = true;
+    public boolean devOnStatus = true, stickSync = true, hasBackdrop, hasEmblem, hasLiveMinimap;
+    public int screenBrightnessPct = -1, mapCropMode = 1;
+    public String devBuildTag = "", devOverlayText = "", assetSource = "NONE";
     public float posX, posY, posZ, yawDeg, fps, frameMs;
     public final float[] trailX = new float[TRAIL_CAP], trailY = new float[TRAIL_CAP], trailZ = new float[TRAIL_CAP];
     public final boolean[] pinActive = new boolean[PIN_CAP];
@@ -207,7 +210,7 @@ public final class WarriorsCompanionModel {
 
     public static String tabName(int t) {
         switch (t) {
-            case TAB_TACTICAL: return "RADAR";
+            case TAB_TACTICAL: return "MAP";
             case TAB_COMMAND: return "ACTIONS";
             case TAB_GRIMOIRE: return "COMBOS";
             case TAB_LEDGER: return "STATUS";
@@ -276,6 +279,29 @@ public final class WarriorsCompanionModel {
             case 2: return "STUN"; case 3: return "SWEEP";
             case 4: return "VORTEX"; default: return "FINISHER";
         }
+    }
+
+
+    public void cycleMapCrop() { mapCropMode = (mapCropMode + 1) % 3; }
+    public String mapCropLabel() {
+        return mapCropMode == 0 ? "TIGHT" : (mapCropMode == 2 ? "WIDE" : "NORMAL");
+    }
+
+    public float fpsOnePercentLow() {
+        if (fpsHistCount <= 0) return 0f;
+        float min1 = Float.MAX_VALUE, min2 = Float.MAX_VALUE;
+        int start = (fpsHistHead + FPS_CAP - fpsHistCount) % FPS_CAP;
+        for (int i = 0; i < fpsHistCount; i++) {
+            float v = fpsHist[(start + i) % FPS_CAP];
+            if (v < min1) { min2 = min1; min1 = v; }
+            else if (v < min2) { min2 = v; }
+        }
+        return fpsHistCount >= 4 ? min2 : (min1 == Float.MAX_VALUE ? 0f : min1);
+    }
+
+    public String stickSyncLabel() {
+        if (!stickSync) return "OFF";
+        return screenBrightnessPct >= 0 ? ("ON (" + screenBrightnessPct + "%)") : "ON";
     }
 
     private static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }

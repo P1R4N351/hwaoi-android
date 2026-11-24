@@ -81,9 +81,34 @@ public final class WarriorsCompanionJvmTest {
         check(CompanionDisplay.select(externalOnly, "QCM", true) == 5, "external opt-in selects first usable");
     }
 
+    private static void testCropAndStatusTelemetry() {
+        WarriorsCompanionModel m = new WarriorsCompanionModel();
+        check(m.devOnStatus && m.stickSync, "status overlay migration and stick sync default ON");
+        check("NORMAL".equals(m.mapCropLabel()), "default map crop is NORMAL");
+        m.cycleMapCrop(); check("WIDE".equals(m.mapCropLabel()), "crop cycles to WIDE");
+        m.cycleMapCrop(); check("TIGHT".equals(m.mapCropLabel()), "crop cycles to TIGHT");
+        m.cycleMapCrop(); check("NORMAL".equals(m.mapCropLabel()), "crop cycles back to NORMAL");
+
+        m.screenBrightnessPct = 42;
+        check("ON (42%)".equals(m.stickSyncLabel()), "stick sync label reports brightness percentage");
+        m.stickSync = false;
+        check("OFF".equals(m.stickSyncLabel()), "stick sync OFF label");
+
+        int[] ints = new int[WarriorsCompanionModel.DETAIL_INTS];
+        float[] flts = new float[WarriorsCompanionModel.DETAIL_FLOATS];
+        ints[0] = CompanionState.READY; ints[1] = 1; ints[2] = 1;
+        float[] samples = {30.0f, 22.0f, 31.0f, 25.0f, 30.0f};
+        for (int i = 0; i < samples.length; i++) {
+            flts[4] = samples[i];
+            m.update(ints, flts, "", 1000L + i * 50L);
+        }
+        check(Math.abs(m.fpsOnePercentLow() - 25.0f) < 1e-4f, "fpsOnePercentLow tracks second-lowest sample");
+    }
+
     public static void main(String[] args) {
         testModelUnpackProjectionAndDim();
         testDisplayClassification();
+        testCropAndStatusTelemetry();
         System.out.println("WarriorsCompanionJvmTest: PASS");
     }
 }

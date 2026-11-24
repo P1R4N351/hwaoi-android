@@ -1355,4 +1355,6 @@
     <string name="game_stick_leds_bifrost_off">由 Bifrost 自行控制 AYN Thor 摇杆灯效</string>
     <string name="game_companion_hud">副屏</string>
     <string name="game_companion_drawer">在主屏幕显示</string>
+    <string name="game_overlay_second_screen">将性能信息移至副屏</string>
+    <string name="game_bifrost_brightness">摇杆灯效随屏幕亮度同步</string>
 </resources>
