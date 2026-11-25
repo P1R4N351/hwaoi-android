@@ -228,8 +228,10 @@ final class WarriorsCompanionDraw {
     private void drawAnchored(Canvas c, WarriorsCompanionLayout.Slot s, Bitmap b, float k, long now) {
         float a = alpha * s.alpha(now);
         if (a <= VIS_EPS || k <= 0f || b == null || b.isRecycled()) return;
-        float l = s.left(now), t = s.top(now);
-        dstF.set(l, t, l + b.getWidth() * k, t + b.getHeight() * k);
+        // The stream's rect grows and shrinks at its left and around its row (the marker's glow); its right edge is the game
+        // screen's. Anchored right and on the row's centre, a narrower frame does not jump toward the middle.
+        float r = s.right(now), cy = (s.top(now) + s.bottom(now)) * 0.5f, bw = b.getWidth() * k, bh = b.getHeight() * k;
+        dstF.set(r - bw, cy - bh * 0.5f, r, cy + bh * 0.5f);
         drawImage(c, b, a);
     }
 

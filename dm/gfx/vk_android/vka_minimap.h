@@ -783,6 +783,9 @@ static int vka_mm_obj_icon(const float *mn, const float *mx, int32_t cnt) {
         && fabsf(icx - g_vka_mm.learn_obj_icon_x) <= h * 0.08f;
     int near_icon = g_vka_mm.pass_obj_icon && fabsf(cy - g_vka_mm.obj_icon_cy) <= h * 0.06f
         && fabsf(icx - g_vka_mm.obj_icon_cx) <= h * 0.05f;
+    // Once the bar's icon column is known, an icon-shaped sprite elsewhere on its row is not the bar's: the game draws the
+    // same marker over the 3D world, and it crosses that row as the camera turns.
+    if (g_vka_mm.obj_ttl > 0u && !near_learn && !near_text && !near_pill) return 0;
     if (bw >= h * 0.016f || near_text || near_pill) {
         if (!g_vka_mm.pass_obj_icon || bw < g_vka_mm.obj_icon_core_w) {
             g_vka_mm.obj_icon_core_w = bw; g_vka_mm.obj_icon_cx = icx; g_vka_mm.obj_icon_cy = cy;

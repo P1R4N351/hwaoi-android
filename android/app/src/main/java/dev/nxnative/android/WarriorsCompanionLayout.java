@@ -23,8 +23,8 @@ final class WarriorsCompanionLayout {
     static final float GAP = 24f;
 
     /* Header: tab glyph top-left, settings glyph top-right. */
-    static final float HEADER_B = 92f, TAB0_HIT_L = 1040f, TAB_SPLIT = 1128f;   // both tab glyphs sit in the right corner
-    static final float TAB0_CX = 1090f, TAB1_CX = 1166f, NAV_CY = 50f, NAV_RULE_Y = 74f, NAV_RULE_HALF = 28f;
+    static final float HEADER_B = 104f, TAB0_HIT_L = 1040f, TAB_SPLIT = 1128f;   // both tab glyphs sit in the right corner
+    static final float TAB0_CX = 1090f, TAB1_CX = 1166f, NAV_CY = 62f, NAV_RULE_Y = 86f, NAV_RULE_HALF = 28f;
 
     /*
      * Objective: centred on OBJ_CY and as large as OBJ_FIT_W x OBJ_FIT_H allows. Its bitmap carries wide transparent

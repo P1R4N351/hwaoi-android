@@ -500,9 +500,38 @@ static void test_minimap_group_closes(void) {
     vka_minimap_present();
 }
 
+static void test_world_marker_stays(void) {   /* runs right after test_pass_462636: the bar's icon column is learned */
+    float fb_ortho[64]; memset(fb_ortho, 0, sizeof fb_ortho);
+    fb_ortho[8 + 0] = 2.f / 1920.f; fb_ortho[8 + 5] = -2.f / 1080.f; fb_ortho[8 + 10] = 1.f;
+    fb_ortho[8 + 12] = -1.f; fb_ortho[8 + 13] = 1.f; fb_ortho[8 + 15] = 1.f;
+    init_id_m34(&fb_ortho[24]);
+    vtx_idx_pos q_marker[6], q_ring[12];
+    make_quad_vtx(q_marker, 951.f, 478.f, 1020.f, 547.f, 0.f, 0.f);    /* the marker over the 3D world, on the bar's row (measured) */
+    make_quad_vtx(&q_ring[0], 930.f, 457.f, 1041.f, 568.f, 0.f, 0.f);  /* its pulsing ring */
+    make_quad_vtx(&q_ring[6], 930.f, 457.f, 1041.f, 568.f, 0.f, 0.f);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    vka_dstate ds_marker = make_dstate((void *)q_marker, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_ring = make_dstate((void *)q_ring, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_minimap_present();
+    assert(g_vka_mm.obj_ttl > 0u);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+        (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    for (int i = 0; i < 3; i++) {
+        vka_minimap_select_target(1ull, &ds_marker, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == 0 && g_vka_mm.pass_obj_hit == 0);
+    }
+    vka_minimap_select_target(1ull, &ds_ring, 3u, &(p_draw){0, 0, 12, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 0 && g_vka_mm.pass_obj_hit == 0);
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+}
+
 int main(void) {
     test_proj_decode();
     test_pass_462636();
+    test_world_marker_stays();
     test_speech_popup_stays();
     test_menu_dim_stops_capture();
     test_minimap_group_closes();
