@@ -527,9 +527,9 @@ class WarriorsCompanionTests(unittest.TestCase):
         self.assertNotIn('CUTSCENE', draw_src)
         self.assertNotIn('drawRoundRect', draw_src)
         self.assertNotIn('0xF205080A', draw_src)
-        self.assertIn('drawWallFrieze', draw_src)
-        self.assertIn('-90f', draw_src)
-        self.assertIn('c.rotate(', draw_src)
+        self.assertNotIn('drawWallFrieze', draw_src)   # no wall text, side border or scanline overlay on the left and right
+        self.assertNotIn('drawFilter', draw_src)
+        self.assertNotIn('sidePaint', draw_src)
         self.assertIn('vka_mm_ubo_xy_bounds', mm_src)
         draw_c = (REPO / 'dm/gfx/vk_android/vka_draw.c').read_text(encoding='utf-8')
         self.assertIn('vka_mm_find_proj', mm_src)

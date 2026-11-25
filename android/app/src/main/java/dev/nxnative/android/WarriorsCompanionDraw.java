@@ -23,15 +23,12 @@ import java.util.Locale;
  */
 final class WarriorsCompanionDraw {
     static final float LOGIC_W = WarriorsCompanionLayout.LOGIC_W, LOGIC_H = WarriorsCompanionLayout.LOGIC_H;
-    private static final int COL_SIDE_TINT = 0x785CE6C4, COL_FRIEZE_TINT = 0xCC5CE6C4;
     private static final int COL_GLYPH_NAV = 0xFF5CE6C4, COL_GLYPH_OFF = 0xAA7FA39E, COL_GLYPH_DIM = 0xCC5CE6C4;
     private static final float VIS_EPS = 0.004f;
 
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint imgPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint texPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint sidePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-    private final Paint friezePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint glyphNavPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint glyphOffPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint glyphDimPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
@@ -50,8 +47,6 @@ final class WarriorsCompanionDraw {
     private boolean hudScanned;
 
     WarriorsCompanionDraw() {
-        sidePaint.setColorFilter(new PorterDuffColorFilter(COL_SIDE_TINT, PorterDuff.Mode.SRC_IN));
-        friezePaint.setColorFilter(new PorterDuffColorFilter(COL_FRIEZE_TINT, PorterDuff.Mode.SRC_IN));
         glyphNavPaint.setColorFilter(new PorterDuffColorFilter(COL_GLYPH_NAV, PorterDuff.Mode.SRC_IN));
         glyphOffPaint.setColorFilter(new PorterDuffColorFilter(COL_GLYPH_OFF, PorterDuff.Mode.SRC_IN));
         glyphDimPaint.setColorFilter(new PorterDuffColorFilter(COL_GLYPH_DIM, PorterDuff.Mode.SRC_IN));
@@ -72,7 +67,7 @@ final class WarriorsCompanionDraw {
         c.save();
         c.translate(ox, oy);
         c.scale(sc, sc, 0f, 0f);
-        drawChrome(c, filter, borderFrieze, borderEdge, borderSide);
+        drawChrome(c, borderEdge);
         drawTopNav(c, m, glyph, nowMs);
         drawPages(c, m, nowMs);
         float dim = scene.dimT(nowMs);
@@ -134,8 +129,7 @@ final class WarriorsCompanionDraw {
                 ? new BitmapShader(backdrop, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT) : null;
     }
 
-    private void drawChrome(
-        Canvas c, Bitmap filter, Bitmap borderFrieze, Bitmap borderEdge, Bitmap borderSide) {
+    private void drawChrome(Canvas c, Bitmap borderEdge) {
         p.setStyle(Paint.Style.FILL);
         p.setColor(0xFF000000);
         c.drawRect(0f, 0f, LOGIC_W, LOGIC_H, p);
@@ -143,31 +137,11 @@ final class WarriorsCompanionDraw {
             texPaint.setShader(backdropShader);
             c.drawRect(0f, 0f, LOGIC_W, LOGIC_H, texPaint);
         }
-        drawFilter(c, filter);
-        drawBorders(c, borderFrieze, borderEdge, borderSide);
+        drawBorders(c, borderEdge);
     }
 
-    private void drawFilter(Canvas c, Bitmap filter) {
-        if (filter == null || filter.isRecycled()) return;
-        dstRect.set(840, 0, 1240, 1080);
-        c.drawBitmap(filter, null, dstRect, imgPaint);
-        c.save();
-        c.scale(-1f, 1f, 200f, 0f);
-        dstRect.set(0, 0, 400, 1080);
-        c.drawBitmap(filter, null, dstRect, imgPaint);
-        c.restore();
-    }
-
-    private void drawBorders(Canvas c, Bitmap frieze, Bitmap edge, Bitmap side) {
-        if (side != null && !side.isRecycled()) {
-            dstRect.set(20, 0, 116, 1080);
-            c.drawBitmap(side, null, dstRect, sidePaint);
-            c.save();
-            c.scale(-1f, 1f, 1172f, 0f);
-            dstRect.set(1124, 0, 1220, 1080);
-            c.drawBitmap(side, null, dstRect, sidePaint);
-            c.restore();
-        }
+    /** Top and bottom edge bands only: the left and right sides carry no border, wall text or scanline overlay. */
+    private void drawBorders(Canvas c, Bitmap edge) {
         if (edge != null && !edge.isRecycled()) {
             c.save();
             c.scale(1f, -1f, 0f, 42f);
@@ -177,28 +151,6 @@ final class WarriorsCompanionDraw {
             dstRect.set(0, 996, 1240, 1080);
             c.drawBitmap(edge, null, dstRect, imgPaint);
         }
-        drawWallFrieze(c, frieze);
-    }
-
-    private void drawWallFrieze(Canvas c, Bitmap frieze) {
-        if (frieze == null || frieze.isRecycled()) return;
-        int span = 872, thick = 20;
-        int segW = Math.max(140, Math.min(span, Math.round(frieze.getWidth() * ((float) thick / Math.max(1, frieze.getHeight())))));
-        drawWallStrip(c, frieze, 8f, 976f, -90f, span, thick, segW);
-        drawWallStrip(c, frieze, 1232f, 104f, 90f, span, thick, segW);
-    }
-
-    private void drawWallStrip(
-        Canvas c, Bitmap frieze, float tx, float ty, float deg, int span, int thick, int segW) {
-        c.save();
-        c.translate(tx, ty);
-        c.rotate(deg, 0f, 0f);
-        c.clipRect(0, 0, span, thick);
-        for (int x = 0, n = 0; x < span && n < 8; x += segW, n++) {
-            dstRect.set(x, 0, x + segW, thick);
-            c.drawBitmap(frieze, null, dstRect, friezePaint);
-        }
-        c.restore();
     }
 
     private void drawTopNav(Canvas c, WarriorsCompanionModel m, Bitmap glyph, long now) {

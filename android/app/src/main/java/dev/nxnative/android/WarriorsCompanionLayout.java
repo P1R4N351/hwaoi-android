@@ -43,6 +43,8 @@ final class WarriorsCompanionLayout {
     static final long RESCAN_MS = 250L;
     static final float MAP_TOP = FRAME_T + OBJ_BAND_H + GAP;
     static final float HUD_LEFT = 16f, HUD_TOP = 24f;   // the column runs from the top-left corner along the screen's left edge
+    // A cluster that sits at the very bottom of the game's left strip (the KO counter) is pinned to the bottom-left corner.
+    static final float HUD_BOTTOM = LOGIC_H - 24f, BOTTOM_ANCHOR = 0.12f;
     static final float MAP_RING = 2f, MAP_APPEAR_SHRINK = 0.04f;
     static final int MAP_RING_COLOR = 0x705CE6C4;
 
@@ -110,28 +112,38 @@ final class WarriorsCompanionLayout {
      * Writes destination rects (4 floats per cluster, indexed like the source) and returns the stack bottom.
      */
     static float fitClusters(ClusterHold h, int[] idx, int n, float[] scale, float[] out) {
-        float bottom = HUD_TOP;
         for (int k = 0; k < n; k++) scale[k] = HUD_MAX_UPSCALE;
-        bottom = fitPass(h, idx, n, scale, out);
-        // Overflow is taken from the bottom up: the lowest cluster gives way first (to half its size at most), then the one
-        // above it, so a cluster appearing low in the column (a KO counter, combo messages) never shrinks what is above.
-        for (int k = n - 1; k >= 1 && bottom > FRAME_B + 1e-3f; k--) {
+        int m = (n > 0 && h.anchoredBottom(idx[n - 1])) ? n - 1 : n;   // the pinned cluster is not part of the stack
+        float bottom = fitPass(h, idx, m, scale, out), limit = FRAME_B;
+        if (m < n) {
+            int i = idx[n - 1];
+            float w = h.width(i), ht = h.height(i);
+            float s = m > 0 ? Math.min(HUD_MAX_UPSCALE, scale[0]) : HUD_MAX_UPSCALE;
+            if (w > 0f) s = Math.min(s, (hudColumnRight() - HUD_LEFT) / w);
+            scale[n - 1] = s;
+            float top = HUD_BOTTOM - ht * s;
+            out[i * 4] = HUD_LEFT; out[i * 4 + 1] = top; out[i * 4 + 2] = HUD_LEFT + w * s; out[i * 4 + 3] = HUD_BOTTOM;
+            limit = top - GAP;
+        }
+        // Overflow is taken from the bottom of the stack up: the lowest cluster gives way first (to half its size at most),
+        // then the one above it, so a cluster appearing low in the column (combo messages) never shrinks what is above.
+        for (int k = m - 1; k >= 1 && bottom > limit + 1e-3f; k--) {
             float hk = h.height(idx[k]) * scale[k];
             if (!(hk > 0f)) continue;
-            float want = Math.max(hk * 0.5f, hk - (bottom - FRAME_B));
+            float want = Math.max(hk * 0.5f, hk - (bottom - limit));
             scale[k] *= want / hk;
-            bottom = fitPass(h, idx, n, scale, out);
+            bottom = fitPass(h, idx, m, scale, out);
         }
-        if (bottom > FRAME_B + 1e-3f) {   // still too tall: everything shrinks by one factor
+        if (bottom > limit + 1e-3f) {   // still too tall: the stack shrinks by one factor
             float sum = 0f;
-            for (int k = 0; k < n; k++) sum += h.height(idx[k]) * scale[k];
-            float room = FRAME_B - HUD_TOP - GAP * Math.max(0, n - 1);
+            for (int k = 0; k < m; k++) sum += h.height(idx[k]) * scale[k];
+            float room = limit - HUD_TOP - GAP * Math.max(0, m - 1);
             if (sum > 0f && room > 0f) {
-                for (int k = 0; k < n; k++) scale[k] *= room / sum;
-                bottom = fitPass(h, idx, n, scale, out);
+                for (int k = 0; k < m; k++) scale[k] *= room / sum;
+                bottom = fitPass(h, idx, m, scale, out);
             }
         }
-        return bottom;
+        return m < n ? HUD_BOTTOM : bottom;
     }
 
     private static float fitPass(ClusterHold h, int[] idx, int n, float[] scale, float[] out) {
@@ -310,6 +322,7 @@ final class WarriorsCompanionLayout {
         }
 
         int rowCount() { return rows; }
+        int srcHeight() { return srcH; }
         int rowY(int i) { return i * SCAN_STEP; }
         int count() { return count; }
 
@@ -366,8 +379,10 @@ final class WarriorsCompanionLayout {
         private final float[] wx1 = new float[MAX_CLUSTERS], wy1 = new float[MAX_CLUSTERS];
         private final long[] until = new long[MAX_CLUSTERS], seen = new long[MAX_CLUSTERS];
         private final boolean[] live = new boolean[MAX_CLUSTERS], hit = new boolean[MAX_CLUSTERS];
+        private float srcH;
 
         void ingest(ClusterScan s, long now) {
+            srcH = s.srcHeight();
             for (int i = 0; i < MAX_CLUSTERS; i++) hit[i] = false;
             for (int j = 0; j < s.count(); j++) {
                 int i = match(s.y0[j], s.y1[j]);
@@ -426,6 +441,10 @@ final class WarriorsCompanionLayout {
         }
 
         boolean live(int i) { return live[i]; }
+        /** True for a cluster lying wholly in the lower half of the strip and reaching its bottom BOTTOM_ANCHOR. */
+        boolean anchoredBottom(int i) {
+            return live[i] && srcH > 0f && y0[i] >= srcH * 0.5f && y1[i] >= srcH * (1f - BOTTOM_ANCHOR);
+        }
         float left(int i) { return x0[i]; }
         float top(int i) { return y0[i]; }
         float right(int i) { return x1[i]; }

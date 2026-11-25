@@ -129,6 +129,30 @@ public final class WarriorsCompanionLayoutTest {
         checkClusterFit(h, idx, n, sc, out);
     }
 
+    private static void testPinnedBottomCluster() {
+        WarriorsCompanionLayout.ClusterScan s = new WarriorsCompanionLayout.ClusterScan();
+        WarriorsCompanionLayout.ClusterHold h = new WarriorsCompanionLayout.ClusterHold();
+        int[] idx = new int[WarriorsCompanionLayout.MAX_CLUSTERS];
+        float[] sc = new float[WarriorsCompanionLayout.MAX_CLUSTERS];
+        float[] before = new float[4 * WarriorsCompanionLayout.MAX_CLUSTERS], after = new float[4 * WarriorsCompanionLayout.MAX_CLUSTERS];
+        int[] px = hudStrip(true, 274);
+        s.scan(px, HUD_W, HUD_H); h.ingest(s, 0L);
+        int n0 = h.order(idx), top = idx[0];
+        WarriorsCompanionLayout.fitClusters(h, idx, n0, sc, before);
+        check(!h.anchoredBottom(idx[n0 - 1]), "a mid-strip list is not pinned");
+        for (int y = 1001; y < 1053; y++) for (int x = 52; x < 256; x++) px[y * HUD_W + x] = 0xFFE0E0E0;   // KO counter, measured
+        s.scan(px, HUD_W, HUD_H); h.ingest(s, 250L);
+        int n1 = h.order(idx), ko = idx[n1 - 1];
+        check(n1 == n0 + 1 && h.anchoredBottom(ko), "a block at the strip's bottom is the pinned cluster");
+        float bottom = WarriorsCompanionLayout.fitClusters(h, idx, n1, sc, after);
+        check(Math.abs(after[ko * 4] - WarriorsCompanionLayout.HUD_LEFT) < E && Math.abs(after[ko * 4 + 3] - WarriorsCompanionLayout.HUD_BOTTOM) < E
+                && Math.abs(bottom - WarriorsCompanionLayout.HUD_BOTTOM) < E, "pinned to the bottom-left corner");
+        boolean same = true;
+        for (int k = 0; k < 4; k++) same &= Math.abs(before[top * 4 + k] - after[top * 4 + k]) < E;
+        check(same, "the pinned cluster does not move or shrink the top cluster");
+        for (int k = 0; k < n1 - 1; k++) check(after[idx[k] * 4 + 3] <= after[ko * 4 + 1] - WarriorsCompanionLayout.GAP + E, "stack stays above the pinned cluster");
+    }
+
     private static void testClusterHold() {
         WarriorsCompanionLayout.ClusterScan s = new WarriorsCompanionLayout.ClusterScan();
         WarriorsCompanionLayout.ClusterHold h = new WarriorsCompanionLayout.ClusterHold();
@@ -375,6 +399,7 @@ public final class WarriorsCompanionLayoutTest {
         testClusterDetection();
         testClusterFit();
         testClusterHold();
+        testPinnedBottomCluster();
         testSceneSequencing();
         float[] r = new float[4];
         WarriorsCompanionLayout.mapRect(0f, r);
