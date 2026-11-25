@@ -1528,7 +1528,8 @@ static int ktgl_chunk(uint64_t fp, uint64_t kc[4], uint64_t *ra, int max) {
         if (plat_mem_read(fp, w, sizeof w)) break;
         if (ra && n < max) ra[n++] = w[1];
         uint32_t ins[2] = {0, 0};
-        if ((w[1] & 3u) == 0u && !plat_mem_read(w[1] - 4u, ins, sizeof ins) && ins[0] == 0xd63f0100u && ins[1] == 0xa97f27a8u) {
+        uint64_t r = w[1] & UINT64_C(0x7fffffffff);   // the game signs its return addresses: the signature sits above the 39 address bits
+        if ((r & 3u) == 0u && !plat_mem_read(r - 4u, ins, sizeof ins) && ins[0] == 0xd63f0100u && ins[1] == 0xa97f27a8u) {
             uint64_t q[3] = {0, 0, 0}, cur = 0;
             if (!plat_mem_read(w[0] - 0x30u, q, sizeof q) && !plat_mem_read(w[0] - 0x10u, &cur, sizeof cur)) { kc[0] = q[0]; kc[1] = q[1]; kc[2] = q[2]; kc[3] = cur; }
             if (!ra) break;
