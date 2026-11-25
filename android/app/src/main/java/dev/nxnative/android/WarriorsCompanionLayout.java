@@ -37,7 +37,9 @@ final class WarriorsCompanionLayout {
      * content and scaled up into the space left of the minimap circle, stacked top-down. The minimap is centred
      * in what a HUD_COL_W column leaves; clusters may reach further right where the circle curves away.
      */
-    static final float HUD_COL_W = 400f, HUD_MAX_UPSCALE = 3f;
+    // Every left-HUD cluster is drawn between HUD_MIN_SCALE and HUD_MAX_UPSCALE of its size in the game: a narrow one
+    // (an ally pill, the button guide) is not blown up to the column's width, and none is squeezed below the game's size.
+    static final float HUD_COL_W = 400f, HUD_MAX_UPSCALE = 1.6f, HUD_MIN_SCALE = 1f;
     static final int SCAN_STEP = 4, SCAN_ALPHA = 24, SCAN_MIN_GAP = 16, SCAN_PAD = 4, SCAN_MIN_AREA = 256;
     static final int MAX_CLUSTERS = 8, MAX_SCAN_ROWS = 512, MAX_SCAN_WIDTH = 2048, FIT_ITERS = 8;
     static final long RESCAN_MS = 250L;
@@ -125,12 +127,13 @@ final class WarriorsCompanionLayout {
             out[i * 4] = HUD_LEFT; out[i * 4 + 1] = top; out[i * 4 + 2] = HUD_LEFT + w * s; out[i * 4 + 3] = HUD_BOTTOM;
             limit = top - GAP;
         }
-        // Overflow is taken from the bottom of the stack up: the lowest cluster gives way first (to half its size at most),
+        // Overflow is taken from the bottom of the stack up: the lowest cluster gives way first (to HUD_MIN_SCALE at most),
         // then the one above it, so a cluster appearing low in the column (combo messages) never shrinks what is above.
         for (int k = m - 1; k >= 1 && bottom > limit + 1e-3f; k--) {
             float hk = h.height(idx[k]) * scale[k];
             if (!(hk > 0f)) continue;
-            float want = Math.max(hk * 0.5f, hk - (bottom - limit));
+            float floor = h.height(idx[k]) * Math.min(scale[k], HUD_MIN_SCALE);
+            float want = Math.max(floor, hk - (bottom - limit));
             scale[k] *= want / hk;
             bottom = fitPass(h, idx, m, scale, out);
         }

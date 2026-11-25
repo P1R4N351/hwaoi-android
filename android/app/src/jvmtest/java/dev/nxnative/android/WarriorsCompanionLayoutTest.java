@@ -153,6 +153,26 @@ public final class WarriorsCompanionLayoutTest {
         for (int k = 0; k < n1 - 1; k++) check(after[idx[k] * 4 + 3] <= after[ko * 4 + 1] - WarriorsCompanionLayout.GAP + E, "stack stays above the pinned cluster");
     }
 
+    private static void testClusterSizeLimits() {
+        WarriorsCompanionLayout.ClusterScan s = new WarriorsCompanionLayout.ClusterScan();
+        WarriorsCompanionLayout.ClusterHold h = new WarriorsCompanionLayout.ClusterHold();
+        int[] idx = new int[WarriorsCompanionLayout.MAX_CLUSTERS];
+        float[] sc = new float[WarriorsCompanionLayout.MAX_CLUSTERS], out = new float[4 * WarriorsCompanionLayout.MAX_CLUSTERS];
+        int[] px = new int[HUD_W * HUD_H];
+        for (int y = 40; y < 80; y++) for (int x = 80; x < 140; x++) px[y * HUD_W + x] = 0xFFE0E0E0;      // a narrow pill-like cluster
+        for (int y = 200; y < 330; y++) for (int x = 40; x < 190; x++) px[y * HUD_W + x] = 0xFFE0E0E0;    // a button-guide-like cluster
+        s.scan(px, HUD_W, HUD_H); h.ingest(s, 0L);
+        int n = h.order(idx);
+        WarriorsCompanionLayout.fitClusters(h, idx, n, sc, out);
+        check(n == 2, "two clusters");
+        for (int k = 0; k < n; k++) {
+            int i = idx[k];
+            float drawn = (out[i * 4 + 2] - out[i * 4]) / h.width(i);
+            check(drawn <= WarriorsCompanionLayout.HUD_MAX_UPSCALE + 1e-3f, "cluster " + k + " not above the maximum scale");
+            check(drawn >= WarriorsCompanionLayout.HUD_MIN_SCALE - 1e-3f, "cluster " + k + " not below the minimum scale");
+        }
+    }
+
     private static void testClusterHold() {
         WarriorsCompanionLayout.ClusterScan s = new WarriorsCompanionLayout.ClusterScan();
         WarriorsCompanionLayout.ClusterHold h = new WarriorsCompanionLayout.ClusterHold();
@@ -400,6 +420,7 @@ public final class WarriorsCompanionLayoutTest {
         testClusterFit();
         testClusterHold();
         testPinnedBottomCluster();
+        testClusterSizeLimits();
         testSceneSequencing();
         float[] r = new float[4];
         WarriorsCompanionLayout.mapRect(0f, r);

@@ -97,7 +97,8 @@ static struct {
 };
 
 static struct {
-    int on, valid, hb; char cls; int32_t cnt; uint32_t stt, sref, blend, mask, seq; float mn[2], mx[2];
+    int on, valid, hb; char cls; int32_t cnt; uint32_t stt, sref, blend, mask, seq, mbase; float mn[2], mx[2];
+    uint64_t ua, usz;   // the uniform block the draw's sprite matrices were read from: one per layout (widget) instance
 } g_vka_mm_tr;
 
 static int vka_mm_supported_fmt(VkFormat fmt) {
@@ -525,6 +526,7 @@ static int vka_mm_ubo_xy_bounds(
     uint64_t ua = 0u, usz = 0u;
     uint32_t m_base = 0u;
     if (!vka_mm_find_proj(d, (idx_loc >= 0 || nc0 < 2), p, vp, &ua, &usz, &m_base)) return 0;
+    g_vka_mm_tr.ua = ua; g_vka_mm_tr.usz = usz; g_vka_mm_tr.mbase = m_base;
     int32_t lim = cnt < 256 ? cnt : 256, last_idx = -1;
     for (int32_t i = 0; i < lim; i++) {
         int32_t v = cnt <= 256 ? i : (int32_t)(((int64_t)i * cnt) / lim);
@@ -815,11 +817,12 @@ static void vka_minimap_trace_draw(uint64_t vsk, uint64_t fsk, const vka_img *t0
     (void)vsk; (void)fsk; (void)t0; (void)ntex;   // read only by the log line
     if (!g_vka_mm_tr.on || !g_vka_mm_tr.valid) return;
     g_vka_mm_tr.valid = 0;
-    VLOG("mm trace f%llu d%u: cls %c vs %016llx fs %016llx cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d",
+    VLOG("mm trace f%llu d%u: cls %c vs %016llx fs %016llx cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d ubo %llx+%llu m%u",
          (unsigned long long)vka_frame(), g_vka_mm_tr.seq++, g_vka_mm_tr.cls, (unsigned long long)vsk, (unsigned long long)fsk,
          g_vka_mm_tr.cnt, g_vka_mm_tr.stt, g_vka_mm_tr.sref, g_vka_mm_tr.blend, g_vka_mm_tr.mask, g_vka_mm_tr.hb,
          g_vka_mm_tr.mn[0], g_vka_mm_tr.mn[1], g_vka_mm_tr.mx[0], g_vka_mm_tr.mx[1],
-         t0 ? t0->w : 0u, t0 ? t0->h : 0u, t0 ? t0->levels : 0u, (unsigned long long)(t0 ? t0->serial : 0u), ntex);
+         t0 ? t0->w : 0u, t0 ? t0->h : 0u, t0 ? t0->levels : 0u, (unsigned long long)(t0 ? t0->serial : 0u), ntex,
+         (unsigned long long)g_vka_mm_tr.ua, (unsigned long long)g_vka_mm_tr.usz, g_vka_mm_tr.mbase);
 }
 
 static int vka_minimap_select_target(
@@ -827,7 +830,7 @@ static int vka_minimap_select_target(
     int mesh, uint64_t ind, uint32_t stt, uint32_t dt, uint32_t c0_mask, uint32_t blend_en) {
     if (!g_vka_mm.in_hud_pass) return 0;
     int32_t cnt = dw ? dw->count : (di ? di->count : 0);
-    g_vka_mm_tr.valid = 1; g_vka_mm_tr.hb = 0; g_vka_mm_tr.cls = 'x'; g_vka_mm_tr.cnt = cnt; g_vka_mm_tr.stt = stt;
+    g_vka_mm_tr.valid = 1; g_vka_mm_tr.hb = 0; g_vka_mm_tr.cls = 'x'; g_vka_mm_tr.ua = 0u; g_vka_mm_tr.usz = 0u; g_vka_mm_tr.mbase = 0u; g_vka_mm_tr.cnt = cnt; g_vka_mm_tr.stt = stt;
     g_vka_mm_tr.sref = d->st_ref[0]; g_vka_mm_tr.blend = blend_en; g_vka_mm_tr.mask = c0_mask;
     if (mesh || ind || dt != 0u || d->nattr < 1) return vka_mm_switch_target(cb, 0);
     float mn[2] = {0}, mx[2] = {0};
