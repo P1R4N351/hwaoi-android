@@ -246,6 +246,7 @@ int vka_cpu_read(uint64_t addr, void *out, size_t n) {
 
 #define VLOG(...) ((void)0)
 #define VKA_ENV(key, def) (def)
+int dm_ktgl_tag_get(uint64_t ubo, uint64_t *chunk, uint32_t *off, uint32_t *len) { (void)ubo; (void)chunk; (void)off; (void)len; return 0; }
 #include "vka_minimap.h"
 
 typedef struct { float x, y, z, idx; } vtx_idx_pos;

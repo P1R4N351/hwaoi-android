@@ -34,6 +34,7 @@ uint64_t vka_done(void);
 uint64_t vka_fence_queued(void);
 int vka_origin_ll(void);
 int vka_cpu_read(uint64_t addr, void *out, size_t n);
+int dm_ktgl_tag_get(uint64_t ubo, uint64_t *chunk, uint32_t *off, uint32_t *len);   // hle_nvn.c: the draw's display-list chunk (DM_KTGL_TAG)
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; } vka_mm_slot;
 typedef struct { uint32_t w, h; VkFormat fmt; uint64_t serial; } vka_mm_cand;
@@ -815,14 +816,16 @@ static int vka_mm_is_obj_draw(const float *mn, const float *mx, int32_t cnt) {
 // cls: x pre-filter, b no bounds, F opaque fullscreen, S stencil mask, M modal/masked, m minimap, l left HUD, o objective, - main.
 static void vka_minimap_trace_draw(uint64_t vsk, uint64_t fsk, const vka_img *t0, int ntex) {
     (void)vsk; (void)fsk; (void)t0; (void)ntex;   // read only by the log line
+    uint64_t kch = 0u; uint32_t koff = 0u, klen = 0u;
+    (void)dm_ktgl_tag_get(g_vka_mm_tr.ua, &kch, &koff, &klen);
     if (!g_vka_mm_tr.on || !g_vka_mm_tr.valid) return;
     g_vka_mm_tr.valid = 0;
-    VLOG("mm trace f%llu d%u: cls %c vs %016llx fs %016llx cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d ubo %llx+%llu m%u",
+    VLOG("mm trace f%llu d%u: cls %c vs %016llx fs %016llx cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d ubo %llx+%llu m%u kt %llx+%u/%u",
          (unsigned long long)vka_frame(), g_vka_mm_tr.seq++, g_vka_mm_tr.cls, (unsigned long long)vsk, (unsigned long long)fsk,
          g_vka_mm_tr.cnt, g_vka_mm_tr.stt, g_vka_mm_tr.sref, g_vka_mm_tr.blend, g_vka_mm_tr.mask, g_vka_mm_tr.hb,
          g_vka_mm_tr.mn[0], g_vka_mm_tr.mn[1], g_vka_mm_tr.mx[0], g_vka_mm_tr.mx[1],
          t0 ? t0->w : 0u, t0 ? t0->h : 0u, t0 ? t0->levels : 0u, (unsigned long long)(t0 ? t0->serial : 0u), ntex,
-         (unsigned long long)g_vka_mm_tr.ua, (unsigned long long)g_vka_mm_tr.usz, g_vka_mm_tr.mbase);
+         (unsigned long long)g_vka_mm_tr.ua, (unsigned long long)g_vka_mm_tr.usz, g_vka_mm_tr.mbase, (unsigned long long)kch, koff, klen);
 }
 
 static int vka_minimap_select_target(

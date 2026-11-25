@@ -1514,26 +1514,72 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
 // Draws carry the indirect / multi-draw fields (ind onwards) only when they use them: a plain indexed draw record is 0x28 bytes instead of 0x40 (nvn_obj.h draw_rec)
 // DM_NVN_DRAW_BT=<n> (diagnostic, live): the next n recorded draws log their count and the return addresses above the NVN call
 // (host frames first, then the game's), to find which game routine issues a given widget's draws.
+static __thread uint64_t t_dbt_ubo[4];   // this thread's last vertex-stage uniform blocks 0-3
+
+// KTGL's display-list interpreter, when it is on this thread's stack: kc = context, chunk begin, chunk end, cursor; ra = the
+// return addresses passed on the way (up to max), returns how many. The interpreter's loop is `blr x8` to the opcode's handler
+// then `ldp x8, x9, [x29, #-0x10]` (its cursor): the frame record that returns there is the handler's, and its saved frame
+// pointer is the interpreter's x29 (frame: sp = x29 - 0x50; the queue entry is copied at sp+0x20: context, begin, end).
+static int ktgl_chunk(uint64_t fp, uint64_t kc[4], uint64_t *ra, int max) {
+    int n = 0;
+    kc[0] = kc[1] = kc[2] = kc[3] = 0;
+    for (int i = 0; i < 20 && fp && !(fp & 7); i++) {
+        uint64_t w[2];
+        if (plat_mem_read(fp, w, sizeof w)) break;
+        if (ra && n < max) ra[n++] = w[1];
+        uint32_t ins[2] = {0, 0};
+        if ((w[1] & 3u) == 0u && !plat_mem_read(w[1] - 4u, ins, sizeof ins) && ins[0] == 0xd63f0100u && ins[1] == 0xa97f27a8u) {
+            uint64_t q[3] = {0, 0, 0}, cur = 0;
+            if (!plat_mem_read(w[0] - 0x30u, q, sizeof q) && !plat_mem_read(w[0] - 0x10u, &cur, sizeof cur)) { kc[0] = q[0]; kc[1] = q[1]; kc[2] = q[2]; kc[3] = cur; }
+            if (!ra) break;
+        }
+        if (w[0] <= fp) break;
+        fp = w[0];
+    }
+    return n;
+}
+
+// The widget tag of a draw, from the game's record side to the replay (vka_minimap.h): which display-list chunk the draw came
+// from and where in it. Keyed by the draw's vertex uniform blocks, which the game allocates one per draw per frame.
+// DM_KTGL_TAG=1 (live) turns the record side on; off, the table stays empty and lookups miss.
+enum { KT_N = 16384 };
+static struct { _Atomic uint64_t key; uint64_t chunk; uint32_t off, len; } g_kt[KT_N];
+static void ktgl_tag_put(uint64_t ubo, const uint64_t kc[4]) {
+    if (!ubo || !kc[1]) return;
+    size_t i = (size_t)(ubo >> 9) & (KT_N - 1);
+    atomic_store_explicit(&g_kt[i].key, 0u, memory_order_release);
+    g_kt[i].chunk = kc[1]; g_kt[i].off = (uint32_t)(kc[3] - kc[1]); g_kt[i].len = (uint32_t)(kc[2] - kc[1]);
+    atomic_store_explicit(&g_kt[i].key, ubo, memory_order_release);
+}
+int dm_ktgl_tag_get(uint64_t ubo, uint64_t *chunk, uint32_t *off, uint32_t *len) {
+    size_t i = (size_t)(ubo >> 9) & (KT_N - 1);
+    if (!ubo || atomic_load_explicit(&g_kt[i].key, memory_order_acquire) != ubo) return 0;
+    *chunk = g_kt[i].chunk; *off = g_kt[i].off; *len = g_kt[i].len;
+    return atomic_load_explicit(&g_kt[i].key, memory_order_acquire) == ubo;
+}
+
+// DM_NVN_DRAW_BT=<n> (diagnostic, live): the next n recorded draws log their count, uniform blocks, display-list chunk and the
+// return addresses above the NVN call. DM_KTGL_TAG=1: every draw's chunk is tagged for the replay.
 static void rec_draw_bt(int cnt) {
-    static uint32_t tick; static int left; static char last[16];
+    static uint32_t tick; static int left, tag; static char last[16];
     if ((tick++ & 255u) == 0u) {
         const char *e = getenv("DM_NVN_DRAW_BT");
         if (!e || !*e) last[0] = 0;
         else if (strncmp(e, last, sizeof last - 1)) { snprintf(last, sizeof last, "%s", e); left = atoi(e); }
+        const char *t = getenv("DM_KTGL_TAG");
+        tag = t && *t == '1';
     }
+    if (left <= 0 && !tag) return;
+    uint64_t kc[4], ra[14];
+    int n = ktgl_chunk((uint64_t)__builtin_frame_address(0), kc, left > 0 ? ra : NULL, 14);
+    if (tag) for (int i = 0; i < 4; i++) ktgl_tag_put(t_dbt_ubo[i], kc);
     if (left <= 0) return;
     left--;
-    uint64_t fp = (uint64_t)__builtin_frame_address(0), ra[14]; int n = 0;
-    for (int i = 0; i < 20 && n < 14 && fp && !(fp & 7); i++) {
-        uint64_t w[2];
-        if (plat_mem_read(fp, w, sizeof w)) break;
-        ra[n++] = w[1];
-        if (w[0] <= fp) break;
-        fp = w[0];
-    }
     char b[14 * 18 + 4]; size_t o = 0; b[0] = 0;
     for (int i = 0; i < n && o < sizeof b; i++) o += (size_t)snprintf(b + o, sizeof b - o, " %llx", (unsigned long long)ra[i]);
-    LOG("[nvn] dbt cnt %d:%s", cnt, b);
+    LOG("[nvn] dbt cnt %d ubo %llx %llx %llx %llx chunk %llx len %llx off %llx ctx %llx:%s", cnt,
+        (unsigned long long)t_dbt_ubo[0], (unsigned long long)t_dbt_ubo[1], (unsigned long long)t_dbt_ubo[2], (unsigned long long)t_dbt_ubo[3],
+        (unsigned long long)kc[1], (unsigned long long)(kc[2] - kc[1]), (unsigned long long)(kc[3] - kc[1]), (unsigned long long)kc[0], b);
 }
 static void rec_draw(NVNcommandBuffer *c, p_draw d) { rec_draw_bt(d.count); shp_bind(SHK_IND, d.ind, 16); shp_bind(SHK_IND, d.mdi_cnt, 4); size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
 static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) {
@@ -1638,6 +1684,7 @@ static inline void rec_ubo_fast(cmd_t *o, int32_t st, int32_t i, uint64_t a, siz
     }
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+    if (st == NVN_SHADER_STAGE_VERTEX && (unsigned)i < 4u) t_dbt_ubo[i] = (uint64_t)a;
     shp_bind(SHK_UBO, a, n);
     if (vka_enc_fast_on()) { rec_ubo_fast(CB(c), st, i, a, n); return; }
     if ((unsigned)st < 6 && (unsigned)i < 16 && n <= UINT32_MAX) {
