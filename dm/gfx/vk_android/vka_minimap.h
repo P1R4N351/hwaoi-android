@@ -80,7 +80,7 @@ static struct {
     int saw_mm_frame, saw_obj_frame, saw_lhud_frame;
     int in_hud_pass, pass_opaque_fs, pass_modal, pass_dialog;
     int pass_mm_hit, pass_obj_hit, obj_bounds_init, pass_obj_icon, pass_obj_pill, pass_obj_text, cand_obj_text;
-    int pass_lhud_any, pass_lhud_top, nfp, fr_modal;
+    int pass_lhud_any, pass_lhud_top, nfp, fr_modal, mm_open;
     float fp[8][4];   // this frame's foreign panels (vka_mm_note_foreign)
     uint64_t hud_cleared_frame, hud_state_frame, frame_got_mm, frame_got_obj, frame_got_lhud;
     vka_mm_rect hit_mm, hit_obj, prev_hit_obj, hit_lhud;
@@ -273,7 +273,7 @@ static void vka_minimap_pass_begin(
         g_vka_mm.pass_mm_hit = 0; g_vka_mm.pass_obj_hit = 0; g_vka_mm.obj_bounds_init = 0;
         g_vka_mm.pass_obj_icon = 0; g_vka_mm.pass_obj_pill = 0; g_vka_mm.pass_obj_text = 0; g_vka_mm.cand_obj_text = 0;
         g_vka_mm.obj_icon_cx = 0.f; g_vka_mm.obj_icon_core_w = 0.f;
-        g_vka_mm.pass_lhud_any = 0; g_vka_mm.pass_lhud_top = 0; g_vka_mm.nfp = 0; g_vka_mm.fr_modal = 0;
+        g_vka_mm.pass_lhud_any = 0; g_vka_mm.pass_lhud_top = 0; g_vka_mm.nfp = 0; g_vka_mm.fr_modal = 0; g_vka_mm.mm_open = 0;
         g_vka_mm.hud_state_frame = fr; g_vka_mm.hud_state_im = im->img;
     }
     g_vka_mm.pass_area = area; g_vka_mm.main_cview = main_cview; g_vka_mm.main_clayout = main_clayout;
@@ -597,7 +597,7 @@ static void vka_mm_try_minimap(const float *mn, const float *mx) {
     if (x0 + (int32_t)side > (int32_t)g_vka_mm.pass_w) x0 = (int32_t)g_vka_mm.pass_w - (int32_t)side;
     if (y0 + (int32_t)side > (int32_t)g_vka_mm.pass_h) y0 = (int32_t)g_vka_mm.pass_h - (int32_t)side;
     g_vka_mm.hit_mm = (vka_mm_rect){x0, y0, side, side};
-    g_vka_mm.pass_mm_hit = 1;
+    g_vka_mm.pass_mm_hit = 1; g_vka_mm.mm_open = 1;
     g_vka_mm.learn_mm_w = g_vka_mm.pass_w; g_vka_mm.learn_mm_h = g_vka_mm.pass_h;
     g_vka_mm.learn_mm_cx = (int32_t)lrintf(cx); g_vka_mm.learn_mm_cy = (int32_t)lrintf(cy);
     g_vka_mm.learn_mm_half = (int32_t)(side / 2u);
@@ -672,8 +672,12 @@ static int vka_mm_is_mm_draw(const float *mn, const float *mx, uint32_t stt, int
                 && mx[0] - mn[0] < w * 0.98f
                 && fabsf((mn[0] + mx[0]) * 0.5f - ((float)r.x + rx1) * 0.5f) <= 4.f
                 && fabsf((mn[1] + mx[1]) * 0.5f - ((float)r.y + ry1) * 0.5f) <= 4.f) return 1;
-        return mn[0] >= (float)(r.x - 28) && mx[0] <= (float)(r.x + (int32_t)r.w + 28)
+        // The minimap's draws are contiguous. An unstencilled sprite inside its box belongs to it only while that group is
+        // open: the first draw outside the box closes it, so a world-anchored bubble that later drifts over the box stays put.
+        int inside = mn[0] >= (float)(r.x - 28) && mx[0] <= (float)(r.x + (int32_t)r.w + 28)
             && mn[1] >= (float)(r.y - 28) && mx[1] <= (float)(r.y + (int32_t)r.h + 28);
+        if (!inside) g_vka_mm.mm_open = 0;
+        return inside && g_vka_mm.mm_open;
     }
     if (g_vka_mm.mm_ttl > 0u && !g_vka_mm.pass_dialog && stt == 0u && cnt >= 4 && cnt <= 24) {
         float bw = mx[0] - mn[0], bh = mx[1] - mn[1];

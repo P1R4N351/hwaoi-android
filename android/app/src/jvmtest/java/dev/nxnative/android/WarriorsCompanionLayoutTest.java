@@ -85,7 +85,9 @@ public final class WarriorsCompanionLayoutTest {
         for (int k = 0; k < n; k++) {
             int i = idx[k];
             r[0] = out[i * 4]; r[1] = out[i * 4 + 1]; r[2] = out[i * 4 + 2]; r[3] = out[i * 4 + 3];
-            check(inFrame(r) && r[1] >= WarriorsCompanionLayout.HUD_TOP - E, "cluster " + k + " inside the left column");
+            check(r[0] >= WarriorsCompanionLayout.HUD_LEFT - E && r[1] >= WarriorsCompanionLayout.HUD_TOP - E
+                    && r[2] <= WarriorsCompanionLayout.FRAME_R + E && r[3] <= WarriorsCompanionLayout.FRAME_B + E, "cluster " + k + " inside the left column");
+            if (k == 0) check(Math.abs(r[0] - WarriorsCompanionLayout.HUD_LEFT) < E && Math.abs(r[1] - WarriorsCompanionLayout.HUD_TOP) < E, "top cluster in the top-left corner");
             float qx = Math.max(r[0], Math.min(cx, r[2])), qy = Math.max(r[1], Math.min(cy, r[3]));
             float d = (float) Math.hypot(qx - cx, qy - cy);
             check(d >= rad + 8f, "cluster " + k + " clear of the minimap circle: " + (d - rad));
@@ -155,7 +157,7 @@ public final class WarriorsCompanionLayoutTest {
             check(inFrame(map), "minimap inside frame, hud=" + hasHud);
             check(Math.abs((map[2] - map[0]) - (map[3] - map[1])) < E, "minimap bounds are square");
             check(map[1] >= WarriorsCompanionLayout.HEADER_B, "minimap below header");
-            hud[0] = WarriorsCompanionLayout.FRAME_L; hud[1] = WarriorsCompanionLayout.HUD_TOP;
+            hud[0] = WarriorsCompanionLayout.HUD_LEFT; hud[1] = WarriorsCompanionLayout.HUD_TOP;
             hud[2] = WarriorsCompanionLayout.hudColumnRight(); hud[3] = WarriorsCompanionLayout.FRAME_B;
             if (hasHud == 1) {
                 check(map[0] - hud[2] >= WarriorsCompanionLayout.GAP - E, "minimap clear of the hud column");
@@ -177,12 +179,11 @@ public final class WarriorsCompanionLayoutTest {
             check(Math.abs(sw - WarriorsCompanionLayout.OBJ_FIT_W) < E || Math.abs(sh - WarriorsCompanionLayout.OBJ_FIT_H) < E,
                     "objective as large as the fit box allows");
             check(Math.abs(sw / sh - (float) os[0] / os[1]) < 0.01f, "objective keeps its aspect");
-            check(Math.abs((obj[0] + obj[2]) * 0.5f - WarriorsCompanionLayout.CENTER_X) < E, "objective centred");
+            check(Math.abs(obj[2] - WarriorsCompanionLayout.LOGIC_W) < E, "objective comes out of the right edge");
             check(obj[1] >= 4f - E && Math.abs((obj[1] + obj[3]) * 0.5f - Math.max(WarriorsCompanionLayout.OBJ_CY, 4f + sh * 0.5f)) < E,
                     "objective centred on its line");
             check(obj[0] >= 0f && obj[2] <= WarriorsCompanionLayout.LOGIC_W, "objective on screen");
         }
-        if (hud != null) check(hud[1] >= WarriorsCompanionLayout.OBJ_CY + 48f, "hud column starts under the objective's text line");
         check(map[1] >= WarriorsCompanionLayout.FRAME_T + WarriorsCompanionLayout.OBJ_BAND_H, "minimap below the objective band");
     }
 
@@ -206,9 +207,10 @@ public final class WarriorsCompanionLayoutTest {
         check(WarriorsCompanionLayout.statusRowAt(WarriorsCompanionLayout.ROW_LABEL_X,
                 WarriorsCompanionLayout.rowTop(WarriorsCompanionLayout.ROW_COUNT)) == -1, "below rows misses");
         check(WarriorsCompanionLayout.statusRowAt(400f, 200f) == -1, "telemetry column is not a row");
-        check(WarriorsCompanionLayout.headerTabAt(74f, 50f) == 0 && WarriorsCompanionLayout.headerTabAt(1166f, 50f) == 1,
+        check(WarriorsCompanionLayout.headerTabAt(WarriorsCompanionLayout.TAB0_CX, 50f) == 0 && WarriorsCompanionLayout.headerTabAt(WarriorsCompanionLayout.TAB1_CX, 50f) == 1,
                 "header glyphs hit their tabs");
-        check(WarriorsCompanionLayout.headerTabAt(620f, 50f) == -1 && WarriorsCompanionLayout.headerTabAt(74f, 120f) == -1,
+        check(WarriorsCompanionLayout.headerTabAt(620f, 50f) == -1 && WarriorsCompanionLayout.headerTabAt(74f, 50f) == -1
+                && WarriorsCompanionLayout.headerTabAt(WarriorsCompanionLayout.TAB0_CX, 120f) == -1,
                 "header misses");
     }
 

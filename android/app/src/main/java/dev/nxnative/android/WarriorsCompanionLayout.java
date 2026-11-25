@@ -23,8 +23,8 @@ final class WarriorsCompanionLayout {
     static final float GAP = 24f;
 
     /* Header: tab glyph top-left, settings glyph top-right. */
-    static final float HEADER_B = 92f, TAB0_HIT_R = 200f, TAB1_HIT_L = 1040f;
-    static final float TAB0_CX = 74f, TAB1_CX = 1166f, NAV_CY = 50f, NAV_RULE_Y = 74f, NAV_RULE_HALF = 28f;
+    static final float HEADER_B = 92f, TAB0_HIT_L = 1040f, TAB_SPLIT = 1128f;   // both tab glyphs sit in the right corner
+    static final float TAB0_CX = 1090f, TAB1_CX = 1166f, NAV_CY = 50f, NAV_RULE_Y = 74f, NAV_RULE_HALF = 28f;
 
     /*
      * Objective: centred on OBJ_CY and as large as OBJ_FIT_W x OBJ_FIT_H allows. Its bitmap carries wide transparent
@@ -42,7 +42,7 @@ final class WarriorsCompanionLayout {
     static final int MAX_CLUSTERS = 8, MAX_SCAN_ROWS = 512, MAX_SCAN_WIDTH = 2048, FIT_ITERS = 8;
     static final long RESCAN_MS = 250L;
     static final float MAP_TOP = FRAME_T + OBJ_BAND_H + GAP;
-    static final float HUD_TOP = 208f;   // under the objective's text line, above the minimap's top
+    static final float HUD_LEFT = 16f, HUD_TOP = 24f;   // the column runs from the top-left corner along the screen's left edge
     static final float MAP_RING = 2f, MAP_APPEAR_SHRINK = 0.04f;
     static final int MAP_RING_COLOR = 0x705CE6C4;
 
@@ -110,16 +110,26 @@ final class WarriorsCompanionLayout {
      * Writes destination rects (4 floats per cluster, indexed like the source) and returns the stack bottom.
      */
     static float fitClusters(ClusterHold h, int[] idx, int n, float[] scale, float[] out) {
-        float colH = FRAME_B - HUD_TOP, bottom = HUD_TOP;
+        float bottom = HUD_TOP;
         for (int k = 0; k < n; k++) scale[k] = HUD_MAX_UPSCALE;
-        for (int pass = 0; pass < 2; pass++) {
+        bottom = fitPass(h, idx, n, scale, out);
+        // Overflow is taken from the bottom up: the lowest cluster gives way first (to half its size at most), then the one
+        // above it, so a cluster appearing low in the column (a KO counter, combo messages) never shrinks what is above.
+        for (int k = n - 1; k >= 1 && bottom > FRAME_B + 1e-3f; k--) {
+            float hk = h.height(idx[k]) * scale[k];
+            if (!(hk > 0f)) continue;
+            float want = Math.max(hk * 0.5f, hk - (bottom - FRAME_B));
+            scale[k] *= want / hk;
             bottom = fitPass(h, idx, n, scale, out);
+        }
+        if (bottom > FRAME_B + 1e-3f) {   // still too tall: everything shrinks by one factor
             float sum = 0f;
             for (int k = 0; k < n; k++) sum += h.height(idx[k]) * scale[k];
-            float room = colH - GAP * Math.max(0, n - 1);
-            if (bottom <= FRAME_B + 1e-3f || sum <= 0f || room <= 0f) break;
-            float f = room / sum;
-            for (int k = 0; k < n; k++) scale[k] *= f;
+            float room = FRAME_B - HUD_TOP - GAP * Math.max(0, n - 1);
+            if (sum > 0f && room > 0f) {
+                for (int k = 0; k < n; k++) scale[k] *= room / sum;
+                bottom = fitPass(h, idx, n, scale, out);
+            }
         }
         return bottom;
     }
@@ -131,11 +141,11 @@ final class WarriorsCompanionLayout {
             float w = h.width(i), ht = h.height(i);
             float s = k == 0 ? scale[0] : Math.min(scale[k], scale[0]);
             for (int it = 0; it < FIT_ITERS && w > 0f; it++) {
-                s = Math.min(s, (hudFreeRight(y, y + ht * s) - FRAME_L) / w);
+                s = Math.min(s, (hudFreeRight(y, y + ht * s) - HUD_LEFT) / w);
             }
             s = Math.max(0f, s);
             scale[k] = s;
-            out[i * 4] = FRAME_L; out[i * 4 + 1] = y; out[i * 4 + 2] = FRAME_L + w * s; out[i * 4 + 3] = y + ht * s;
+            out[i * 4] = HUD_LEFT; out[i * 4 + 1] = y; out[i * 4 + 2] = HUD_LEFT + w * s; out[i * 4 + 3] = y + ht * s;
             y += ht * s + GAP;
         }
         return n > 0 ? y - GAP : HUD_TOP;
@@ -146,11 +156,11 @@ final class WarriorsCompanionLayout {
         return Math.min(OBJ_FIT_W / bw, OBJ_FIT_H / bh);
     }
 
-    /** Slot for an objective whose (held) source size is bw x bh: centred on (CENTER_X, OBJ_CY). */
+    /** Slot for an objective whose (held) source size is bw x bh: out of the screen's right edge, as on the top screen, on the OBJ_CY line. */
     static boolean objectiveSlot(float bw, float bh, float[] out) {
         float s = objectiveScale(bw, bh);
         if (s <= 0f) return clear(out);
-        float sw = bw * s, sh = bh * s, left = CENTER_X - sw * 0.5f;
+        float sw = bw * s, sh = bh * s, left = LOGIC_W - sw;
         float top = Math.max(4f, OBJ_CY - sh * 0.5f);
         out[0] = left; out[1] = top; out[2] = left + sw; out[3] = top + sh;
         return true;
@@ -159,8 +169,8 @@ final class WarriorsCompanionLayout {
     /** Header tab under a logical touch point, or -1. */
     static int headerTabAt(float lx, float ly) {
         if (ly < 0f || ly > HEADER_B) return -1;
-        if (lx >= 0f && lx <= TAB0_HIT_R) return 0;
-        if (lx >= TAB1_HIT_L && lx <= LOGIC_W) return 1;
+        if (lx >= TAB0_HIT_L && lx < TAB_SPLIT) return 0;
+        if (lx >= TAB_SPLIT && lx <= LOGIC_W) return 1;
         return -1;
     }
 
