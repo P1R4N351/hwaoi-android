@@ -20,14 +20,16 @@ extern ssize_t process_vm_readv(pid_t, const struct iovec *, unsigned long,
 enum {
     KTGL_PANE_OFF_CHILDCNT = 0x38u,
     KTGL_PANE_OFF_CHILDREN = 0x48u,
-    KTGL_PANE_OFF_OWNER_SL = 0xa0u,
+    KTGL_PANE_OFF_OWNER_SL = 0xd8u,
     KTGL_PANE_OFF_NAME     = 0xb0u,
     KTGL_PANE_OFF_PARENT   = 0xd0u,
     KTGL_PANE_MIN_SIZE     = 0xe0u,
+    KTGL_SL_OFF_ROOT_PANE  = 0x358u,
     KTGL_NODE_OFF_PANE     = 0x08u,
     KTGL_CACHE_SLOTS       = 512u,
     KTGL_MAX_HOPS          = 24u,
     KTGL_MAX_CHILDREN      = 64u,
+    KTGL_MAX_SL_SCAN       = 128u,
     KTGL_NAME_MAX          = 95u
 };
 
@@ -180,6 +182,19 @@ static inline size_t ktgl_pane_name(
     return ktgl_snap_name(snap, b, buf, cap);
 }
 
+static inline const void *ktgl_sl_root_pane(
+    const void *sl, const KtglAddrBounds *b) {
+    uint8_t snap[KTGL_PANE_MIN_SIZE];
+    if (!ktgl_snap_pane(sl, b, snap)) return NULL;
+    char nm[8];
+    if (ktgl_snap_name(snap, b, nm, sizeof nm) > 0u) return sl;
+    const void *rp = NULL;
+    if (!ktgl_read_mem((uintptr_t)sl + KTGL_SL_OFF_ROOT_PANE, &rp, sizeof rp, b)) {
+        return NULL;
+    }
+    return ktgl_valid_pane(rp, b) ? rp : NULL;
+}
+
 static inline uint32_t ktgl_snap_children(
     const uint8_t snap[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b,
     const void *out[KTGL_MAX_CHILDREN]) {
@@ -224,7 +239,8 @@ static inline uint8_t ktgl_match_menu(const char *n) {
         "worldmap_parts_multiplay", "allies", "tutorial", "icon_weaponskill"
     };
     if (!strncmp(n, "icon_", 5u) || !strncmp(n, "PIC_icon_", 9u)) return 0u;
-    if (strstr(n, "btl_mask_carrying_item") || strstr(n, "menu_action_") || strstr(n, "menu_sync_")) return 0u;
+    if (strstr(n, "btl_mask_carrying_item") || strstr(n, "menu_action_")
+            || strstr(n, "menu_sync_") || strstr(n, "win_item_info")) return 0u;
     if (ktgl_has_any(n, k, sizeof k / sizeof k[0])) return KTGL_WID_MENU;
     const char *mp = strstr(n, "menu_");
     if (mp && !strstr(n, "icon_menu_")) return KTGL_WID_MENU;
@@ -245,10 +261,14 @@ static inline uint8_t ktgl_match_top_nonmenu(const char *n) {
         "battle_parts_center", "center_system_message", "center_ko",
         "center_success", "center_start", "chapter_name", "gameover",
         "btl_plt_marker", "btl_parts_route", "unit_info", "goremsensor",
-        "seeksensor", "btl_plt_sensor"
+        "seeksensor", "btl_plt_sensor", "guide_btn_action", "guide_finalblow",
+        "keyguide_finalblow", "action_gacha", "icon_linkstrike"
     };
     if (ktgl_has_any(n, ks, sizeof ks / sizeof ks[0])) return KTGL_WID_SPEECH;
     if (ktgl_has_any(n, kw, sizeof kw / sizeof kw[0])) return KTGL_WID_WORLD_MARKER;
+    if (strstr(n, "guide_action") && !strstr(n, "joycon") && !strstr(n, "cmn_action")) {
+        return KTGL_WID_WORLD_MARKER;
+    }
     return 0u;
 }
 
@@ -264,7 +284,8 @@ static inline uint8_t ktgl_match_bot_left(const char *n) {
         "gauge_musou", "flare_musou", "gauge_sync", "eff_sync",
         "gauge_meiyaku", "meiyaku_gauge", "gauge_strike",
         "battle_parts_main_gauge_0", "btl_gauge_kohga", "btl_gauge_urbosa",
-        "btl_gauge_impa", "gauge_ganon"
+        "btl_gauge_impa", "gauge_ganon", "gauge_linkstrike",
+        "linkstrike_playing", "linkstrike_stanby"
     };
     if (ktgl_has_any(n, kh, sizeof kh / sizeof kh[0])) return KTGL_WID_HEARTS;
     if (ktgl_has_any(n, kb, sizeof kb / sizeof kb[0])) return KTGL_WID_BATTERIES;
@@ -288,13 +309,13 @@ static inline uint8_t ktgl_match_bot_rest(const char *n) {
         "actionsheet_next_arrow", "actionsheet_key"
     };
     static const char *const kbu[] = {
-        "guide_action", "guide_cmn_action", "guide_btn_action", "guide_item",
+        "guide_cmn_action", "guide_action_joycon", "guide_item",
         "guide_btn_item", "guide_icon_item", "item_cooltime", "db_cooltime",
-        "db_keyguide", "zonaugear_sky", "znai_bullet", "linkstrike",
-        "action_gacha", "timelimit", "action_cooltime", "guide_finalblow",
-        "keyguide_finalblow", "keyguide_sky", "zonaugear_info", "zonaugear_exchange"
+        "db_keyguide", "zonaugear_sky", "znai_bullet", "timelimit",
+        "action_cooltime", "keyguide_sky", "zonaugear_info", "zonaugear_exchange",
+        "cmn_win_base_guide"
     };
-    static const char *const kal[] = {"player_info", "btl_plt_player"};
+    static const char *const kal[] = {"player_info", "btl_plt_player", "PIC_ext_player"};
     static const char *const kko[] = {"ko_count", "kocount"};
     static const char *const kkw[] = {"num_ko", "tb_text_ko", "tb_num_ko"};
     static const char *const kit[] = {
@@ -302,8 +323,9 @@ static inline uint8_t ktgl_match_bot_rest(const char *n) {
         "battle_parts_main_apple", "btl_flare_rod", "battle_parts_main_get"
     };
     static const char *const klo[] = {
-        "btl_buff", "btl_parts_base_zl", "btl_parts_base_sl",
-        "NULL_inout_zl", "zonaugear_stock"
+        "btl_buff", "btl_parts_base_zl", "btl_parts_base_zr", "btl_parts_base_sl",
+        "NULL_inout_zl", "NULL_inout_zr", "zonaugear_stock",
+        "NULL_item_carry", "PIC_base_icon_item", "PIC_frame_icon_item"
     };
     if (ktgl_has_any(n, km, sizeof km / sizeof km[0])) return KTGL_WID_MINIMAP;
     if (ktgl_has_any(n, ko, sizeof ko / sizeof ko[0])) return KTGL_WID_OBJECTIVE;
@@ -324,7 +346,9 @@ static inline uint8_t ktgl_match_name(const char *n) {
     if (w) return w;
     w = ktgl_match_bot_rest(n);
     if (w) return w;
-    return ktgl_match_bot_left(n);
+    w = ktgl_match_bot_left(n);
+    if (w) return w;
+    return strstr(n, "marker_destination") ? KTGL_WID_OBJECTIVE : 0u;
 }
 
 static inline uint8_t ktgl_pick_top(uint8_t a, uint8_t b) {
@@ -334,8 +358,9 @@ static inline uint8_t ktgl_pick_top(uint8_t a, uint8_t b) {
 }
 
 static inline int ktgl_is_master_hud(const void *sl, const KtglAddrBounds *b) {
+    const void *root = ktgl_sl_root_pane(sl, b);
     uint8_t snap[KTGL_PANE_MIN_SIZE];
-    if (!ktgl_snap_pane(sl, b, snap)) return 0;
+    if (!root || !ktgl_snap_pane(root, b, snap)) return 0;
     const void *kids[KTGL_MAX_CHILDREN];
     uint32_t lim = ktgl_snap_children(snap, b, kids);
     if (!lim) return 0;
@@ -345,7 +370,7 @@ static inline int ktgl_is_master_hud(const void *sl, const KtglAddrBounds *b) {
         if (!ktgl_pane_name(kids[i], b, nm, sizeof nm)) continue;
         if (strstr(nm, "player_info")) sp = 1;
         if (strstr(nm, "MINIMAP") || strstr(nm, "minimap")) sm = 1;
-        if (strstr(nm, "gauge")) sg = 1;
+        if (strstr(nm, "main_gauge")) sg = 1;
         if (strstr(nm, "misson_info") || strstr(nm, "mission_info")) so = 1;
         if (strstr(nm, "ko_count") || strstr(nm, "comboflow")) sk = 1;
     }
@@ -353,8 +378,9 @@ static inline int ktgl_is_master_hud(const void *sl, const KtglAddrBounds *b) {
 }
 
 static inline int ktgl_root_sl_has_menu(const void *root_sl, const KtglAddrBounds *b) {
+    const void *root = ktgl_sl_root_pane(root_sl, b);
     uint8_t snap[KTGL_PANE_MIN_SIZE];
-    if (!ktgl_snap_pane(root_sl, b, snap) || ktgl_is_master_hud(root_sl, b)) return 0;
+    if (!root || !ktgl_snap_pane(root, b, snap) || ktgl_is_master_hud(root, b)) return 0;
     const void *kids[KTGL_MAX_CHILDREN];
     uint32_t lim = ktgl_snap_children(snap, b, kids);
     for (uint32_t i = 0; i < lim; i++) {
@@ -365,54 +391,73 @@ static inline int ktgl_root_sl_has_menu(const void *root_sl, const KtglAddrBound
 }
 
 static inline void ktgl_scan_note_snap(
-    const uint8_t snap[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b, uint32_t *mask, uint8_t *obj_hit) {
+    const uint8_t snap[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b, uint32_t *mask) {
     char nm[96];
     if (!ktgl_snap_name(snap, b, nm, sizeof nm)) return;
-    uint8_t k = ktgl_match_name(nm);
-    if (k == KTGL_WID_OBJECTIVE) *obj_hit = 1u;
+    uint8_t k = ktgl_match_menu(nm);
+    if (!k) {
+        uint8_t top = ktgl_match_top_nonmenu(nm);
+        if (top == KTGL_WID_SPEECH) k = KTGL_WID_SPEECH;
+    }
+    if (!k) k = ktgl_match_bot_rest(nm);
+    if (!k) k = ktgl_match_bot_left(nm);
     if (k && k < KTGL_WID_COUNT) *mask |= (1u << k);
 }
 
 static inline void ktgl_scan_node_children(
-    const uint8_t snap[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b, uint32_t *mask, uint8_t *obj_hit) {
-    ktgl_scan_note_snap(snap, b, mask, obj_hit);
+    const uint8_t snap[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b, uint32_t *mask) {
+    uint32_t budget = KTGL_MAX_SL_SCAN - 1u;
+    ktgl_scan_note_snap(snap, b, mask);
     const void *k0[KTGL_MAX_CHILDREN];
     uint32_t l0 = ktgl_snap_children(snap, b, k0);
-    for (uint32_t i = 0; i < l0; i++) {
-        uint8_t csnap[KTGL_PANE_MIN_SIZE];
-        if (!ktgl_snap_pane(k0[i], b, csnap)) continue;
-        ktgl_scan_note_snap(csnap, b, mask, obj_hit);
+    for (uint32_t i = 0; i < l0 && budget > 0u; i++) {
+        uint8_t s1[KTGL_PANE_MIN_SIZE];
+        if (!ktgl_snap_pane(k0[i], b, s1)) continue;
+        budget--; ktgl_scan_note_snap(s1, b, mask);
         const void *k1[KTGL_MAX_CHILDREN];
-        uint32_t l1 = ktgl_snap_children(csnap, b, k1);
-        for (uint32_t j = 0; j < l1; j++) {
-            uint8_t gsnap[KTGL_PANE_MIN_SIZE];
-            if (ktgl_snap_pane(k1[j], b, gsnap)) ktgl_scan_note_snap(gsnap, b, mask, obj_hit);
+        uint32_t l1 = ktgl_snap_children(s1, b, k1);
+        for (uint32_t j = 0; j < l1 && budget > 0u; j++) {
+            uint8_t s2[KTGL_PANE_MIN_SIZE];
+            if (!ktgl_snap_pane(k1[j], b, s2)) continue;
+            budget--; ktgl_scan_note_snap(s2, b, mask);
+            const void *k2[KTGL_MAX_CHILDREN];
+            uint32_t l2 = ktgl_snap_children(s2, b, k2);
+            for (uint32_t t = 0; t < l2 && budget > 0u; t++) {
+                uint8_t s3[KTGL_PANE_MIN_SIZE];
+                if (ktgl_snap_pane(k2[t], b, s3)) { budget--; ktgl_scan_note_snap(s3, b, mask); }
+            }
         }
     }
 }
 
-static inline uint8_t ktgl_scan_owner_sl(const void *sl, const KtglAddrBounds *b) {
-    uint8_t snap[KTGL_PANE_MIN_SIZE];
-    if (!ktgl_snap_pane(sl, b, snap) || ktgl_is_master_hud(sl, b)) return 0u;
-    uint32_t mask = 0u;
-    uint8_t obj_hit = 0u;
-    ktgl_scan_node_children(snap, b, &mask, &obj_hit);
-    uint32_t top_m = mask & ((1u << KTGL_WID_SPEECH) | (1u << KTGL_WID_WORLD_MARKER) | (1u << KTGL_WID_MENU));
-    uint32_t bot_m = mask & ~(top_m | 1u);
-    if (obj_hit && !top_m && (bot_m & ~(1u << KTGL_WID_OBJECTIVE)) == 0u) return KTGL_WID_OBJECTIVE;
-    if (top_m && bot_m) return 0u;
-    if (mask == (1u << KTGL_WID_MENU)) return KTGL_WID_MENU;
-    for (uint8_t w = 1u; w < KTGL_WID_COUNT; w++) {
-        if (mask == (1u << w)) return w;
+static inline uint8_t ktgl_resolve_sl_mask(uint32_t mask) {
+    static const uint8_t k_pri[] = {
+        KTGL_WID_OBJECTIVE, KTGL_WID_MINIMAP, KTGL_WID_ALLIES, KTGL_WID_ITEMS,
+        KTGL_WID_KO_COUNT, KTGL_WID_COMBO, KTGL_WID_BTN_GUIDE, KTGL_WID_HEARTS,
+        KTGL_WID_BATTERIES, KTGL_WID_GAUGE, KTGL_WID_LEFT_OTHER, KTGL_WID_SPEECH,
+        KTGL_WID_MENU
+    };
+    if (!mask) return 0u;
+    for (size_t i = 0; i < sizeof k_pri / sizeof k_pri[0]; i++) {
+        if (mask & (1u << k_pri[i])) return k_pri[i];
     }
     return 0u;
+}
+
+static inline uint8_t ktgl_scan_owner_sl(const void *sl, const KtglAddrBounds *b) {
+    const void *root = ktgl_sl_root_pane(sl, b);
+    uint8_t snap[KTGL_PANE_MIN_SIZE];
+    if (!root || !ktgl_snap_pane(root, b, snap) || ktgl_is_master_hud(root, b)) return 0u;
+    uint32_t mask = 0u;
+    ktgl_scan_node_children(snap, b, &mask);
+    return ktgl_resolve_sl_mask(mask);
 }
 
 static inline uint8_t ktgl_classify_pane_snap(
     const void *pane, const uint8_t snap0[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b) {
     const void *pane_sl = ktgl_snap_ptr(snap0, KTGL_PANE_OFF_OWNER_SL);
     const void *root_sl = NULL, *p = pane;
-    uint8_t top_pri = 0u, bot_wid = 0u;
+    uint8_t top_pri = 0u, bot_wid = 0u, md_hit = 0u, has_allies = 0u;
     for (uint32_t hop = 0u; hop < KTGL_MAX_HOPS && p; hop++) {
         uint8_t hbuf[KTGL_PANE_MIN_SIZE];
         const uint8_t *hsnap = hop == 0u ? snap0 : hbuf;
@@ -423,25 +468,22 @@ static inline uint8_t ktgl_classify_pane_snap(
             uint8_t m = ktgl_match_menu(nm);
             if (!m) m = ktgl_match_top_nonmenu(nm);
             if (m) top_pri = ktgl_pick_top(top_pri, m);
-            if (!bot_wid) {
-                uint8_t bw = ktgl_match_bot_rest(nm);
-                if (!bw) bw = ktgl_match_bot_left(nm);
-                if (bw) bot_wid = bw;
-            }
+            uint8_t bw = ktgl_match_bot_rest(nm);
+            if (!bw) bw = ktgl_match_bot_left(nm);
+            if (bw == KTGL_WID_ALLIES) has_allies = 1u;
+            if (!bot_wid && bw) bot_wid = bw;
+            if (strstr(nm, "marker_destination")) md_hit = 1u;
         }
         p = ktgl_snap_ptr(hsnap, KTGL_PANE_OFF_PARENT);
     }
-    if (top_pri == KTGL_WID_MENU) return KTGL_WID_MENU;
-    if (ktgl_root_sl_has_menu(root_sl, b)) return KTGL_WID_MENU;
+    if (top_pri == KTGL_WID_MENU || ktgl_root_sl_has_menu(root_sl, b)) return KTGL_WID_MENU;
     if (top_pri) return top_pri;
-    if (bot_wid) return bot_wid;
     uint8_t fb = ktgl_scan_owner_sl(pane_sl, b);
+    if (!fb && root_sl != pane_sl) fb = ktgl_scan_owner_sl(root_sl, b);
+    if (bot_wid == KTGL_WID_GAUGE && (has_allies || fb == KTGL_WID_ALLIES)) return KTGL_WID_ALLIES;
+    if (bot_wid) return bot_wid;
     if (fb) return fb;
-    if (root_sl != pane_sl) {
-        fb = ktgl_scan_owner_sl(root_sl, b);
-        if (fb) return fb;
-    }
-    return 0u;
+    return md_hit ? KTGL_WID_OBJECTIVE : 0u;
 }
 
 static inline uint8_t ktgl_classify_pane(const void *pane, const KtglAddrBounds *b) {
