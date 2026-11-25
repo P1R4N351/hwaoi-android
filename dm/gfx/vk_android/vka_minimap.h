@@ -332,6 +332,21 @@ static int vka_minimap_skip_draw(void) {
     return g_vka_mm.in_hud_pass && g_vka_mm.skip_cur_draw;
 }
 
+static int vka_hud_override_blend(
+    uint8_t en, uint8_t src, uint8_t dst, uint8_t op,
+    uint8_t *srca, uint8_t *dsta, uint8_t *opa, uint8_t *mask) {
+    if (!en || (*mask & 0xfu) == 0u || op != 0u) return 0;
+    if ((src == 6u || src == 1u) && dst == 7u) {
+        *mask |= 0x8u; *srca = 1u; *dsta = 7u; *opa = 0u;
+        return 1;
+    }
+    if ((src == 6u || src == 1u) && dst == 1u) {
+        *mask |= 0x8u; *srca = 0u; *dsta = 1u; *opa = 0u;
+        return 1;
+    }
+    return 0;
+}
+
 static void vka_minimap_pass_begin(
     VkCommandBuffer cb, vka_img *im, uint32_t nl, uint32_t w, uint32_t h,
     VkFormat att_fmt, VkRect2D area, VkImageView main_cview, VkImageLayout main_clayout,
@@ -1420,8 +1435,74 @@ void vka_minimap_present(void) {
     g_vka_mm.prev_lhud_top = g_vka_mm.pass_lhud_top; g_vka_mm.pass_lhud_top = 0;
 }
 
+static _Atomic int g_vka_srgb_lut_ready;
+static float g_vka_srgb_to_lin[256];
+static float g_vka_lin_to_srgb[4097];
+
+static void vka_mm_ensure_srgb_lut(void) {
+    if (atomic_load_explicit(&g_vka_srgb_lut_ready, memory_order_acquire) == 2) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&g_vka_srgb_lut_ready, &expected, 1)) {
+        for (uint32_t u = 0u; u < 256u; u++) {
+            float x = (float)u * (1.0f / 255.0f);
+            g_vka_srgb_to_lin[u] = x <= 0.04045f ? x * (1.0f / 12.92f) : powf((x + 0.055f) / 1.055f, 2.4f);
+        }
+        for (uint32_t i = 0u; i <= 4096u; i++) {
+            float l = (float)i * (1.0f / 4096.0f);
+            g_vka_lin_to_srgb[i] = l <= 0.0031308f ? l * 12.92f : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+        }
+        atomic_store_explicit(&g_vka_srgb_lut_ready, 2, memory_order_release);
+        return;
+    }
+    for (int spin = 0; spin < 1000000; spin++) {
+        if (atomic_load_explicit(&g_vka_srgb_lut_ready, memory_order_acquire) == 2) return;
+    }
+}
+
+static float vka_mm_srgb_to_lin(uint8_t u) {
+    return g_vka_srgb_to_lin[u];
+}
+
+static float vka_mm_lin_to_srgb(float l) {
+    if (l <= 0.0f) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    if (l <= 0.0031308f) return l * 12.92f;
+    int idx = (int)(l * 4096.0f + 0.5f);
+    if (idx < 0) idx = 0;
+    if (idx > 4096) idx = 4096;
+    return g_vka_lin_to_srgb[idx];
+}
+
+static void vka_mm_srgb_premul_pixel(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    uint8_t av = *a;
+    if (av == 0u) {
+        uint8_t mx = *r > *g ? (*r > *b ? *r : *b) : (*g > *b ? *g : *b);
+        *a = mx;
+        return;
+    }
+    if (av == 255u) return;
+    float lr = vka_mm_srgb_to_lin(*r), lg = vka_mm_srgb_to_lin(*g), lb = vka_mm_srgb_to_lin(*b);
+    float ml = lr > lg ? (lr > lb ? lr : lb) : (lg > lb ? lg : lb);
+    float af = (float)av * (1.0f / 255.0f);
+    if (ml > af * 1.05f + 0.006f) {
+        af = ml < 1.0f ? ml : 1.0f;
+        av = (uint8_t)lrintf(af * 255.0f);
+        *a = av;
+    }
+    float ch[3] = {lr, lg, lb};
+    uint8_t *dst[3] = {r, g, b};
+    for (int i = 0; i < 3; i++) {
+        float s = ch[i] / af;
+        if (s > 1.0f) s = 1.0f;
+        uint32_t v = (uint32_t)lrintf(vka_mm_lin_to_srgb(s) * (float)av);
+        *dst[i] = (uint8_t)(v > av ? av : v);
+    }
+}
+
 static void vka_mm_copy_rgba(uint8_t *dst, const uint8_t *src, uint32_t w, uint32_t h, VkFormat fmt, int flip, int alpha_mode) {
     int bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    int srgb = (fmt == VK_FORMAT_R8G8B8A8_SRGB || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    if (alpha_mode == 2 && srgb) vka_mm_ensure_srgb_lut();
     for (uint32_t y = 0; y < h; y++) {
         const uint8_t *sr = src + (size_t)(flip ? (h - 1u - y) : y) * w * 4u;
         uint8_t *dr = dst + (size_t)y * w * 4u;
@@ -1429,6 +1510,7 @@ static void vka_mm_copy_rgba(uint8_t *dst, const uint8_t *src, uint32_t w, uint3
             size_t o = (size_t)x * 4u;
             uint8_t r = sr[o + (bgra ? 2 : 0)], g = sr[o + 1], b = sr[o + (bgra ? 0 : 2)], a = sr[o + 3];
             if (alpha_mode == 0) a = 255u;
+            else if (alpha_mode == 2 && srgb) vka_mm_srgb_premul_pixel(&r, &g, &b, &a);
             else if (alpha_mode == 2) {
                 uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
                 if (a < mx) a = mx;

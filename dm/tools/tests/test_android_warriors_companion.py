@@ -911,6 +911,33 @@ int main(void) {
     test_travel_safely_subtitle_stays();
     test_world_ring_known_by_texture();
     test_minimap_variant_without_stencil();
+    {
+        uint8_t sa = 1u, da = 0u, oa = 0u, mk = 0x7u;
+        assert(vka_hud_override_blend(1u, 6u, 7u, 0u, &sa, &da, &oa, &mk) == 1);
+        assert(sa == 1u && da == 7u && oa == 0u && mk == 0xfu);
+        uint8_t px[4] = {7u, 7u, 7u, 166u}, out[4] = {0};
+        vka_mm_copy_rgba(out, px, 1u, 1u, VK_FORMAT_R8G8B8A8_UNORM, 0, 2);
+        assert(out[3] == 166u);
+        sa = 6u; da = 1u; oa = 0u; mk = 0xfu;
+        assert(vka_hud_override_blend(1u, 6u, 1u, 0u, &sa, &da, &oa, &mk) == 1);
+        assert(sa == 0u && da == 1u && oa == 0u && mk == 0xfu);
+        uint8_t glow[4] = {200u, 120u, 0u, 0u};
+        vka_mm_copy_rgba(out, glow, 1u, 1u, VK_FORMAT_R8G8B8A8_UNORM, 0, 2);
+        assert(out[3] == 200u);
+        sa = 6u; da = 7u; oa = 0u; mk = 0u;
+        assert(vka_hud_override_blend(1u, 6u, 7u, 0u, &sa, &da, &oa, &mk) == 0 && mk == 0u);
+        mk = 0xfu;
+        assert(vka_hud_override_blend(0u, 6u, 7u, 0u, &sa, &da, &oa, &mk) == 0 && sa == 6u);
+        assert(vka_hud_override_blend(1u, 6u, 7u, 2u, &sa, &da, &oa, &mk) == 0 && sa == 6u);
+        uint8_t srgb_frosted[4] = {109u, 109u, 109u, 38u};
+        vka_mm_copy_rgba(out, srgb_frosted, 1u, 1u, VK_FORMAT_R8G8B8A8_SRGB, 0, 2);
+        assert(out[0] >= 37u && out[0] <= 39u && out[1] == out[0] && out[2] == out[0] && out[3] == 38u);
+        uint8_t srgb_face[4] = {149u, 98u, 58u, 255u};
+        vka_mm_copy_rgba(out, srgb_face, 1u, 1u, VK_FORMAT_R8G8B8A8_SRGB, 0, 2);
+        assert(out[0] == 149u && out[1] == 98u && out[2] == 58u && out[3] == 255u);
+        vka_mm_copy_rgba(out, glow, 1u, 1u, VK_FORMAT_R8G8B8A8_SRGB, 0, 2);
+        assert(out[3] == 200u);
+    }
     puts("vka_minimap_c_regression: PASS");
     return 0;
 }
@@ -1008,6 +1035,8 @@ class WarriorsCompanionTests(unittest.TestCase):
         self.assertIn('WarriorsCompanionLayout.headerTabAt(', view_src)
         self.assertIn('scanLeftHud(', draw_src)
         self.assertIn('c.drawBitmap(b, srcRect, dstF, imgPaint);', draw_src)
+        ctrl_src = (JAVA / 'WarriorsCompanionController.java').read_text(encoding='utf-8')
+        self.assertNotIn('softenHudDarkBacking', ctrl_src)
 
 
 if __name__ == '__main__':

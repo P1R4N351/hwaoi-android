@@ -3045,6 +3045,13 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
                 k.att[0].src, k.att[0].dst, k.att[0].op, k.att[0].srca, k.att[0].dsta, k.att[0].opa);
             return;
         }
+        _Static_assert(VK_BLEND_FACTOR_ZERO == 0 && VK_BLEND_FACTOR_ONE == 1
+            && VK_BLEND_FACTOR_SRC_ALPHA == 6 && VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA == 7
+            && VK_BLEND_OP_ADD == 0, "vka_hud_override_blend factors");
+        if (vka_minimap_on_hud_target() && sh[1] && (sh[1]->fcomp[0] & 0x8u)) {
+            (void)vka_hud_override_blend(k.att[0].en, k.att[0].src, k.att[0].dst, k.att[0].op,
+                &k.att[0].srca, &k.att[0].dsta, &k.att[0].opa, &k.att[0].mask);
+        }
     }
 
     PT(3);
