@@ -67,7 +67,7 @@ final class WarriorsCompanionDraw {
         c.save();
         c.translate(ox, oy);
         c.scale(sc, sc, 0f, 0f);
-        drawChrome(c, borderEdge);
+        drawChrome(c);
         drawTopNav(c, m, glyph, nowMs);
         drawPages(c, m, nowMs);
         float dim = scene.dimT(nowMs);
@@ -129,27 +129,18 @@ final class WarriorsCompanionDraw {
                 ? new BitmapShader(backdrop, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT) : null;
     }
 
-    private void drawChrome(Canvas c, Bitmap borderEdge) {
+    /**
+     * The tiled backdrop alone: no bands, borders or overlays. It is drawn BLEED past every edge of the logical screen, so the
+     * view is filled whatever its aspect and wherever the burn-in orbit has shifted the content; the view clips the rest.
+     */
+    private static final float BLEED = 400f;
+    private void drawChrome(Canvas c) {
         p.setStyle(Paint.Style.FILL);
-        p.setColor(0xFF000000);
-        c.drawRect(0f, 0f, LOGIC_W, LOGIC_H, p);
+        p.setColor(0xFF181818);
+        c.drawRect(-BLEED, -BLEED, LOGIC_W + BLEED, LOGIC_H + BLEED, p);
         if (backdropShader != null) {
             texPaint.setShader(backdropShader);
-            c.drawRect(0f, 0f, LOGIC_W, LOGIC_H, texPaint);
-        }
-        drawBorders(c, borderEdge);
-    }
-
-    /** Top and bottom edge bands only: the left and right sides carry no border, wall text or scanline overlay. */
-    private void drawBorders(Canvas c, Bitmap edge) {
-        if (edge != null && !edge.isRecycled()) {
-            c.save();
-            c.scale(1f, -1f, 0f, 42f);
-            dstRect.set(0, 0, 1240, 84);
-            c.drawBitmap(edge, null, dstRect, imgPaint);
-            c.restore();
-            dstRect.set(0, 996, 1240, 1080);
-            c.drawBitmap(edge, null, dstRect, imgPaint);
+            c.drawRect(-BLEED, -BLEED, LOGIC_W + BLEED, LOGIC_H + BLEED, texPaint);
         }
     }
 
