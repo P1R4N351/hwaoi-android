@@ -1454,10 +1454,16 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) { return cmd_alloc_keep(o, si
 // A recording starts with its first command, as in NVN: no BEGIN record, so an empty recording takes only its END. Games size command memory by GetCommandMemoryUsed
 // (nvn_obj.h draw_rec): Breath of the Wild sums one scratch recording per mesh and per shape and render pass into each model's prerecorded commands, and with an
 // 8-byte BEGIN on each of several hundred recordings a model came out a 4 KB page over its resource size table entry
+static _Atomic int g_dm_wid_active;
+static __thread uint8_t t_dm_cur_wid;
+void dm_nvn_enable_wid(void) { atomic_store_explicit(&g_dm_wid_active, 1, memory_order_release); }
+void dm_nvn_set_wid(uint8_t w) { t_dm_cur_wid = w; }
+uint8_t dm_nvn_cur_wid(void) { return t_dm_cur_wid; }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("[RED] BeginRecording re-entered");
     o->recording = 2;   // 2: recording, no command yet (cmd_alloc sets begin)
+    o->last_wid = 0xffu;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
@@ -1468,6 +1474,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
+    CB(c)->last_wid = 0xffu;
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
@@ -1508,6 +1515,14 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
     return p + 8;
 }
 #define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T)))
+static inline void rec_ui_tag(NVNcommandBuffer *c) {
+    if (!atomic_load_explicit(&g_dm_wid_active, memory_order_relaxed)) return;
+    cmd_t *o = CB(c); uint8_t w = t_dm_cur_wid;
+    if (o->last_wid == w) return;
+    o->last_wid = w;
+    *REC(c, OP_UI_TAG, p_ui_tag) = (p_ui_tag){w, 0u};
+}
+
 // Binding records with arrays are allocated by the actual count: prefix fields + n elements (the replay side reads only the first n). Previously they were recorded at fixed length for the maximum count (bind vertex buffers 272 bytes, bind textures / samplers 280 bytes,
 // while there are usually only 1–2 in practice), and the empty tail took 40–50% of the command bytes per frame; the advanced stats page of the level 88 sorceress recorded 12.5 MB per frame, using up the game's own command memory pool (about 105 segments x 128 KB per frame)
 #define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
@@ -1615,8 +1630,9 @@ static void rec_draw_bt(int cnt) {
         (unsigned long long)t_dbt_ubo[0], (unsigned long long)t_dbt_ubo[1], (unsigned long long)t_dbt_ubo[2], (unsigned long long)t_dbt_ubo[3],
         (unsigned long long)kc[1], (unsigned long long)(kc[2] - kc[1]), (unsigned long long)(kc[3] - kc[1]), (unsigned long long)kc[0], b);
 }
-static void rec_draw(NVNcommandBuffer *c, p_draw d) { rec_draw_bt(d.count); shp_bind(SHK_IND, d.ind, 16); shp_bind(SHK_IND, d.mdi_cnt, 4); size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
+static void rec_draw(NVNcommandBuffer *c, p_draw d) { rec_ui_tag(c); rec_draw_bt(d.count); shp_bind(SHK_IND, d.ind, 16); shp_bind(SHK_IND, d.mdi_cnt, 4); size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
 static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) {
+    rec_ui_tag(c);
     rec_draw_bt(d.count);
     shp_bind(SHK_IBUF, d.ibuf, d.ind || d.count <= 0 ? 0 : (uint64_t)d.count << (d.itype == 0 ? 0 : d.itype == 1 ? 1 : 2)); shp_bind(SHK_IND, d.ind, 20); shp_bind(SHK_IND, d.mdi_cnt, 4);
     size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n); }
@@ -1868,6 +1884,7 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
 // A textured rectangle into the bound colour targets, replayed as draw_tex (nvn_mtl.m). The handle's IDs are moved to the pools this command buffer bound, as bind_handles does:
 // Streets of Rage 4 draws its movie frames into its scene target this way, from a second texture pool. Only the handle's lower 32 bits reach the GPU (bind_handles)
 NVN(nvnCommandBufferDrawTexture, void, NVNcommandBuffer *c, NVNtextureHandle h, const NVNdrawTextureRegion *d, const NVNdrawTextureRegion *s) {
+    rec_ui_tag(c);
     uint64_t tid = (uint32_t)h & 0xfffff, sid = (uint32_t)h >> 20;
     if (tid) tid += (uint64_t)CB(c)->tex_base;
     if (sid) sid += (uint64_t)CB(c)->samp_base;
@@ -3195,6 +3212,7 @@ NVN(nvnCommandBufferEndTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAd
 NVN(nvnCommandBufferPauseTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { shp_bind(SHK_XFB, a, 0); *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){2, 0, a}; }
 NVN(nvnCommandBufferResumeTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { shp_bind(SHK_XFB, a, 0); *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){3, 0, a}; }
 NVN(nvnCommandBufferDrawTransformFeedback, void, NVNcommandBuffer *c, NVNdrawPrimitive m, NVNbufferAddress a) {
+    rec_ui_tag(c);
     shp_bind(SHK_XFB, a, 0);
     *REC(c, OP_DRAW, p_draw) = (p_draw){.prim=m,.instances=1,.ind=a+16};
 }

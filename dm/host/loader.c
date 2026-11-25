@@ -941,6 +941,7 @@ static uint8_t *module_mmap(const char *name, size_t len) {   // the next len by
     return p;
 }
 
+__attribute__((weak)) int ktgl_ui_tag_install(module_t *m);
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
 static void map_image(module_t *m, const char *dir) {
@@ -958,9 +959,11 @@ static void map_image(module_t *m, const char *dir) {
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
         free(raw); install_key_page(m); window_apply(m); shape_apply(m); fiber_pac_apply(m); pac_patch_text(m); rt_pool_apply(m);
+        int ktgl_ok = (ktgl_ui_tag_install && !strcmp(m->name, "main")) ? ktgl_ui_tag_install(m) : 0;
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+        if (ktgl_ok > 0) plat_icache_invalidate(m->base, rx);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
         if (pre > m->patch_len && mprotect(a + m->patch_len, pre - m->patch_len, PROT_NONE)) die("%s mprotect gap", m->name);
         return;
@@ -969,8 +972,10 @@ static void map_image(module_t *m, const char *dir) {
     m->base = module_mmap(m->name, m->size);   // the module arena (see above)
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); shape_apply(m); fiber_pac_apply(m); pac_patch_text(m); rt_pool_apply(m);
+    int ktgl_ok = (ktgl_ui_tag_install && !strcmp(m->name, "main")) ? ktgl_ui_tag_install(m) : 0;
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+    if (ktgl_ok > 0) plat_icache_invalidate(m->base, rx);
     uint64_t po = m->patch_off & ~0x3FFFull;
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
 }

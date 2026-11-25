@@ -143,6 +143,7 @@ static void vka_state_op_scalar(vka_dstate *d, uint32_t op, const void *a, int f
     case OP_PRIM_RESTART: if (!fast || memcmp(&d->restart, a, sizeof d->restart)) { d->restart = *(const p_prim_restart *)a; d->bind_gen++; } break;
     case OP_RAST_DISCARD: { int on = ((const p_rast_discard *)a)->on;
         if (!fast || d->rast_discard != on) { d->rast_discard = on; d->bind_gen++; } break; }
+    case OP_UI_TAG: d->ui_wid = (uint8_t)((const p_ui_tag *)a)->wid; break;
     default: break;
     }
 }
@@ -187,7 +188,7 @@ int vka_state_op(vka_dstate *d, uint32_t op, const void *a) {
     case OP_VIEWPORTS: if (vka_state_apply_viewports(fast, d->vp, &d->has_vp, a)) d->bind_gen++; break;
     case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_STENCIL: case OP_POLY_OFFSET: case OP_DEPTH_RANGE:
     case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_PUSH_CONST:
-    case OP_TF_STATE: case OP_PRIM_RESTART: case OP_RAST_DISCARD: vka_state_op_scalar(d, op, a, fast); break;
+    case OP_TF_STATE: case OP_PRIM_RESTART: case OP_RAST_DISCARD: case OP_UI_TAG: vka_state_op_scalar(d, op, a, fast); break;
     case OP_TF_BIND: if (!fast) d->bind_gen++; break;
     default: return 0;
     }
@@ -2781,6 +2782,21 @@ static void rd_run(const vka_dstate *d) {
     } else if (g_rd_prev && !R.on && VKA_ENV("DM_VK_RD_TOUCH", 0)) rd_touch();
     g_rd_prev = rd;
 }
+static void vka_mm_trace_cur_draw(
+    int mesh, const vka_shader *vs, const vka_shader *fs,
+    uint8_t src, uint8_t dst, uint8_t op, uint8_t srca, uint8_t dsta, uint8_t opa) {
+    if (!g_vka_mm_tr.on || !g_vka_mm_tr.valid) return;
+    const vka_img *t0_ = NULL; int nt_ = 0;
+    int n_ = (!mesh && fs) ? (g_wk.n[1] < 16 ? g_wk.n[1] : 16) : 0;
+    for (int i_ = 0; i_ < n_; i_++) {
+        const vka_res *r_ = &g_wk.r[1][i_];
+        if (r_->what != VKA_R_TEX || !r_->tid || vka_tex_id_is_buffer(r_->tid)) continue;
+        if (!t0_) t0_ = vka_tex_id_img(r_->tid, g_cb);
+        nt_++;
+    }
+    vka_minimap_trace_blend(src, dst, op, srca, dsta, opa);
+    vka_minimap_trace_draw(vs ? vs->key : 0u, fs ? fs->key : 0u, t0_, nt_);
+}
 static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
     if (RUN.open && RUN.fast && !vka_minimap_in_hud_pass() && di && !dw && g_inst_on && inst_fast(d, rt, has_rt, sc, has_sc, di)) {   // DM_VK_INSTANCE: the run's next object, no walk
@@ -3017,10 +3033,17 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
             }
             vka_minimap_note_draw_tex(mm_tex);
         }
+        vka_minimap_note_draw_wid(d->ui_wid);
         if (vka_minimap_select_target(g_cb, d, mm_vin, dw, di, mesh, ind, d->ds.st,
                 (R.df != VK_FORMAT_UNDEFINED && d->ds.dt), k.att[0].mask, k.att[0].en)) {
             if (RUN.open) inst_close();
             vka_dyn_invalidate();
+        }
+        if (vka_minimap_skip_draw()) {
+            if (RUN.open) inst_close();
+            vka_mm_trace_cur_draw(mesh, sh[0], sh[1],
+                k.att[0].src, k.att[0].dst, k.att[0].op, k.att[0].srca, k.att[0].dsta, k.att[0].opa);
+            return;
         }
     }
 
@@ -3165,18 +3188,8 @@ dyn_done:
                 vka_minimap_note_fs_tex(vka_tex_id_img(r_->tid, g_cb), DY.dt);
         }
     }
-    if (g_vka_mm_tr.on && g_vka_mm_tr.valid) {   // DM_VK_MM_TRACE: this draw's identity beside its capture decision
-        const vka_img *t0_ = NULL; int nt_ = 0;
-        int n_ = (!mesh && sh[1]) ? (g_wk.n[1] < 16 ? g_wk.n[1] : 16) : 0;
-        for (int i_ = 0; i_ < n_; i_++) {
-            const vka_res *r_ = &g_wk.r[1][i_];
-            if (r_->what != VKA_R_TEX || !r_->tid || vka_tex_id_is_buffer(r_->tid)) continue;
-            if (!t0_) t0_ = vka_tex_id_img(r_->tid, g_cb);
-            nt_++;
-        }
-        vka_minimap_trace_blend(k.att[0].src, k.att[0].dst, k.att[0].op, k.att[0].srca, k.att[0].dsta, k.att[0].opa);
-        vka_minimap_trace_draw(sh[0] ? sh[0]->key : 0u, sh[1] ? sh[1]->key : 0u, t0_, nt_);
-    }
+    vka_mm_trace_cur_draw(mesh, sh[0], sh[1],
+        k.att[0].src, k.att[0].dst, k.att[0].op, k.att[0].srca, k.att[0].dsta, k.att[0].opa);
     if (g_rtl_pass && rtl_room()) {   // DM_VK_RT_LOG: the draw's state
         char cm[200]; size_t cn = 0;
         for (uint32_t i = 0; i < R.ncolor && cn < sizeof cm; i++) if (R.cf[i]) cn += (size_t)snprintf(cm + cn, sizeof cm - cn, " c%u mask %x out %x blend %d(%d,%d,%d/%d,%d,%d)", i, k.att[i].mask,

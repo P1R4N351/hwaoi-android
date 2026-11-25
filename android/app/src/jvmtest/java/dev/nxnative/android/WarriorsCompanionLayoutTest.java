@@ -206,6 +206,12 @@ public final class WarriorsCompanionLayoutTest {
         for (int y = 470; y < 500; y++) for (int x = 40; x < 200; x++) px[y * HUD_W + x] = 0xFFE0E0E0;
         s.scan(px, HUD_W, HUD_H); h.ingest(s, 250L);
         check(h.order(idx) == 1, "merged hit drops overlapping stale cluster immediately");
+        check(!h.overlapsLive(idx[0]), "live merged cluster does not self-overlap");
+        boolean deadOverlap = false;
+        for (int k = 0; k < WarriorsCompanionLayout.MAX_CLUSTERS; k++) {
+            if (k != idx[0] && h.overlapsLive(k)) deadOverlap = true;
+        }
+        check(deadOverlap, "absorbed stale cluster reports overlapsLive to suppress fade duplicate");
     }
 
     private static void testStaticLayoutAllStates() {

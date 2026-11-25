@@ -155,7 +155,7 @@ static inline int vka_op_memu_allowed_fast(uint32_t op, int fault_mode) {
         (UINT64_C(1) << OP_SET_TEX_POOL) | (UINT64_C(1) << OP_SET_SAMP_POOL) | (UINT64_C(1) << OP_BLEND_COLOR) |
         (UINT64_C(1) << OP_DEPTH_CLAMP) | (UINT64_C(1) << OP_TF_BIND) | (UINT64_C(1) << OP_TF_STATE) |
         (UINT64_C(1) << OP_RAST_DISCARD) | (UINT64_C(1) << OP_VP_SWIZZLE) | (UINT64_C(1) << OP_PRIM_RESTART) |
-        (UINT64_C(1) << OP_ALPHA_REF) | (UINT64_C(1) << OP_PUSH_CONST);
+        (UINT64_C(1) << OP_ALPHA_REF) | (UINT64_C(1) << OP_PUSH_CONST) | (UINT64_C(1) << OP_UI_TAG);
     uint64_t eff = (fault_mode == 3) ? (m | (UINT64_C(1) << OP_DISPATCH)) : m;
     return vka_op_bit_test(eff, op);
 }

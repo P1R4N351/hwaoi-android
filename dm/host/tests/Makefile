@@ -81,6 +81,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_oot_companion_tap
 	$(B)/t_oot_companion_waist
 	$(B)/t_ktgl_companion
+	$(B)/t_ktgl_wid
 	$(B)/t_dkb_wide
 	$(B)/t_mkw_wide
 	$(B)/t_mtf_size
@@ -804,3 +805,7 @@ $(B)/t_drs_steps: t_drs_steps.c ../drs_steps.h ../fps_fast.h | $(B)
 run: $(B)/t_pkp_aspect
 $(B)/t_pkp_aspect: t_pkp_aspect.c ../android/pkp_aspect.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wno-unused-function -I.. $(GINC) -o $@ t_pkp_aspect.c -lm -pthread
+
+run: $(B)/t_ktgl_wid
+$(B)/t_ktgl_wid: t_ktgl_wid.c ../hle_ktgl_ui_tag.c ../ktgl_ui_tag.h ../ktgl_wid_classify.h ../ktgl_wid_ids.h | $(B)
+	$(CLANG) -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-function -DKTGL_HOST_TEST -I.. -o $@ t_ktgl_wid.c ../hle_ktgl_ui_tag.c -lpthread

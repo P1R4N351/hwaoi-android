@@ -451,6 +451,12 @@ final class WarriorsCompanionLayout {
         }
 
         boolean live(int i) { return live[i]; }
+        boolean overlapsLive(int i) {
+            for (int k = 0; k < MAX_CLUSTERS; k++) {
+                if (k != i && live[k] && y0[i] < y1[k] && y1[i] > y0[k]) return true;
+            }
+            return false;
+        }
         /** True for a cluster lying wholly in the lower half of the strip and reaching its bottom BOTTOM_ANCHOR. */
         boolean anchoredBottom(int i) {
             return live[i] && srcH > 0f && y0[i] >= srcH * 0.5f && y1[i] >= srcH * (1f - BOTTOM_ANCHOR);
