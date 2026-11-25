@@ -1559,21 +1559,54 @@ int dm_ktgl_tag_get(uint64_t ubo, uint64_t *chunk, uint32_t *off, uint32_t *len)
     return atomic_load_explicit(&g_kt[i].key, memory_order_acquire) == ubo;
 }
 
+// DM_KTGL_DUMP=<n> (diagnostic, live): the next n display-list chunks a draw is seen in are written whole to ktgl_dump.bin
+// beside the control file, each followed by its draws: 'C' u64 chunk, u32 len, bytes; 'D' u64 chunk, u32 cursor offset,
+// i32 count, u64 uniform block 0. The command bytes are the game's own record of what it drew, widget by widget.
+static void ktgl_dump(const uint64_t kc[4], int cnt) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static FILE *f; static int left; static uint64_t last; static char seen[16]; static uint8_t buf[65536];
+    const char *e = getenv("DM_KTGL_DUMP");
+    if (!e || !*e || !kc[1]) return;
+    pthread_mutex_lock(&mu);
+    if (strncmp(e, seen, sizeof seen - 1)) {
+        snprintf(seen, sizeof seen, "%s", e); left = atoi(e); last = 0;
+        const char *ctl = getenv("DM_CTL");
+        char path[512]; const char *sl = ctl ? strrchr(ctl, '/') : NULL;
+        if (f) { fclose(f); f = NULL; }
+        if (sl && (size_t)(sl - ctl) < sizeof path - 20) { snprintf(path, sizeof path, "%.*s/ktgl_dump.bin", (int)(sl - ctl), ctl); f = fopen(path, "wb"); }
+    }
+    if (f && (left > 0 || kc[1] == last)) {
+        if (kc[1] != last) {
+            uint64_t len = kc[2] - kc[1];
+            uint32_t n = (uint32_t)(len < sizeof buf ? len : sizeof buf);
+            if (n && !plat_mem_read(kc[1], buf, n)) { fputc('C', f); fwrite(&kc[1], 8, 1, f); fwrite(&n, 4, 1, f); fwrite(buf, 1, n, f); }
+            last = kc[1]; left--;
+        }
+        uint32_t off = (uint32_t)(kc[3] - kc[1]); int32_t c = cnt;
+        fputc('D', f); fwrite(&kc[1], 8, 1, f); fwrite(&off, 4, 1, f); fwrite(&c, 4, 1, f); fwrite(&t_dbt_ubo[0], 8, 1, f);
+        if (left <= 0) fflush(f);
+    }
+    pthread_mutex_unlock(&mu);
+}
+
 // DM_NVN_DRAW_BT=<n> (diagnostic, live): the next n recorded draws log their count, uniform blocks, display-list chunk and the
 // return addresses above the NVN call. DM_KTGL_TAG=1: every draw's chunk is tagged for the replay.
 static void rec_draw_bt(int cnt) {
-    static uint32_t tick; static int left, tag; static char last[16];
+    static uint32_t tick; static int left, tag, dump; static char last[16];
     if ((tick++ & 255u) == 0u) {
         const char *e = getenv("DM_NVN_DRAW_BT");
         if (!e || !*e) last[0] = 0;
         else if (strncmp(e, last, sizeof last - 1)) { snprintf(last, sizeof last, "%s", e); left = atoi(e); }
         const char *t = getenv("DM_KTGL_TAG");
         tag = t && *t == '1';
+        const char *du = getenv("DM_KTGL_DUMP");
+        dump = du && *du;
     }
-    if (left <= 0 && !tag) return;
+    if (left <= 0 && !tag && !dump) return;
     uint64_t kc[4], ra[14];
     int n = ktgl_chunk((uint64_t)__builtin_frame_address(0), kc, left > 0 ? ra : NULL, 14);
     if (tag) for (int i = 0; i < 4; i++) ktgl_tag_put(t_dbt_ubo[i], kc);
+    if (dump) ktgl_dump(kc, cnt);
     if (left <= 0) return;
     left--;
     char b[14 * 18 + 4]; size_t o = 0; b[0] = 0;
