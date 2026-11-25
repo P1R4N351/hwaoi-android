@@ -468,7 +468,8 @@ static void test_minimap_group_closes(void) {
     fb_ortho[8 + 0] = 2.f / 1920.f; fb_ortho[8 + 5] = -2.f / 1080.f; fb_ortho[8 + 10] = 1.f;
     fb_ortho[8 + 12] = -1.f; fb_ortho[8 + 13] = 1.f; fb_ortho[8 + 15] = 1.f;
     init_id_m34(&fb_ortho[24]);
-    vtx_idx_pos q_mask[6], q_icon[6], q_else[6], q_bubble[6];
+    vtx_idx_pos q_mask[6], q_icon[6], q_else[6], q_bubble[6], q_layer[6];
+    make_quad_vtx(q_layer, 686.f, -156.f, 2734.f, 1892.f, 0.f, 0.f);   /* a map layer wider than the screen, centred on the minimap (measured) */
     make_quad_vtx(q_mask, 1540.f, 698.f, 1880.f, 1038.f, 0.f, 0.f);    /* the minimap's stencil mask, measured on AoI */
     make_quad_vtx(q_icon, 1707.f, 741.f, 1779.f, 813.f, 0.f, 0.f);     /* its player marker */
     make_quad_vtx(q_else, 900.f, 500.f, 1000.f, 560.f, 0.f, 0.f);      /* some other widget, mid screen */
@@ -479,6 +480,7 @@ static void test_minimap_group_closes(void) {
     vka_dstate ds_icon = make_dstate((void *)q_icon, (void *)fb_ortho, 256u, NULL, 0u);
     vka_dstate ds_else = make_dstate((void *)q_else, (void *)fb_ortho, 256u, NULL, 0u);
     vka_dstate ds_bubble = make_dstate((void *)q_bubble, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_layer = make_dstate((void *)q_layer, (void *)fb_ortho, 256u, NULL, 0u);
     g_f += 2;
     vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
         (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
@@ -486,6 +488,10 @@ static void test_minimap_group_closes(void) {
     assert(g_vka_mm.pass_mm_hit == 1);
     vka_minimap_select_target(1ull, &ds_icon, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
     assert(g_vka_mm.cur_hud == 1);                      /* inside the box while the group is open */
+    vka_minimap_select_target(1ull, &ds_layer, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 1);                      /* the wide map layer is the minimap's and does not close its group */
+    vka_minimap_select_target(1ull, &ds_icon, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(g_vka_mm.cur_hud == 1);                      /* so the markers drawn after it are still captured */
     vka_minimap_select_target(1ull, &ds_else, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
     assert(g_vka_mm.cur_hud == 0);
     vka_minimap_select_target(1ull, &ds_bubble, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);

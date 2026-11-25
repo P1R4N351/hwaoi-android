@@ -669,7 +669,6 @@ static int vka_mm_is_mm_draw(const float *mn, const float *mx, uint32_t stt, int
         // The map's own layers (terrain, fog): unstencilled quads that cover the whole minimap and share its centre.
         float rx1 = (float)(r.x + (int32_t)r.w), ry1 = (float)(r.y + (int32_t)r.h);
         if (stt == 0u && cnt <= 6 && mn[0] <= (float)r.x && mx[0] >= rx1 && mn[1] <= (float)r.y && mx[1] >= ry1
-                && mx[0] - mn[0] < w * 0.98f
                 && fabsf((mn[0] + mx[0]) * 0.5f - ((float)r.x + rx1) * 0.5f) <= 4.f
                 && fabsf((mn[1] + mx[1]) * 0.5f - ((float)r.y + ry1) * 0.5f) <= 4.f) return 1;
         // The minimap's draws are contiguous. An unstencilled sprite inside its box belongs to it only while that group is
