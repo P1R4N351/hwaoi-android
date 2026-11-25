@@ -529,6 +529,101 @@ static void test_world_marker_stays(void) {   /* runs right after test_pass_4626
     vka_minimap_present();
 }
 
+static int sel_box_1080(float fb[64], vtx_idx_pos *q, int32_t cnt, uint32_t st, uint32_t bl) {
+    vka_dstate ds = make_dstate((void *)q, (void *)fb, 256u, NULL, 0u);
+    vka_minimap_select_target(1ull, &ds, 3u, &(p_draw){0, 0, cnt, 1, 0, 0}, NULL, 0, 0u, st, 0u, 0xfu, bl);
+    return g_vka_mm.cur_hud;
+}
+
+static void test_terrain_backing_and_camp_bubbles(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos qm[6], q2048[6], qcamp[18], qh[6], qcb[6], qko[6], qtrv[84];
+    make_quad_vtx(qm, 1540.f, 698.f, 1880.f, 1038.f, 0.f, 0.f);
+    make_quad_vtx(q2048, 686.f, -156.f, 2734.f, 1892.f, 0.f, 0.f);
+    for (int i = 0; i < 18; i += 6) make_quad_vtx(&qcamp[i], 35.f, 284.f, 270.f, 307.f, 0.f, 0.f);
+    make_quad_vtx(qh, 50.f, 25.f, 94.f, 69.f, 0.f, 0.f);
+    make_quad_vtx(qcb, 0.f, 553.f, 514.f, 683.f, 0.f, 0.f);
+    make_quad_vtx(qko, -44.f, 995.f, 504.f, 1047.f, 0.f, 0.f);
+    for (int i = 0; i < 84; i += 6) make_quad_vtx(&qtrv[i], 157.f, 347.f, 310.f, 376.f, 0.f, 0.f);
+    for (int k = 0; k < 4; k++) { g_f += 2; vka_minimap_present(); }
+    assert(g_vka_mm.lhud_ttl == 0u);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_dstate dsm = make_dstate((void *)qm, (void *)fb, 256u, NULL, 0u);
+    vka_minimap_select_target(1ull, &dsm, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 1u, 0u, 0u, 1u);
+    assert(sel_box_1080(fb, q2048, 6, 0u, 1u) == 1);
+    assert(sel_box_1080(fb, qcamp, 18, 0u, 1u) == 0);   /* camp exploration without top HUD stays off leftHud */
+    assert(sel_box_1080(fb, qh, 6, 0u, 1u) == 1);
+    assert(sel_box_1080(fb, qcb, 6, 0u, 1u) == 1);      /* combo backing panel */
+    assert(sel_box_1080(fb, qko, 6, 0u, 1u) == 1);      /* left-bleed KO backing panel */
+    assert(sel_box_1080(fb, qtrv, 84, 0u, 1u) == 0);    /* battle overhead "Travel safely." stays on top */
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+}
+
+static void test_allies_menu_stays(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos q_bar[18], q_txt[180], q_ic[12], q_sub[18], q_subt[180];
+    make_quad_vtx(&q_bar[0], 1420.f, 468.f, 1920.f, 524.f, 0.f, 0.f);
+    make_quad_vtx(&q_bar[6], 1440.f, 472.f, 1920.f, 520.f, 0.f, 0.f);
+    make_quad_vtx(&q_bar[12], 1460.f, 476.f, 1920.f, 516.f, 0.f, 0.f);
+    for (int q = 0; q < 180; q += 6) {
+        make_quad_vtx(&q_txt[q], 1493.f, 478.f, 1781.f, 514.f, 0.f, 0.f);
+        make_quad_vtx(&q_subt[q], 759.f, 846.f, 1161.f, 894.f, 0.f, 0.f);
+    }
+    make_quad_vtx(&q_ic[0], 1443.f, 476.f, 1483.f, 516.f, 0.f, 0.f);
+    make_quad_vtx(&q_ic[6], 1383.f, 416.f, 1543.f, 576.f, 0.f, 0.f);
+    for (int q = 0; q < 18; q += 6) make_quad_vtx(&q_sub[q], 620.f, 840.f, 1300.f, 900.f, 0.f, 0.f);
+    g_f += 2; run_obj_frame(fb, q_bar, q_txt, q_ic, 1, q_sub, q_subt);
+    vka_minimap_present();
+    assert(g_vka_mm.obj_ttl > 0u);
+    g_vka_mm.mm_ttl = VKA_MM_TTL; g_vka_mm.mm.ready_w = 340u; g_vka_mm.mm.ready_h = 340u;
+    int32_t mm_meta[5] = {0};
+    assert(nxhost_companion_minimap(NULL, 0, mm_meta) == 0 && mm_meta[0] == 340 && mm_meta[1] == 340);
+    vtx_idx_pos q_c1[6], q_z[30], q_lv[18], q_ex[18], q_h[6], q_c2[6], q_bl[84], q_ft[6], q_hd[6];
+    make_quad_vtx(q_c1, 1062.f, 241.f, 1920.f, 457.f, 0.f, 0.f);
+    for (int i = 0; i < 30; i += 6) make_quad_vtx(&q_z[i], 1092.f, 242.f, 1191.f, 291.f, 0.f, 0.f);
+    for (int i = 0; i < 18; i += 6) {
+        make_quad_vtx(&q_lv[i], 1092.f, 298.f, 1136.f, 334.f, 0.f, 0.f);
+        make_quad_vtx(&q_ex[i], 1202.f, 299.f, 1253.f, 333.f, 0.f, 0.f);
+    }
+    make_quad_vtx(q_h, 1085.f, 335.f, 1129.f, 379.f, 0.f, 0.f);
+    make_quad_vtx(q_c2, 1062.f, 469.f, 1920.f, 685.f, 0.f, 0.f);
+    for (int i = 0; i < 84; i += 6) make_quad_vtx(&q_bl[i], 1298.f, 491.f, 1519.f, 546.f, 0.f, 0.f);
+    make_quad_vtx(q_ft, 0.f, 1012.f, 1920.f, 1080.f, 0.f, 0.f);
+    make_quad_vtx(q_hd, 0.f, 0.f, 1920.f, 68.f, 0.f, 0.f);
+    for (int fr = 0; fr < 2; fr++) {
+        g_f += 2;
+        vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+        assert(sel_box_1080(fb, q_c1, 6, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_z, 30, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_lv, 18, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_ex, 18, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_h, 6, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_c2, 6, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_bl, 84, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_ft, 6, 0u, 1u) == 0);
+        assert(sel_box_1080(fb, q_hd, 6, 0u, 1u) == 0);
+        assert(g_vka_mm.pass_modal == 1 && g_vka_mm.obj_ttl == 0u && g_vka_mm.mm_ttl == 0u);
+        vka_minimap_pass_end(1ull, &im);
+        vka_minimap_present();
+    }
+    assert(nxhost_companion_minimap(NULL, 0, mm_meta) == 0 && mm_meta[0] == 0 && mm_meta[1] == 0);
+    g_vka_mm.mm.ready_w = 0u; g_vka_mm.mm.ready_h = 0u;
+}
+
 int main(void) {
     test_proj_decode();
     test_pass_462636();
@@ -536,6 +631,8 @@ int main(void) {
     test_speech_popup_stays();
     test_menu_dim_stops_capture();
     test_minimap_group_closes();
+    test_terrain_backing_and_camp_bubbles();
+    test_allies_menu_stays();
     puts("vka_minimap_c_regression: PASS");
     return 0;
 }

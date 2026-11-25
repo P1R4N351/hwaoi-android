@@ -245,7 +245,7 @@ static int vka_mm_ensure_hud(VkCommandBuffer cb, uint32_t w, uint32_t h, VkForma
 }
 
 static vka_mm_rect vka_mm_lhud_box(uint32_t w, uint32_t h) {
-    uint32_t lw = ((uint32_t)lrintf((float)w * 0.26f)) & ~3u;
+    uint32_t lw = ((uint32_t)lrintf((float)w * 0.28f)) & ~3u;
     if (lw > VKA_LHUD_MAX_W) lw = VKA_LHUD_MAX_W;
     if (lw > (w & ~3u)) lw = w & ~3u;
     uint32_t lh = h < VKA_LHUD_MAX_H ? h : VKA_LHUD_MAX_H;
@@ -313,7 +313,7 @@ static int vka_mm_switch_target(VkCommandBuffer cb, int want_hud) {
     if (want_hud && !g_vka_mm.pass_hud_cleared) vka_mm_clear_hud_img(cb);
     VkMemoryBarrier mb = {
         VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
         .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
             | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
     };
@@ -700,7 +700,11 @@ static void vka_mm_note_foreign(const float *mn, const float *mx, int32_t cnt) {
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
     if (cnt < 4 || g_vka_mm.nfp >= 8) return;
-    if (mn[0] > w * 0.26f || mx[0] < w * 0.30f || bw < w * 0.20f || bw > w * 0.90f || bh < h * 0.04f || bh > h * 0.50f) return;
+    int left_wide = mn[0] <= w * 0.26f && mx[0] >= w * 0.30f && bw >= w * 0.20f && bw <= w * 0.90f
+        && bh >= h * 0.04f && bh <= h * 0.50f;
+    int right_card = mn[0] >= w * 0.40f && mx[0] <= w + 8.f && mn[1] >= -8.f && mx[1] <= h + 8.f
+        && bw >= w * 0.25f && bh >= h * 0.095f && bh <= h * 0.75f;
+    if (!left_wide && !right_card) return;
     float *r = g_vka_mm.fp[g_vka_mm.nfp++];
     r[0] = mn[0]; r[1] = mn[1]; r[2] = mx[0]; r[3] = mx[1];
 }
@@ -721,14 +725,17 @@ static int vka_mm_is_lhud_draw(const float *mn, const float *mx, int32_t cnt) {
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
     int ll = vka_origin_ll();
     int top_band = !ll ? (mn[1] >= -8.f && mx[1] <= h * 0.18f) : (mn[1] >= h * 0.82f && mx[1] <= h + 8.f);
-    if (top_band && mn[0] >= -8.f && mn[0] <= w * 0.095f && mx[0] <= w * 0.22f
+    if (top_band && mn[0] >= -w * 0.03f && mn[0] <= w * 0.095f && mx[0] <= w * 0.22f
             && bw >= 10.f && bh >= 5.f && bh <= h * 0.09f) {
         g_vka_mm.pass_lhud_top = 1;
     }
-    if (!(g_vka_mm.pass_lhud_top || g_vka_mm.pass_mm_hit || g_vka_mm.lhud_ttl > 0u)) return 0;
-    if (mn[0] < -16.f || mn[0] > w * 0.20f || mx[0] > w * 0.26f || mn[1] < -16.f || mx[1] > h + 16.f) return 0;
-    if (bw < 6.f || bw > w * 0.26f || bh < 6.f || bh > h * 0.42f) return 0;
+    if (!(g_vka_mm.pass_lhud_top || g_vka_mm.lhud_ttl > 0u)) return 0;
+    if (mn[0] < -w * 0.05f || mn[0] > w * 0.22f || mx[0] > w * 0.28f || mn[1] < -16.f || mx[1] > h + 16.f) return 0;
+    if (bw < 6.f || bw > w * 0.32f || bh < 6.f || bh > h * 0.42f) return 0;
     if (mn[0] > w * 0.18f && bh > bw * 6.f) return 0;
+    int dead_y = !ll ? (mn[1] > h * 0.345f && mx[1] < h * 0.495f) : (mn[1] > h * 0.505f && mx[1] < h * 0.655f);
+    int ov_y = !ll ? (mn[1] >= h * 0.20f && mx[1] <= h * 0.845f) : (mn[1] >= h * 0.155f && mx[1] <= h * 0.80f);
+    if (dead_y || (ov_y && cnt >= 30 && mn[0] > w * 0.08f)) return 0;
     if (vka_mm_on_foreign(mn, mx)) return 0;
     g_vka_mm.pass_lhud_any = 1;
     g_vka_mm.hit_lhud = vka_mm_lhud_box(g_vka_mm.pass_w, g_vka_mm.pass_h);
@@ -739,7 +746,7 @@ static int vka_mm_obj_pill(const float *mn, const float *mx, int32_t cnt) {
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
     if (cnt > 36 || mn[0] < w * 0.48f || mn[0] > w * 0.88f || mx[0] < w * 0.72f) return 0;
-    if (bh < h * 0.018f || bh > h * 0.14f || bw < bh * 2.0f) return 0;
+    if (bh < h * 0.018f || bh > h * 0.085f || bw < bh * 2.0f) return 0;
     int known = (g_vka_mm.pass_obj_icon && fabsf(cy - g_vka_mm.obj_icon_cy) <= h * 0.06f)
         || (g_vka_mm.pass_obj_text && fabsf(cy - g_vka_mm.cand_text_cy) <= h * 0.06f && mn[0] <= g_vka_mm.cand_text_mn_x)
         || (g_vka_mm.obj_ttl > 0u && fabsf(cy - g_vka_mm.learn_obj_cy) <= h * 0.06f && mn[0] >= g_vka_mm.learn_obj_icon_x - 64.f);
@@ -751,6 +758,7 @@ static int vka_mm_obj_pill(const float *mn, const float *mx, int32_t cnt) {
 }
 
 static int vka_mm_obj_text(const float *mn, const float *mx, int32_t cnt) {
+    if (!(g_vka_mm.pass_obj_pill || g_vka_mm.obj_ttl > 0u)) return 0;
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
     if (cnt < 12 || cnt > 1200 || mn[0] < w * 0.52f || mx[0] > w + 24.f) return 0;
@@ -772,10 +780,11 @@ static int vka_mm_obj_text(const float *mn, const float *mx, int32_t cnt) {
 }
 
 static int vka_mm_obj_icon(const float *mn, const float *mx, int32_t cnt) {
+    if (!(g_vka_mm.pass_obj_pill || g_vka_mm.obj_ttl > 0u)) return 0;
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
     float icx = (mn[0] + mx[0]) * 0.5f;
-    if (cnt > 96 || mx[0] > w * 0.92f || bw < h * 0.004f || bw > h * 0.18f || bh < h * 0.004f || bh > h * 0.18f) return 0;
+    if (cnt > 12 || mx[0] > w * 0.92f || bw < h * 0.004f || bw > h * 0.18f || bh < h * 0.004f || bh > h * 0.18f) return 0;
     if (fabsf(bw - bh) > fmaxf(8.f, bw * 0.35f)) return 0;
     int near_text = (g_vka_mm.pass_obj_text || g_vka_mm.cand_obj_text)
         && fabsf(cy - g_vka_mm.cand_text_cy) <= h * 0.06f
@@ -803,6 +812,7 @@ static int vka_mm_obj_icon(const float *mn, const float *mx, int32_t cnt) {
 }
 
 static int vka_mm_is_obj_draw(const float *mn, const float *mx, int32_t cnt) {
+    if (vka_mm_on_foreign(mn, mx)) return 0;
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float cy = (mn[1] + mx[1]) * 0.5f;
     if (mn[0] < w * 0.45f || mx[0] > w + 48.f || cy < h * 0.14f || cy > h * 0.68f) return 0;
@@ -828,6 +838,24 @@ static void vka_minimap_trace_draw(uint64_t vsk, uint64_t fsk, const vka_img *t0
          (unsigned long long)g_vka_mm_tr.ua, (unsigned long long)g_vka_mm_tr.usz, g_vka_mm_tr.mbase, (unsigned long long)kch, koff, klen);
 }
 
+static void vka_mm_note_pass_overlays(float w, float h, const float *mn, const float *mx, uint32_t stt, uint32_t bl, int32_t cnt) {
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
+    // A blended quad over the whole pass (dim/fade) or a full-width menu header/footer band marks the pass modal.
+    int fs_dim = stt == 0u && bl && cnt <= 6 && fabsf(mn[0]) <= 2.f && fabsf(mn[1]) <= 2.f
+        && fabsf(mx[0] - w) <= 2.f && fabsf(mx[1] - h) <= 2.f;
+    int menu_band = stt == 0u && bl && cnt <= 12 && mn[0] <= 2.f && mx[0] >= w - 2.f
+        && bh >= h * 0.04f && bh <= h * 0.12f && (mn[1] <= 2.f || mx[1] >= h - 2.f);
+    if (fs_dim || menu_band) {
+        g_vka_mm.fr_modal = 1; g_vka_mm.pass_modal = 1;
+        g_vka_mm.mm_ttl = 0u; g_vka_mm.obj_ttl = 0u; g_vka_mm.lhud_ttl = 0u;
+    }
+    if (cnt >= 4 && bw >= w * 0.28f && bw <= w * 0.88f && bh >= h * 0.12f && bh <= h * 0.88f
+            && fabsf(cx - w * 0.5f) < w * 0.16f && mn[1] < h * 0.66f && mx[1] > h * 0.20f)
+        g_vka_mm.pass_modal = 1;
+    if (cnt >= 4 && bw >= w * 0.34f && bw <= w * 0.88f && bh <= h * 0.45f && cy > h * 0.62f && fabsf(cx - w * 0.5f) < w * 0.18f)
+        g_vka_mm.pass_dialog = 1;
+}
+
 static int vka_minimap_select_target(
     VkCommandBuffer cb, const vka_dstate *d, uint32_t vin_mask, const p_draw *dw, const p_draw_idx *di,
     int mesh, uint64_t ind, uint32_t stt, uint32_t dt, uint32_t c0_mask, uint32_t blend_en) {
@@ -841,26 +869,13 @@ static int vka_minimap_select_target(
     if (cnt < 3 || cnt > 4096 || !vka_mm_attr_xy_bounds(d, vin_mask, dw, di, cnt, mn, mx)) return vka_mm_switch_target(cb, 0);
     g_vka_mm_tr.hb = 1; g_vka_mm_tr.cls = '-';
     g_vka_mm_tr.mn[0] = mn[0]; g_vka_mm_tr.mn[1] = mn[1]; g_vka_mm_tr.mx[0] = mx[0]; g_vka_mm_tr.mx[1] = mx[1];
-    float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
-    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
+    float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h, bw = mx[0] - mn[0], bh = mx[1] - mn[1];
     if (stt == 0u && !blend_en && cnt <= 6) {
         int px_fs = (bw >= w * 0.90f && bh >= h * 0.90f);
         int ndc_fs = (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f);
         if (px_fs || ndc_fs) { g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F'; return vka_mm_switch_target(cb, 0); }
     }
-    // A blended quad over exactly the whole pass is a menu's frozen scene or dim layer (or a fade): the HUD is not the
-    // active layer, so nothing more is captured this frame, in this pass or a later one.
-    if (stt == 0u && blend_en && cnt <= 6 && (c0_mask & 0xfu) != 0u
-            && fabsf(mn[0]) <= 2.f && fabsf(mn[1]) <= 2.f && fabsf(mx[0] - w) <= 2.f && fabsf(mx[1] - h) <= 2.f) {
-        g_vka_mm.fr_modal = 1; g_vka_mm.pass_modal = 1;
-    }
-    if ((c0_mask & 0xfu) != 0u && cnt >= 4) {
-        if (bw >= w * 0.28f && bw <= w * 0.88f && bh >= h * 0.12f && bh <= h * 0.88f
-                && fabsf(cx - w * 0.5f) < w * 0.16f && mn[1] < h * 0.66f && mx[1] > h * 0.20f)
-            g_vka_mm.pass_modal = 1;
-        if (bw >= w * 0.34f && bw <= w * 0.88f && bh <= h * 0.45f && cy > h * 0.62f && fabsf(cx - w * 0.5f) < w * 0.18f)
-            g_vka_mm.pass_dialog = 1;
-    }
+    if ((c0_mask & 0xfu) != 0u) vka_mm_note_pass_overlays(w, h, mn, mx, stt, blend_en, cnt);
     if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vka_mm_tr.cls = 'S'; vka_mm_try_minimap(mn, mx); return 0; }
     if (g_vka_mm.pass_opaque_fs || g_vka_mm.pass_modal || (c0_mask & 0xfu) == 0u) { g_vka_mm_tr.cls = 'M'; return vka_mm_switch_target(cb, 0); }
     int want = vka_mm_is_mm_draw(mn, mx, stt, cnt);
@@ -905,6 +920,7 @@ static void vka_mm_stream_stage(vka_mm_stream *st, VkCommandBuffer cb, const vka
     VkDeviceSize need = (VkDeviceSize)r->w * r->h * 4u;
     if ((g_vka_mm.frame_counter & 1u) != 0u || !r->w || !r->h || need > st->slot_bytes) return;
     if (!g_vka_mm.hud_ready || !vka_mm_ensure_stream_ring(st)) return;
+    vka_barrier(cb);
     vka_mm_slot *dst = &st->slot[st->write_slot];
     VkBufferImageCopy rg = {
         .bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u},
@@ -970,7 +986,8 @@ static void vka_mm_stage_ui_tex(VkCommandBuffer cb) {
 static void vka_minimap_pass_end(VkCommandBuffer cb, vka_img *im) {
     int was = g_vka_mm.in_hud_pass, cleared = g_vka_mm.pass_hud_cleared;
     int mh = g_vka_mm.pass_mm_hit, oh = g_vka_mm.pass_obj_hit, op = g_vka_mm.pass_opaque_fs, md = g_vka_mm.pass_modal;
-    int lh = (!op && !md && g_vka_mm.pass_lhud_any && (mh || (g_vka_mm.pass_lhud_top && !g_vka_mm.pass_dialog))
+    int lh = (!op && !md && g_vka_mm.pass_lhud_any
+        && ((g_vka_mm.pass_lhud_top && (mh || !g_vka_mm.pass_dialog)) || (mh && g_vka_mm.lhud_ttl > 0u))
         && g_vka_mm.hit_lhud.w >= 64u && g_vka_mm.hit_lhud.h >= 64u);
     float oicx = g_vka_mm.obj_icon_cx;
     int obj_pair = (!op && !md && g_vka_mm.cand_obj_text && g_vka_mm.pass_obj_icon
@@ -1078,9 +1095,10 @@ int nxhost_companion_minimap(uint8_t *rgba_out, int max_bytes, int32_t meta[5]) 
     pthread_mutex_lock(&g_vka_mm.mu);
     int cnt = atomic_load_explicit(&g_vka_mm.cand_count, memory_order_acquire);
     int cidx = cnt > 0 ? (int)(atomic_load_explicit(&g_vka_mm.cand_idx, memory_order_acquire) % (uint32_t)cnt) : 0;
+    int active = (g_vka_mm.mm_ttl > 0u || g_vka_mm.saw_mm_frame) ? 1 : 0;
     int rslot = g_vka_mm.mm.ready_slot;
-    uint32_t w = g_vka_mm.mm.ready_w, h = g_vka_mm.mm.ready_h, seq = g_vka_mm.mm.seq;
-    if (rslot >= 0 && rslot < VKA_MM_SLOTS && g_vka_mm.mm.slot[rslot].ptr && seq != client_seq) {
+    uint32_t w = active ? g_vka_mm.mm.ready_w : 0u, h = active ? g_vka_mm.mm.ready_h : 0u, seq = g_vka_mm.mm.seq;
+    if (active && rslot >= 0 && rslot < VKA_MM_SLOTS && g_vka_mm.mm.slot[rslot].ptr && seq != client_seq) {
         size_t need = (size_t)w * h * 4u;
         if (rgba_out && need > 0 && (size_t)max_bytes >= need) {
             vka_mm_copy_rgba(rgba_out, g_vka_mm.mm.slot[rslot].ptr, w, h, g_vka_mm.mm.ready_fmt, vka_origin_ll(), 0);
