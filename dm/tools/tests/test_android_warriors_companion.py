@@ -664,6 +664,52 @@ static void test_left_world_marker_stays(void) {
     g_vka_mm.ring_tex = 0ull;
 }
 
+static void test_stream_modes(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos q_combo[6], q_bar[18];
+    make_quad_vtx(q_combo, -60.f, 514.f, 396.f, 626.f, 0.f, 0.f);
+    make_quad_vtx(&q_bar[0], 1420.f, 468.f, 1920.f, 524.f, 0.f, 0.f);
+    make_quad_vtx(&q_bar[6], 1440.f, 472.f, 1920.f, 520.f, 0.f, 0.f);
+    make_quad_vtx(&q_bar[12], 1460.f, 476.f, 1920.f, 516.f, 0.f, 0.f);
+    nxhost_companion_minimap_enable(0); nxhost_companion_minimap_enable(1);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    /* default: the HUD column is captured */
+    vka_minimap_note_draw_wid(KTGL_WID_COMBO);
+    (void)sel_box_1080(fb, q_combo, 6, 0u, 1u);
+    assert(vka_minimap_on_hud_target() && vka_minimap_skip_draw() == 0);
+    /* HUD column kept on the first screen: drawn there, not skipped */
+    nxhost_companion_stream_mode(2, 1);
+    (void)sel_box_1080(fb, q_combo, 6, 0u, 1u);
+    assert(!vka_minimap_on_hud_target() && vka_minimap_skip_draw() == 0);
+    /* HUD column hidden: drawn on neither */
+    nxhost_companion_stream_mode(2, 2);
+    (void)sel_box_1080(fb, q_combo, 6, 0u, 1u);
+    assert(!vka_minimap_on_hud_target() && vka_minimap_skip_draw() == 1);
+    /* the objective bar is a separate module and is still captured */
+    vka_minimap_note_draw_wid(KTGL_WID_OBJECTIVE);
+    (void)sel_box_1080(fb, q_bar, 18, 0u, 1u);
+    assert(vka_minimap_on_hud_target() && vka_minimap_skip_draw() == 0);
+    nxhost_companion_stream_mode(1, 1);
+    (void)sel_box_1080(fb, q_bar, 18, 0u, 1u);
+    assert(!vka_minimap_on_hud_target() && vka_minimap_skip_draw() == 0);
+    /* out-of-range arguments change nothing; then back to the defaults */
+    nxhost_companion_stream_mode(3, 1); nxhost_companion_stream_mode(0, 7);
+    nxhost_companion_stream_mode(1, 0); nxhost_companion_stream_mode(2, 0);
+    vka_minimap_note_draw_wid(KTGL_WID_COMBO);
+    (void)sel_box_1080(fb, q_combo, 6, 0u, 1u);
+    assert(vka_minimap_on_hud_target() && vka_minimap_skip_draw() == 0);
+    vka_minimap_note_draw_wid(0u);
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+}
+
 static void test_wid_routing_and_stability(void) {
     float fb[64]; memset(fb, 0, sizeof fb);
     fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
@@ -908,6 +954,7 @@ int main(void) {
     test_left_world_marker_stays();
     test_backing_edge_and_unknown_ring();
     test_wid_routing_and_stability();
+    test_stream_modes();
     test_travel_safely_subtitle_stays();
     test_world_ring_known_by_texture();
     test_minimap_variant_without_stencil();

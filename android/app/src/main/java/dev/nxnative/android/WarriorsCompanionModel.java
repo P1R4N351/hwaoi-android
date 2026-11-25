@@ -143,6 +143,17 @@ public final class WarriorsCompanionModel {
     public void toggleHeadingUp() { headingUp = !headingUp; }
     public void toggleMacroMode() { macroMode = !macroMode; }
     public void toggleAutoDim() { autoDim = !autoDim; }
+
+    public static final int STREAM_MINIMAP = 0, STREAM_OBJECTIVE = 1, STREAM_HUD = 2, STREAM_COUNT = 3;
+    public static final int ON_SECOND = 0, ON_FIRST = 1, ON_NEITHER = 2;
+    /** Where each captured module is shown; ON_SECOND is the default. */
+    public final int[] streamMode = new int[STREAM_COUNT];
+    public static int nextStreamMode(int mode) { return mode == ON_SECOND ? ON_FIRST : mode == ON_FIRST ? ON_NEITHER : ON_SECOND; }
+    public boolean onSecond(int stream) { return streamMode[stream] == ON_SECOND; }
+    public String streamModeLabel(int stream) {
+        int m = streamMode[stream];
+        return m == ON_SECOND ? "2ND SCREEN" : m == ON_FIRST ? "TOP SCREEN" : "HIDDEN";
+    }
     public int cycleZoom() { zoomIdx = (zoomIdx + 1) % ZOOM_METERS.length; return zoomIdx; }
     public float radiusMeters() { return ZOOM_METERS[zoomIdx]; }
     public int cyclePreset() { pinPresetIdx = (pinPresetIdx + 1) % 5; return pinPresetIdx; }

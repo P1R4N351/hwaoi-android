@@ -56,9 +56,9 @@ final class WarriorsCompanionLayout {
     static final float ST_DEV_Y = 516f, ST_LINE = 28f, ST_FOOTER_Y = 950f;
     static final int ST_DEV_LINES = 7;
     static final float ROW_X0 = ST_X + ST_GRAPH_W + 72f, ROW_X1 = FRAME_R - 8f;
-    static final float ROW_Y0 = 140f, ROW_STEP = 112f, ROW_RULE = 96f;
+    static final float ROW_Y0 = 140f, ROW_STEP = 81f, ROW_RULE = 70f, ROW_MID = 34f, ROW_BASELINE = 41f;   // ten rows above the footer
     static final float ROW_DIAMOND_X = ROW_X0 + 12f, ROW_LABEL_X = ROW_X0 + 36f;
-    static final int ROW_COUNT = 7;
+    static final int ROW_COUNT = 10;
 
     /* Motion. */
     static final float OMEGA = 28f;              // rad/s: from rest, within 1% of target at ~237 ms

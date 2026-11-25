@@ -198,6 +198,8 @@ final class Native {
     static native int companionMinimapCycle();
     /** Enables or disables native Vulkan minimap capture. */
     static native void companionMinimapEnable(boolean on);
+    /** Where a captured module is shown: stream 0 minimap, 1 objective bar, 2 HUD column; mode 0 second screen, 1 first screen, 2 neither. */
+    static native void companionStreamMode(int stream, int mode);
     /** Reads native Vulkan objective indicator into RGBA buffer; meta = {w, h, seq, active}. Returns 1 if updated. */
     static native int companionObjective(byte[] rgba, int[] meta);
     /** Reads native Vulkan left-column gameplay HUD into RGBA buffer; meta = {w, h, seq, active}. Returns 1 if updated. */

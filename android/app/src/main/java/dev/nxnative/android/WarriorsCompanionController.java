@@ -79,6 +79,10 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         this.model.stickSync = Prefs.bifrostScreenSync(activity);
         BifrostBridge.setEnabled(this.model.stickLights);
         this.drawerOpen = Prefs.companionDrawer(activity, titleId);
+        for (int i = 0; i < WarriorsCompanionModel.STREAM_COUNT; i++) {
+            int mode = Prefs.companionStreamMode(activity, titleId, i);
+            this.model.streamMode[i] = mode >= 0 && mode <= WarriorsCompanionModel.ON_NEITHER ? mode : 0;
+        }
         this.art.loadCached(activity);
         syncArtFlags();
         if (!this.art.hasAllPadArt()) {
@@ -123,6 +127,7 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
             @Override public void onCycleRt() { cycleRt(); }
             @Override public void onRescanArt() { rescanArt(); }
             @Override public void onClearArt() { art.clearCache(activity); onArtUpdated(); }
+            @Override public void onCycleStream(int stream) { cycleStream(stream); }
             @Override public void onTouchPulse() { BifrostBridge.touched(); }
         };
     }
@@ -155,6 +160,24 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         model.stickSync = next;
         invalidateViews();
     }
+
+    private void cycleStream(int stream) {
+        if (stream < 0 || stream >= WarriorsCompanionModel.STREAM_COUNT) return;
+        int next = WarriorsCompanionModel.nextStreamMode(model.streamMode[stream]);
+        Prefs.companionStreamMode(activity, titleId, stream, next);
+        model.streamMode[stream] = next;
+        streamModesPushed = false;
+        invalidateViews();
+    }
+
+    /** Tells the native capture where each module goes; cheap, and repeated only after a change. */
+    private void pushStreamModes() {
+        if (streamModesPushed) return;
+        for (int i = 0; i < WarriorsCompanionModel.STREAM_COUNT; i++) Native.companionStreamMode(i, model.streamMode[i]);
+        streamModesPushed = true;
+    }
+
+    private boolean streamModesPushed;
 
     private void cycleRt() {
         model.minimapCandIdx = Native.companionMinimapCycle();
@@ -288,9 +311,13 @@ final class WarriorsCompanionController implements DisplayManager.DisplayListene
         model.devOnStatus = Prefs.overlayOnSecondScreen(activity);
         if (minimapWantActive()) {
             Native.companionMinimapEnable(true);
-            pollMinimapStream();
-            pollObjectiveStream();
-            pollLeftHudStream();
+            pushStreamModes();
+            if (model.onSecond(WarriorsCompanionModel.STREAM_MINIMAP)) pollMinimapStream();
+            else { minimapMeta[2] = 0; art.setMinimap(null); }
+            if (model.onSecond(WarriorsCompanionModel.STREAM_OBJECTIVE)) pollObjectiveStream();
+            else { objMeta[2] = 0; art.setObjective(null); }
+            if (model.onSecond(WarriorsCompanionModel.STREAM_HUD)) pollLeftHudStream();
+            else { lhudMeta[2] = 0; art.setLeftHud(null); }
         } else {
             Native.companionMinimapEnable(false);
             minimapMeta[2] = 0; objMeta[2] = 0; lhudMeta[2] = 0;

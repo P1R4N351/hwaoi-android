@@ -76,6 +76,7 @@ static struct {
     int hud_ready, hud_failed, has_depth, has_stencil_att, cur_hud, pass_hud_cleared;
     vka_mm_cand cand[VKA_MM_MAX_CAND];
     _Atomic int cand_count, want_active;
+    _Atomic int stream_mode[3];   // per module (0 minimap, 1 objective, 2 left HUD): 0 second screen, 1 first screen, 2 neither
     _Atomic uint32_t cand_idx;
     uint32_t frame_counter, mm_ttl, obj_ttl, lhud_ttl;
     int saw_mm_frame, saw_obj_frame, saw_lhud_frame;
@@ -92,7 +93,7 @@ static struct {
     float obj_umin_x, obj_umin_y, obj_umax_x, obj_umax_y;
     float obj_icon_cx, obj_icon_core_w, obj_icon_cy, obj_pill_mn_x, obj_pill_cy;
     float cand_text_mn_x, cand_text_cy, learn_obj_icon_x, learn_obj_text_x, learn_obj_cy;
-    uint8_t cur_wid, cur_wid_bg, wid_dest[15];
+    uint8_t stale_wid, cur_wid, cur_wid_bg, wid_dest[15];
     int wid_init, skip_cur_draw, pass_lhud_tagged, pass_obj_tagged, pass_mm_tagged, pass_mm_square, mm_tbox_init;
     float mm_tbox[4];
 } g_vka_mm = {
@@ -406,7 +407,19 @@ static void vka_mm_clear_hud_img(VkCommandBuffer cb) {
     g_vka_mm.hud_cleared_im = g_vka_mm.pass_im;
 }
 
+enum { VKA_MM_ON_SECOND = 0, VKA_MM_ON_FIRST = 1, VKA_MM_ON_NEITHER = 2 };
+
+static int vka_mm_cls_mode(char cls) {
+    int i = (cls == 'm' || cls == 'S') ? 0 : cls == 'o' ? 1 : cls == 'l' ? 2 : -1;
+    return i < 0 ? VKA_MM_ON_SECOND : atomic_load_explicit(&g_vka_mm.stream_mode[i], memory_order_relaxed);
+}
+
 static int vka_mm_switch_target(VkCommandBuffer cb, int want_hud) {
+    if (want_hud) {   // a module the player moved back to the first screen, or hid, is not sent to the HUD image
+        int mode = vka_mm_cls_mode(g_vka_mm_tr.cls);
+        if (mode == VKA_MM_ON_NEITHER) g_vka_mm.skip_cur_draw = 1;
+        if (mode != VKA_MM_ON_SECOND) want_hud = 0;
+    }
     if (!g_vka_mm.in_hud_pass || !g_vka_mm.hud_ready || g_vka_mm.cur_hud == want_hud) return 0;
     vka_oq_pass_end();
     vk.vkCmdEndRendering(cb);
@@ -446,6 +459,15 @@ static int vka_mm_switch_target(VkCommandBuffer cb, int want_hud) {
     vk.vkCmdBeginRendering(cb, &ri);
     g_vka_mm.cur_hud = want_hud;
     return 1;
+}
+
+// The minimap's stencil masks are drawn where the minimap is drawn: left alone when it is captured (as before), on the
+// first screen's target when the player keeps the minimap there, and not at all when it is hidden.
+static int vka_mm_mask_target(VkCommandBuffer cb) {
+    int mode = vka_mm_cls_mode('S');
+    if (mode == VKA_MM_ON_SECOND) return 0;
+    if (mode == VKA_MM_ON_NEITHER) g_vka_mm.skip_cur_draw = 1;
+    return vka_mm_switch_target(cb, 0);
 }
 
 static int vka_minimap_bind_main(VkCommandBuffer cb) {
@@ -1070,7 +1092,7 @@ static int vka_mm_tagged_mm(
     if (stt != 0u && (c0_mask & 0xfu) == 0u) {
         g_vka_mm_tr.cls = 'S';
         if (can_box) vka_mm_try_minimap(mn, mx);
-        return 0;
+        return vka_mm_mask_target(cb);
     }
     if (!hb) {
         g_vka_mm_tr.cls = '-';
@@ -1192,7 +1214,7 @@ static int vka_mm_select_fallback(
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
     if ((c0_mask & 0xfu) != 0u) vka_mm_note_pass_overlays(w, h, mn, mx, stt, blend_en, cnt);
-    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vka_mm_tr.cls = 'S'; vka_mm_try_minimap(mn, mx); return 0; }
+    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vka_mm_tr.cls = 'S'; vka_mm_try_minimap(mn, mx); return vka_mm_mask_target(cb); }
     if (g_vka_mm.pass_opaque_fs || g_vka_mm.pass_modal || (c0_mask & 0xfu) == 0u) { g_vka_mm_tr.cls = 'M'; return vka_mm_switch_target(cb, 0); }
     int prev_small = g_vka_mm.last_small;
     float pq[4] = { g_vka_mm.last_q[0], g_vka_mm.last_q[1], g_vka_mm.last_q[2], g_vka_mm.last_q[3] };
@@ -1235,10 +1257,15 @@ static int vka_minimap_select_target(
                 && ((bw >= w * 0.90f && bh >= h * 0.90f)
                     || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f))) {
             g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F';
+            g_vka_mm.stale_wid = g_vka_mm.cur_wid;   /* an id set before the HUD starts is not a HUD widget's */
             return vka_mm_switch_target(cb, 0);
         }
     } else {
         g_vka_mm_tr.cls = 'b';
+    }
+    if (g_vka_mm.stale_wid) {
+        if (wid == g_vka_mm.stale_wid) wid = 0u;
+        else g_vka_mm.stale_wid = 0u;
     }
     uint8_t dest = wid ? vka_mm_wid_dest(wid) : KTGL_DEST_FALLBACK;
     if (dest != KTGL_DEST_FALLBACK) {
@@ -1433,6 +1460,7 @@ void vka_minimap_present(void) {
     memcpy(g_vka_mm.wm_prev, g_vka_mm.wm_cur, sizeof g_vka_mm.wm_prev);
     g_vka_mm.nwm_prev = g_vka_mm.nwm_cur; g_vka_mm.nwm_cur = 0;
     g_vka_mm.prev_lhud_top = g_vka_mm.pass_lhud_top; g_vka_mm.pass_lhud_top = 0;
+    g_vka_mm.stale_wid = 0u;
 }
 
 static _Atomic int g_vka_srgb_lut_ready;
@@ -1597,6 +1625,12 @@ int nxhost_companion_ui_tex(uint8_t *rgba_out, int max_bytes, int32_t meta[4], i
     meta[2] = (int32_t)g_vka_mm.ui_seq; meta[3] = st;
     pthread_mutex_unlock(&g_vka_mm.mu);
     return updated;
+}
+
+__attribute__((visibility("default")))
+void nxhost_companion_stream_mode(int stream, int mode) {
+    if (stream < 0 || stream > 2 || mode < VKA_MM_ON_SECOND || mode > VKA_MM_ON_NEITHER) return;
+    atomic_store_explicit(&g_vka_mm.stream_mode[stream], mode, memory_order_release);
 }
 
 __attribute__((visibility("default")))

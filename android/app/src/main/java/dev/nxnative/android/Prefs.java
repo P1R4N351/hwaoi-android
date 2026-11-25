@@ -539,6 +539,9 @@ final class Prefs {
     /** Opt-in single-screen Companion HUD drawer toggle (Display 4 attaches automatically when present) */
     static boolean companionDrawer(Context c, String titleId) { return of(c).getBoolean(gameKey("companion_drawer", titleId), false); }
     static void companionDrawer(Context c, String titleId, boolean on) { of(c).edit().putBoolean(gameKey("companion_drawer", titleId), on).commit(); }
+    /** Second screen › where a module is shown (stream 0 minimap, 1 objective bar, 2 HUD column): 0 second screen, 1 first screen, 2 hidden */
+    static int companionStreamMode(Context c, String titleId, int stream) { return of(c).getInt(gameKey("companion_stream_" + stream, titleId), 0); }
+    static void companionStreamMode(Context c, String titleId, int stream, int mode) { of(c).edit().putInt(gameKey("companion_stream_" + stream, titleId), mode).commit(); }
 
     /**
      * The game's own environment lines (KEY=VALUE, one a line; its Game settings), given to the host after the launcher's settings and env.txt, so they win for

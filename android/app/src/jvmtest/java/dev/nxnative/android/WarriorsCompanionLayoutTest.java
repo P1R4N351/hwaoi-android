@@ -264,7 +264,7 @@ public final class WarriorsCompanionLayoutTest {
                 && devEnd < WarriorsCompanionLayout.ST_FOOTER_Y - 17f && WarriorsCompanionLayout.ST_FOOTER_Y <= WarriorsCompanionLayout.FRAME_B,
                 "telemetry blocks stack without collision");
         for (int r = 0; r < WarriorsCompanionLayout.ROW_COUNT; r++) {
-            float y = WarriorsCompanionLayout.rowTop(r) + 48f;
+            float y = WarriorsCompanionLayout.rowTop(r) + WarriorsCompanionLayout.ROW_MID;
             check(WarriorsCompanionLayout.statusRowAt(WarriorsCompanionLayout.ROW_LABEL_X, y) == r, "row " + r + " hit");
         }
         check(WarriorsCompanionLayout.statusRowAt(WarriorsCompanionLayout.ROW_LABEL_X, 100f) == -1, "above rows misses");

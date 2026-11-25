@@ -20,6 +20,7 @@ final class WarriorsCompanionView extends View {
         void onCycleRt();
         void onRescanArt();
         void onClearArt();
+        void onCycleStream(int stream);
         void onTouchPulse();
     }
 
@@ -86,7 +87,8 @@ final class WarriorsCompanionView extends View {
         else if (row == 3) model.toggleAutoDim();
         else if (row == 4) actions.onCycleRt();
         else if (row == 5) actions.onRescanArt();
-        else actions.onClearArt();
+        else if (row == 6) actions.onClearArt();
+        else actions.onCycleStream(row - 7);
         return true;
     }
 }

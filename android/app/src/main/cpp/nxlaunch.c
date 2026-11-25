@@ -654,6 +654,8 @@ int nxhost_companion_minimap(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
 int nxhost_companion_minimap_cycle(void);
 #pragma weak nxhost_companion_minimap_enable
 void nxhost_companion_minimap_enable(int on);
+#pragma weak nxhost_companion_stream_mode
+void nxhost_companion_stream_mode(int stream, int mode);
 #pragma weak nxhost_companion_objective
 int nxhost_companion_objective(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
 #pragma weak nxhost_companion_lhud
@@ -729,6 +731,11 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionMinimap(
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_companionMinimapCycle(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     return nxhost_companion_minimap_cycle ? (jint)nxhost_companion_minimap_cycle() : 0;
+}
+
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionStreamMode(JNIEnv *env, jclass cls, jint stream, jint mode) {
+    (void)env; (void)cls;
+    if (nxhost_companion_stream_mode) nxhost_companion_stream_mode((int)stream, (int)mode);
 }
 
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_companionMinimapEnable(JNIEnv *env, jclass cls, jboolean on) {
