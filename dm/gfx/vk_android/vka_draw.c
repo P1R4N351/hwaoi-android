@@ -3006,6 +3006,17 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     if (src1_used) VRED_ONCE("a SRC1 blend factor with no dual-source module (MOD_DUAL; the profile's dual_want.tsv) or no dualSrcBlend: the second source reads as zero");
     {
         uint32_t mm_vin = (!mesh && sh[0] && sh[0]->e) ? sh[0]->e->vin_mask : 0u;
+        if (vka_minimap_in_hud_pass()) {   // the texture this draw samples first, for the classifier (the objective ring is known by it)
+            uint64_t mm_tex = 0u;
+            int n_ = (!mesh && sh[1]) ? (g_wk.n[1] < 16 ? g_wk.n[1] : 16) : 0;
+            for (int i_ = 0; i_ < n_ && !mm_tex; i_++) {
+                const vka_res *r_ = &g_wk.r[1][i_];
+                if (r_->what != VKA_R_TEX || !r_->tid || vka_tex_id_is_buffer(r_->tid)) continue;
+                const vka_img *t_ = vka_tex_id_img(r_->tid, g_cb);
+                if (t_) mm_tex = t_->serial;
+            }
+            vka_minimap_note_draw_tex(mm_tex);
+        }
         if (vka_minimap_select_target(g_cb, d, mm_vin, dw, di, mesh, ind, d->ds.st,
                 (R.df != VK_FORMAT_UNDEFINED && d->ds.dt), k.att[0].mask, k.att[0].en)) {
             if (RUN.open) inst_close();
@@ -3163,6 +3174,7 @@ dyn_done:
             if (!t0_) t0_ = vka_tex_id_img(r_->tid, g_cb);
             nt_++;
         }
+        vka_minimap_trace_blend(k.att[0].src, k.att[0].dst, k.att[0].op, k.att[0].srca, k.att[0].dsta, k.att[0].opa);
         vka_minimap_trace_draw(sh[0] ? sh[0]->key : 0u, sh[1] ? sh[1]->key : 0u, t0_, nt_);
     }
     if (g_rtl_pass && rtl_room()) {   // DM_VK_RT_LOG: the draw's state

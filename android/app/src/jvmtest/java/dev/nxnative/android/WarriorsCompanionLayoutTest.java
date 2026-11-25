@@ -194,6 +194,20 @@ public final class WarriorsCompanionLayoutTest {
         check(h.order(idx) == 2, "a list gone for longer is dropped and takes no space");
     }
 
+    private static void testClusterMergeDropsStale() {
+        WarriorsCompanionLayout.ClusterScan s = new WarriorsCompanionLayout.ClusterScan();
+        WarriorsCompanionLayout.ClusterHold h = new WarriorsCompanionLayout.ClusterHold();
+        int[] idx = new int[WarriorsCompanionLayout.MAX_CLUSTERS];
+        int[] px = new int[HUD_W * HUD_H];
+        for (int y = 400; y < 470; y++) for (int x = 40; x < 240; x++) px[y * HUD_W + x] = 0xFFE0E0E0;
+        for (int y = 500; y < 630; y++) for (int x = 40; x < 200; x++) px[y * HUD_W + x] = 0xFFE0E0E0;
+        s.scan(px, HUD_W, HUD_H); h.ingest(s, 0L);
+        check(h.order(idx) == 2, "two distinct clusters before merge");
+        for (int y = 470; y < 500; y++) for (int x = 40; x < 200; x++) px[y * HUD_W + x] = 0xFFE0E0E0;
+        s.scan(px, HUD_W, HUD_H); h.ingest(s, 250L);
+        check(h.order(idx) == 1, "merged hit drops overlapping stale cluster immediately");
+    }
+
     private static void testStaticLayoutAllStates() {
         float[] map = new float[4], obj = new float[4], hud = new float[4];
         for (int hasHud = 0; hasHud <= 1; hasHud++) {
@@ -419,6 +433,7 @@ public final class WarriorsCompanionLayoutTest {
         testClusterDetection();
         testClusterFit();
         testClusterHold();
+        testClusterMergeDropsStale();
         testPinnedBottomCluster();
         testClusterSizeLimits();
         testSceneSequencing();

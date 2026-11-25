@@ -308,6 +308,7 @@ static void run_obj_frame(
     const float fb_ortho[64], const vtx_idx_pos q_bar[18], const vtx_idx_pos q_txt[180],
     const vtx_idx_pos q_ic[12], int icon_draws, const vtx_idx_pos q_sub[18], const vtx_idx_pos q_subt[180]) {
     vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    vka_minimap_trace_blend(1u, 6u, 0u, 1u, 6u, 0u);
     vka_minimap_trace_draw(1ull, 2ull, &im, 1);   /* off by default: logs nothing, changes nothing */
     VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
     vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
@@ -604,9 +605,14 @@ static void test_allies_menu_stays(void) {
     for (int i = 0; i < 84; i += 6) make_quad_vtx(&q_bl[i], 1298.f, 491.f, 1519.f, 546.f, 0.f, 0.f);
     make_quad_vtx(q_ft, 0.f, 1012.f, 1920.f, 1080.f, 0.f, 0.f);
     make_quad_vtx(q_hd, 0.f, 0.f, 1920.f, 68.f, 0.f, 0.f);
+    vtx_idx_pos q_zt[30], q_hi[6];
+    for (int i = 0; i < 30; i += 6) make_quad_vtx(&q_zt[i], 1493.f, 478.f, 1781.f, 514.f, 0.f, 0.f);
+    make_quad_vtx(q_hi, 1443.f, 476.f, 1483.f, 516.f, 0.f, 0.f);
     for (int fr = 0; fr < 2; fr++) {
         g_f += 2;
         vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+        assert(sel_box_1080(fb, q_zt, 30, 0u, 1u) == 0 && sel_box_1080(fb, q_hi, 6, 0u, 1u) == 0);
+        assert(g_vka_mm.pass_obj_hit == 0);
         assert(sel_box_1080(fb, q_c1, 6, 0u, 1u) == 0);
         assert(sel_box_1080(fb, q_z, 30, 0u, 1u) == 0);
         assert(sel_box_1080(fb, q_lv, 18, 0u, 1u) == 0);
@@ -624,6 +630,124 @@ static void test_allies_menu_stays(void) {
     g_vka_mm.mm.ready_w = 0u; g_vka_mm.mm.ready_h = 0u;
 }
 
+static void test_left_world_marker_stays(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos q_ht[6], q_ic[6], q_rg[12], q_ic2[6], q_rg2[12];
+    make_quad_vtx(q_ht, 50.f, 25.f, 94.f, 69.f, 0.f, 0.f);
+    make_quad_vtx(q_ic, 221.f, 341.f, 290.f, 410.f, 0.f, 0.f);
+    make_quad_vtx(&q_rg[0], 200.f, 320.f, 311.f, 431.f, 0.f, 0.f);
+    make_quad_vtx(&q_rg[6], 200.f, 320.f, 311.f, 431.f, 0.f, 0.f);
+    make_quad_vtx(q_ic2, 241.f, 341.f, 310.f, 410.f, 0.f, 0.f);
+    make_quad_vtx(&q_rg2[0], 220.f, 320.f, 331.f, 431.f, 0.f, 0.f);
+    make_quad_vtx(&q_rg2[6], 220.f, 320.f, 331.f, 431.f, 0.f, 0.f);
+    nxhost_companion_minimap_enable(0); nxhost_companion_minimap_enable(1);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    assert(sel_box_1080(fb, q_ht, 6, 0u, 1u) == 1);
+    assert(sel_box_1080(fb, q_rg, 12, 0u, 1u) == 0 && sel_box_1080(fb, q_ic, 6, 0u, 1u) == 0);
+    vka_minimap_pass_end(1ull, &im); vka_minimap_present();
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    for (int i = 0; i < 3; i++) assert(sel_box_1080(fb, q_ic2, 6, 0u, 1u) == 0);
+    assert(sel_box_1080(fb, q_rg2, 12, 0u, 1u) == 0);
+    vka_minimap_pass_end(1ull, &im); vka_minimap_present();
+}
+
+static void test_travel_safely_subtitle_stays(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos q_mm[6], q_ht[6], q_bub[18], q_txt[84];
+    make_quad_vtx(q_mm, 1540.f, 698.f, 1880.f, 1038.f, 0.f, 0.f);
+    make_quad_vtx(q_ht, 50.f, 25.f, 94.f, 69.f, 0.f, 0.f);
+    for (int i = 0; i < 18; i += 6) make_quad_vtx(&q_bub[i], 20.f, 26.f, 360.f, 96.f, 0.f, 0.f);
+    for (int i = 0; i < 84; i += 6) make_quad_vtx(&q_txt[i], 44.f, 32.f, 340.f, 86.f, 0.f, 0.f);
+    nxhost_companion_minimap_enable(0); nxhost_companion_minimap_enable(1);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    sel_box_1080(fb, q_mm, 6, 1u, 1u); assert(sel_box_1080(fb, q_ht, 6, 0u, 1u) == 1);
+    vka_minimap_pass_end(1ull, &im); assert(g_vka_mm.saw_lhud_frame == 1); vka_minimap_present();
+    for (int fr = 0; fr < 2; fr++) {
+        g_f += 2;
+        vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+        sel_box_1080(fb, q_mm, 6, 1u, 1u);
+        int b = sel_box_1080(fb, q_bub, 18, 0u, 1u), t = sel_box_1080(fb, q_txt, 84, 0u, 1u);
+        if (fr == 1) assert(b == 0 && t == 0);
+        vka_minimap_pass_end(1ull, &im); assert(g_vka_mm.saw_lhud_frame == 0); vka_minimap_present();
+    }
+}
+
+static void test_world_ring_known_by_texture(void) {
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+        (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    g_vka_mm.ring_tex = 77ull; g_vka_mm.nwm_cur = 0; g_vka_mm.nwm_prev = 0;
+    float ring_small_mn[2] = {296.f, 612.f}, ring_small_mx[2] = {333.f, 650.f};   /* the marker's ring at the bottom of its pulse (measured) */
+    float hud_ring_mn[2] = {29.f, 498.f}, hud_ring_mx[2] = {111.f, 580.f};        /* a combo highlight ring, another texture (measured) */
+    float icon_mn[2] = {283.f, 600.f}, icon_mx[2] = {345.f, 662.f};               /* the marker's icon, concentric with its ring */
+    float combo_mn[2] = {218.f, 529.f}, combo_mx[2] = {271.f, 594.f};             /* a combo icon the marker passes beside (measured) */
+    vka_minimap_note_draw_tex(77ull);
+    assert(vka_mm_is_world_marker(ring_small_mn, ring_small_mx, 12) == 1 && g_vka_mm.nwm_cur == 1);
+    vka_minimap_note_draw_tex(5ull);
+    assert(vka_mm_is_world_marker(hud_ring_mn, hud_ring_mx, 12) == 0 && g_vka_mm.nwm_cur == 1);
+    assert(vka_mm_is_world_marker(icon_mn, icon_mx, 6) == 1);
+    assert(vka_mm_is_world_marker(combo_mn, combo_mx, 12) == 0);
+    assert(vka_mm_is_world_marker(combo_mn, combo_mx, 6) == 0);
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+    g_vka_mm.ring_tex = 0ull;
+}
+
+static void test_minimap_variant_without_stencil(void) {
+    float fb_ortho[64]; memset(fb_ortho, 0, sizeof fb_ortho);
+    fb_ortho[8 + 0] = 2.f / 1920.f; fb_ortho[8 + 5] = -2.f / 1080.f; fb_ortho[8 + 10] = 1.f;
+    fb_ortho[8 + 12] = -1.f; fb_ortho[8 + 13] = 1.f; fb_ortho[8 + 15] = 1.f;
+    init_id_m34(&fb_ortho[24]);
+    vtx_idx_pos q_dot[6], q_back[6], q_map[6], q_mark[6], q_else[6];
+    make_quad_vtx(q_dot, 1734.f, 882.f, 1738.f, 886.f, 0.f, 0.f);      /* measured on AoI: the dot that opens the map */
+    make_quad_vtx(q_back, 1494.f, 652.f, 1926.f, 1084.f, 0.f, 0.f);    /* its backdrop, no stencil mask in this variant */
+    make_quad_vtx(q_map, 1530.f, 688.f, 1890.f, 1048.f, 0.f, 0.f);     /* the map itself */
+    make_quad_vtx(q_mark, 1616.f, 884.f, 1688.f, 956.f, 0.f, 0.f);     /* a marker on it */
+    make_quad_vtx(q_else, 900.f, 500.f, 1000.f, 560.f, 0.f, 0.f);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    vka_dstate ds_dot = make_dstate((void *)q_dot, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_back = make_dstate((void *)q_back, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_map = make_dstate((void *)q_map, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_mark = make_dstate((void *)q_mark, (void *)fb_ortho, 256u, NULL, 0u);
+    vka_dstate ds_else = make_dstate((void *)q_else, (void *)fb_ortho, 256u, NULL, 0u);
+    g_vka_mm.mm_ttl = 0u; g_vka_mm.learn_mm_half = 0;
+    for (int frame = 0; frame < 2; frame++) {
+        g_f += 2;
+        vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+            (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+        vka_minimap_select_target(1ull, &ds_dot, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == frame);                  /* the dot joins the map once the map's place is known */
+        vka_minimap_select_target(1ull, &ds_back, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.pass_mm_hit == 1 && g_vka_mm.cur_hud == 1);
+        vka_minimap_select_target(1ull, &ds_map, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == 1);
+        vka_minimap_select_target(1ull, &ds_mark, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == 1);
+        vka_minimap_select_target(1ull, &ds_else, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+        assert(g_vka_mm.cur_hud == 0);
+        vka_minimap_pass_end(1ull, &im);
+        vka_minimap_present();
+    }
+}
+
 int main(void) {
     test_proj_decode();
     test_pass_462636();
@@ -633,6 +757,10 @@ int main(void) {
     test_minimap_group_closes();
     test_terrain_backing_and_camp_bubbles();
     test_allies_menu_stays();
+    test_left_world_marker_stays();
+    test_travel_safely_subtitle_stays();
+    test_world_ring_known_by_texture();
+    test_minimap_variant_without_stencil();
     puts("vka_minimap_c_regression: PASS");
     return 0;
 }

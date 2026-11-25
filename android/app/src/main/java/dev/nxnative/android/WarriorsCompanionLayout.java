@@ -396,8 +396,15 @@ final class WarriorsCompanionLayout {
             }
             for (int i = 0; i < MAX_CLUSTERS; i++) {
                 long d = now - seen[i];
-                if (live[i] && !hit[i] && (d >= SIZE_HOLD_MS || d < 0L)) live[i] = false;
+                if (live[i] && !hit[i] && (d >= SIZE_HOLD_MS || d < 0L || overlapsHit(i))) live[i] = false;
             }
+        }
+
+        private boolean overlapsHit(int i) {
+            for (int k = 0; k < MAX_CLUSTERS; k++) {
+                if (live[k] && hit[k] && y0[i] < y1[k] && y1[i] > y0[k]) return true;
+            }
+            return false;
         }
 
         private int match(float t, float b) {
