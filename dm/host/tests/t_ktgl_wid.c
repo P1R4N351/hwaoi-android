@@ -21,7 +21,8 @@ uintptr_t ktgl_aoi_pre_node(uintptr_t node_obj, uintptr_t mgr, uintptr_t unused)
 uintptr_t ktgl_aoi_mgr_exit(uintptr_t mgr, uintptr_t u1, uintptr_t u2);
 uintptr_t ktgl_aoi_rollover(uintptr_t base, uintptr_t end, uintptr_t ctx);
 uintptr_t ktgl_aoi_cons_cmd(uintptr_t cmd_va, uintptr_t ctx, uintptr_t u2);
-uintptr_t ktgl_aoi_cons_pre(uintptr_t ctx, uintptr_t u1, uintptr_t u2);
+uintptr_t ktgl_aoi_cons_pkt_begin(uintptr_t ctx, uintptr_t lo, uintptr_t hi);
+uintptr_t ktgl_aoi_cons_pkt_end(uintptr_t ctx, uintptr_t u1, uintptr_t u2);
 uintptr_t ktgl_aoi_cons_end(uintptr_t ctx, uintptr_t u1, uintptr_t u2);
 uintptr_t ktgl_aoi_cons_exit(uintptr_t u0, uintptr_t u1, uintptr_t u2);
 uintptr_t ktgl_aoi_post_flush(uintptr_t ctx, uintptr_t u1, uintptr_t u2);
@@ -338,22 +339,24 @@ static void test_aoi_binary_patch_install(void) {
     assert(ktgl_rd32(buf, 0xb2e634u) == 0xf9400b20u);
     ktgl_wr32(buf, 0x725288u, 0x79400108u);
 
-    /* Positive control: clean install patches all 32 sites into [0x1ed7200, 0x1ed8000) */
+    /* Positive control: clean install patches all 38 sites within 3.5 KiB slack */
     assert(ktgl_ui_tag_install_raw(buf, text_end, ro_off, data_off, mod_end, bid) == 1);
     assert(g_mock_enabled == 1);
-    static const uint64_t sites[32] = {
+    static const uint64_t sites[38] = {
         0xae7ba8u, 0xae9b20u, 0xaf1e94u, 0xaf453cu, 0xaf52b8u, 0xaf56e4u, 0xaf5de4u, 0xafe498u,
         0xb04548u, 0xb04d08u, 0xb05710u, 0xb057e8u, 0xb07c58u, 0xb0bfe0u, 0x245974u, 0xb2775cu,
-        0xb2e4d8u, 0xb34ee8u, 0xb2e634u, 0xb2e6ecu, 0xb2ec28u, 0xb2f658u, 0xb32888u, 0xb33f3cu,
-        0xb34fb8u, 0xb34e58u, 0xb37b20u, 0x7234f4u, 0x725288u, 0x7252b4u, 0x7252ccu, 0x7253e4u,
+        0xb2e4d8u, 0xb34ee8u, 0xb2e634u, 0xb2e6ecu, 0xb2ec28u, 0xb2ed14u, 0xb2f658u, 0xb31084u,
+        0xb32084u, 0xb325b0u, 0xb32888u, 0xb33f3cu, 0xb34fb8u, 0xb34e58u, 0xb37b20u, 0x70bb34u,
+        0x7234f4u, 0x725280u, 0x725288u, 0x7252acu, 0x7252ccu, 0x7253e4u,
     };
-    for (size_t i = 0; i < 32u; i++) {
+    for (size_t i = 0; i < 38u; i++) {
         uint32_t w = ktgl_rd32(buf, sites[i]);
         assert((w & 0xfc000000u) == 0x14000000u);
         int32_t simm = ((int32_t)(w << 6)) >> 6;
-        uint64_t target = (uint64_t)((int64_t)sites[i] + ((int64_t)simm * 4LL));
-        assert(target >= 0x1ed7200u && target < 0x1ed8000u);
+        uint64_t t = (uint64_t)((int64_t)sites[i] + ((int64_t)simm * 4LL));
+        assert(t >= 0x1ed7200u && t < 0x1ed8000u);
     }
+    for (uint64_t o = 0x1ed7200u + 3400u; o < 0x1ed8000u; o++) assert(buf[o] == 0u);
     free(buf);
 }
 
@@ -652,14 +655,18 @@ static void *cons_worker_part1(void *arg) {
 
 static void *cons_worker_part2(void *arg) {
     ConsWorkerArg *a = (ConsWorkerArg *)arg;
-    assert(ktgl_aoi_cons_pre(a->ctx, 0u, 0u) == 0u);
-    assert(g_mock_wid == KTGL_WID_OBJECTIVE);
+    assert(ktgl_aoi_cons_pkt_begin(a->ctx, a->cmd - 8u, a->cmd + 56u) == 0u);
+    assert(g_mock_wid == KTGL_WID_NONE);
     assert(ktgl_aoi_cons_cmd(a->cmd, a->ctx, 0u) == a->ctx);
-    assert(g_mock_wid == KTGL_WID_OBJECTIVE);
+    assert(g_mock_wid == KTGL_WID_NONE);
     ktgl_aoi_post_flush(a->ctx, 0u, 0u);
     assert(g_mock_wid == KTGL_WID_MINIMAP);
+    assert(ktgl_aoi_cons_pkt_end(a->ctx, 0u, 0u) == a->ctx);
+    assert(g_mock_wid == KTGL_WID_MINIMAP);
+    ktgl_aoi_post_flush(a->ctx, 0u, 0u);
+    assert(g_mock_wid == KTGL_WID_NONE);
+    assert(ktgl_aoi_cons_cmd(a->cmd, a->ctx, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
     assert(ktgl_aoi_cons_end(a->ctx, 0u, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
-    assert(ktgl_aoi_cons_pre(a->ctx, 0u, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
     return NULL;
 }
 
@@ -700,6 +707,101 @@ static void test_consumer_cross_thread_and_nested_mgr(void) {
     assert(pthread_create(&th2, NULL, cons_worker_part2, &a2) == 0 && pthread_join(th2, NULL) == 0);
 }
 
+static void test_classifier_depth5_btn_guide_and_snap_hash(void) {
+    _Alignas(16) uint8_t sl[0x380] = {0};
+    uintptr_t vt = 0x20000ULL;
+    SynPane r_p, d1, d2, d3, d4, ally_p, leaf;
+    const void *rp = &r_p;
+    memcpy(sl, &vt, sizeof vt);
+    memcpy(sl + KTGL_SL_OFF_ROOT_PANE, &rp, sizeof rp);
+    syn_init(&r_p, "NULL_root", NULL, sl);
+    syn_init(&d1, "NULL_l1", &r_p, sl);
+    syn_init(&d2, "NULL_l2", &d1, sl);
+    syn_init(&d3, "NULL_l3", &d2, sl);
+    syn_init(&d4, "NULL_l4", &d3, sl);
+    syn_init(&ally_p, "btl_plt_player_2p", &d4, sl);
+    syn_init(&leaf, "PIC_00", &r_p, sl);
+    syn_add_child(&r_p, &d1); syn_add_child(&d1, &d2); syn_add_child(&d2, &d3);
+    syn_add_child(&d3, &d4); syn_add_child(&d4, &ally_p); syn_add_child(&r_p, &leaf);
+    assert(ktgl_classify_pane(&leaf, &g_tb) == KTGL_WID_ALLIES);
+
+    static const char *const bg_toks[] = {
+        "TEXT24_keyguide_flare_0", "btl_parts_action_arrow_l", "btl_parts_action_x2",
+        "icon_keyguide_longpress", "icon_keyguide_mash", "tb_text_operation_00",
+    };
+    for (size_t i = 0; i < sizeof bg_toks / sizeof bg_toks[0]; i++) {
+        SynPane p; syn_init(&p, bg_toks[i], NULL, NULL);
+        assert(ktgl_classify_pane(&p, &g_tb) == KTGL_WID_BTN_GUIDE);
+    }
+    SynPane sp_sc, mr, c1, c2, cm;
+    syn_init(&sp_sc, "still_speech_scale", NULL, NULL);
+    assert(ktgl_classify_pane(&sp_sc, &g_tb) == KTGL_WID_NONE);
+    _Alignas(16) uint8_t msl[0x380] = {0}, sub_sl[0x380] = {0};
+    const void *mrp = &mr;
+    memcpy(msl, &vt, sizeof vt); memcpy(msl + KTGL_SL_OFF_ROOT_PANE, &mrp, sizeof mrp);
+    memcpy(sub_sl, &vt, sizeof vt); memcpy(sub_sl + KTGL_SL_OFF_ROOT_PANE, &mrp, sizeof mrp);
+    syn_init(&mr, "NULL_root", NULL, msl);
+    syn_init(&c1, "player_info", &mr, msl);
+    syn_init(&cm, "pause_menu", &mr, msl);
+    syn_add_child(&mr, &c1); syn_add_child(&mr, &cm);
+    assert(ktgl_is_master_hud(sub_sl, &g_tb) == 0 && ktgl_root_sl_has_menu(sub_sl, &g_tb) == 1);
+    syn_init(&c2, "MINIMAP", &mr, msl);
+    syn_add_child(&mr, &c2);
+    assert(ktgl_is_master_hud(msl, &g_tb) == 1 && ktgl_root_sl_has_menu(msl, &g_tb) == 0);
+
+    KtglSnapMap *sm = calloc(1u, sizeof *sm);
+    assert(sm != NULL);
+    uintptr_t stride = (uintptr_t)KTGL_SNAP_SETS * 16u;
+    uint32_t sets[16];
+    for (size_t i = 0; i < 16u; i++) {
+        const void *k = (const void *)(0x100000ULL + i * stride);
+        sets[i] = ktgl_snap_set_idx((uint64_t)(uintptr_t)k);
+        ktgl_snap_put(sm, k, (uint8_t)((i % 14u) + 1u));
+    }
+    int diff = 0;
+    for (size_t i = 1; i < 16u; i++) if (sets[i] != sets[0]) diff++;
+    assert(diff >= 8);
+    for (size_t i = 0; i < 16u; i++) {
+        const void *k = (const void *)(0x100000ULL + i * stride);
+        assert(ktgl_snap_get(sm, k) == (int)((i % 14u) + 1u));
+    }
+    free(sm);
+}
+
+static void test_rollover_mid_node_and_va_reuse(void) {
+    ktgl_ui_tag_reset_for_test();
+    ktgl_ui_tag_set_bounds_for_test(g_tb);
+    g_mock_wid = 0u;
+    _Alignas(16) uint8_t mgr[0x80] = {0}, prod[0x4100] = {0}, cons[0x4100] = {0}, ch1[256], ch2[256];
+    uintptr_t pp = (uintptr_t)prod, sr = (uintptr_t)cons - 0x10u, cp = (uintptr_t)cons;
+    uintptr_t c1 = (uintptr_t)ch1, c2 = (uintptr_t)ch2;
+    memcpy(mgr + 0x40u, &pp, sizeof pp);
+    memcpy(prod + 0x3fb0u, &sr, sizeof sr);
+    memcpy(prod + 0x4050u, &c1, sizeof c1);
+    uintptr_t c1_32 = c1 + 32u, c1_128 = c1 + 128u, c2_48 = c2 + 48u;
+    memcpy(prod + 0x4048u, &c1_32, sizeof c1_32);
+    SynPane p_obj, p_mm;
+    syn_init(&p_obj, "battle_parts_main_misson_info", NULL, NULL);
+    syn_init(&p_mm, "PANE_NULL_MINIMAP", NULL, NULL);
+    SynNode n_obj = {.vt = 0x20000ULL, .pane = &p_obj}, n_mm = {.vt = 0x20000ULL, .pane = &p_mm};
+    ktgl_aoi_on_pane((uintptr_t)&p_obj, 0u, 0u); ktgl_aoi_on_submit((uintptr_t)&n_obj, (uintptr_t)&n_obj, 0u);
+    ktgl_aoi_on_pane((uintptr_t)&p_mm, 0u, 0u); ktgl_aoi_on_submit((uintptr_t)&n_mm, (uintptr_t)&n_mm, 0u);
+
+    ktgl_aoi_mgr_enter((uintptr_t)mgr, 0u, 0u);
+    assert(ktgl_aoi_pre_node((uintptr_t)&n_obj, (uintptr_t)mgr, 0u) == 0u);
+    assert(ktgl_aoi_rollover(c1, c1_128, pp) == 0u);
+    memcpy(prod + 0x4050u, &c2, sizeof c2);
+    memcpy(prod + 0x4048u, &c2_48, sizeof c2_48);
+    assert(ktgl_aoi_pre_node((uintptr_t)&n_mm, (uintptr_t)mgr, 0u) == 0u);
+    assert(ktgl_aoi_mgr_exit((uintptr_t)mgr, 0u, 0u) == 0u);
+
+    assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
+    assert(ktgl_aoi_cons_cmd(c2 + 8u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
+    assert(ktgl_aoi_rollover(c1, c1_128, pp) == 0u); /* !in_mgr retires [c1, c1+128) only */
+    assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
+    assert(ktgl_aoi_cons_cmd(c2 + 8u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
+}
+
 int main(void) {
     test_prot_none_guard();
     test_all_widget_classes();
@@ -713,6 +815,8 @@ int main(void) {
     test_parallel_worker_submit();
     test_real_screenlayout_and_corpus_fixes();
     test_consumer_cross_thread_and_nested_mgr();
+    test_classifier_depth5_btn_guide_and_snap_hash();
+    test_rollover_mid_node_and_va_reuse();
     printf("ktgl_wid_classify: PASS\n");
     return 0;
 }

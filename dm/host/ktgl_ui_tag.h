@@ -13,7 +13,7 @@ typedef struct {
 
 typedef struct {
     uint64_t pool_lo, pool_hi, cur;
-    uint64_t flush_off, tramp_off;
+    uint64_t flush_off, tramp_off, bcall_off;
     uintptr_t bridge_va, post_flush_va;
 } KtglEmitCtx;
 
@@ -118,6 +118,9 @@ static inline int ktgl_emit_frame_restore(uint8_t *b, KtglEmitCtx *e) {
 }
 
 static inline int ktgl_emit_flush_trampoline(uint8_t *b, KtglEmitCtx *e) {
+    e->bcall_off = e->cur;
+    if (!ktgl_emit_mov64(b, e, 17u, (uint64_t)e->bridge_va)) return 0;
+    if (!ktgl_emit_w(b, e, 0xd61f0220u)) return 0;
     e->tramp_off = e->cur;
     if (!ktgl_emit_frame_save(b, e)) return 0;
     if (!ktgl_emit_mov_x(b, e, 0u, 17u)) return 0;
@@ -127,8 +130,8 @@ static inline int ktgl_emit_flush_trampoline(uint8_t *b, KtglEmitCtx *e) {
     if (!ktgl_emit_mov_x(b, e, 10u, 31u)) return 0;
     if (!ktgl_emit_mov_x(b, e, 11u, 31u)) return 0;
     if (!ktgl_emit_mov64(b, e, 16u, (uint64_t)e->post_flush_va)) return 0;
-    if (!ktgl_emit_mov64(b, e, 17u, (uint64_t)e->bridge_va)) return 0;
-    if (!ktgl_emit_w(b, e, 0xd63f0220u)) return 0;
+    uint32_t bbl = ktgl_b_word(e->cur, e->bcall_off, 1);
+    if (!bbl || !ktgl_emit_w(b, e, bbl)) return 0;
     return ktgl_emit_frame_restore(b, e);
 }
 
@@ -147,8 +150,8 @@ static inline int ktgl_emit_hook_stub(
     if (!ktgl_emit_mov_x(b, e, 10u, s->r1)) return 0;
     if (!ktgl_emit_mov_x(b, e, 11u, s->r2)) return 0;
     if (!ktgl_emit_mov64(b, e, 16u, (uint64_t)hook_va)) return 0;
-    if (!ktgl_emit_mov64(b, e, 17u, (uint64_t)e->bridge_va)) return 0;
-    if (!ktgl_emit_w(b, e, 0xd63f0220u)) return 0;
+    uint32_t bbl = ktgl_b_word(e->cur, e->bcall_off, 1);
+    if (!bbl || !ktgl_emit_w(b, e, bbl)) return 0;
     if (with_flush) {
         if (!ktgl_emit_w(b, e, 0xb4000051u)) return 0;
         uint32_t bl = ktgl_b_word(e->cur, e->tramp_off, 1);

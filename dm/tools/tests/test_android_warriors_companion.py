@@ -710,6 +710,34 @@ static void test_stream_modes(void) {
     vka_minimap_present();
 }
 
+static void test_late_centre_plate_keeps_staging(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos q_heart[6], q_plate[6], q_after[6];
+    make_quad_vtx(q_heart, 50.f, 25.f, 94.f, 69.f, 0.f, 0.f);
+    make_quad_vtx(q_plate, 859.f, 374.f, 1439.f, 587.f, 0.f, 0.f);
+    make_quad_vtx(q_after, 80.f, 25.f, 124.f, 69.f, 0.f, 0.f);
+    nxhost_companion_minimap_enable(0); nxhost_companion_minimap_enable(1);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_note_draw_wid(0u);
+    (void)sel_box_1080(fb, q_heart, 6, 0u, 1u);
+    assert(g_vka_mm_tr.cls == 'l' && vka_minimap_on_hud_target());
+    (void)sel_box_1080(fb, q_plate, 6, 0u, 1u);            /* the plate itself stays on the first screen */
+    assert(!vka_minimap_on_hud_target());
+    (void)sel_box_1080(fb, q_after, 6, 0u, 1u);            /* and what follows it in the pass is refused */
+    assert(g_vka_mm_tr.cls == 'M' && !vka_minimap_on_hud_target());
+    g_vka_mm.saw_lhud_frame = 0;
+    vka_minimap_pass_end(1ull, &im);
+    assert(g_vka_mm.saw_lhud_frame == 1);                  /* what was captured before the plate is still staged */
+    vka_minimap_present();
+}
+
 static void test_wid_routing_and_stability(void) {
     float fb[64]; memset(fb, 0, sizeof fb);
     fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
@@ -942,6 +970,34 @@ static void test_minimap_variant_without_stencil(void) {
     }
 }
 
+static void test_zero_area_minimap_and_present_reset(void) {
+    float fb[64]; memset(fb, 0, sizeof fb);
+    fb[8 + 0] = 2.f / 1920.f; fb[8 + 5] = -2.f / 1080.f; fb[8 + 10] = 1.f;
+    fb[8 + 12] = -1.f; fb[8 + 13] = 1.f; fb[8 + 15] = 1.f;
+    init_id_m34(&fb[24]);
+    vka_img im = { .img = 55ull, .serial = 4ull, .w = 1920u, .h = 1080u, .layers = 1u, .samples = 1u };
+    VkRenderingAttachmentInfo sp = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, 30ull, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u };
+    VkRect2D area = {{0, 0}, {1920u, 1080u}};
+    vtx_idx_pos q_mm[6], q_zero[6];
+    make_quad_vtx(q_mm, 1540.f, 698.f, 1880.f, 1038.f, 0.f, 0.f);
+    make_quad_vtx(q_zero, 960.f, 540.f, 960.f, 540.f, 0.f, 0.f);
+    nxhost_companion_minimap_enable(0); nxhost_companion_minimap_enable(1);
+    g_f += 2;
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_note_draw_wid(KTGL_WID_MINIMAP);
+    assert(sel_box_1080(fb, q_mm, 6, 0u, 1u) == 1);
+    vka_mm_rect mm_r0 = g_vka_mm.hit_mm;
+    vka_dstate ds_z = make_dstate((void *)q_zero, (void *)fb, 256u, NULL, 0u);
+    int sel_z = vka_minimap_select_target(1ull, &ds_z, 3u, &(p_draw){0, 0, 6, 1, 0, 0}, NULL, 0, 0u, 0u, 0u, 0xfu, 1u);
+    assert(sel_z == 0 && vka_minimap_skip_draw() == 1);
+    assert(g_vka_mm_tr.cls == 'm' && memcmp(&mm_r0, &g_vka_mm.hit_mm, sizeof mm_r0) == 0);
+    vka_minimap_note_draw_wid((uint8_t)(KTGL_WID_COMBO | KTGL_WID_FLAG_BG));
+    assert(g_vka_mm.cur_wid == KTGL_WID_COMBO && g_vka_mm.cur_wid_bg == 1u);
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_present();
+    assert(g_vka_mm.cur_wid == 0u && g_vka_mm.cur_wid_bg == 0u);
+}
+
 int main(void) {
     test_proj_decode();
     test_pass_462636();
@@ -954,6 +1010,8 @@ int main(void) {
     test_left_world_marker_stays();
     test_backing_edge_and_unknown_ring();
     test_wid_routing_and_stability();
+    test_zero_area_minimap_and_present_reset();
+    test_late_centre_plate_keeps_staging();
     test_stream_modes();
     test_travel_safely_subtitle_stays();
     test_world_ring_known_by_texture();

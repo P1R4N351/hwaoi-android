@@ -251,7 +251,7 @@ static inline uint8_t ktgl_match_top_nonmenu(const char *n) {
     static const char *const ks[] = {
         "vmes", "serifu", "subtitle", "smes", "message_balloon",
         "btl_win_base_msg", "btl_plt_msg", "win_message",
-        "TEXT26_message", "TEXT28_message", "still_speech",
+        "TEXT26_message", "TEXT28_message",
         "fukidasi", "battle_parts_main_msg"
     };
     static const char *const kw[] = {
@@ -265,6 +265,7 @@ static inline uint8_t ktgl_match_top_nonmenu(const char *n) {
         "keyguide_finalblow", "action_gacha", "icon_linkstrike"
     };
     if (ktgl_has_any(n, ks, sizeof ks / sizeof ks[0])) return KTGL_WID_SPEECH;
+    if (strstr(n, "still_speech") && !strstr(n, "still_speech_scale")) return KTGL_WID_SPEECH;
     if (ktgl_has_any(n, kw, sizeof kw / sizeof kw[0])) return KTGL_WID_WORLD_MARKER;
     if (strstr(n, "guide_action") && !strstr(n, "joycon") && !strstr(n, "cmn_action")) {
         return KTGL_WID_WORLD_MARKER;
@@ -313,7 +314,9 @@ static inline uint8_t ktgl_match_bot_rest(const char *n) {
         "guide_btn_item", "guide_icon_item", "item_cooltime", "db_cooltime",
         "db_keyguide", "zonaugear_sky", "znai_bullet", "timelimit",
         "action_cooltime", "keyguide_sky", "zonaugear_info", "zonaugear_exchange",
-        "cmn_win_base_guide"
+        "cmn_win_base_guide", "keyguide_flare_", "btl_parts_action_arrow",
+        "btl_parts_action_x", "keyguide_longpress", "keyguide_mash",
+        "tb_text_operation_"
     };
     static const char *const kal[] = {"player_info", "btl_plt_player", "PIC_ext_player"};
     static const char *const kko[] = {"ko_count", "kocount"};
@@ -380,7 +383,7 @@ static inline int ktgl_is_master_hud(const void *sl, const KtglAddrBounds *b) {
 static inline int ktgl_root_sl_has_menu(const void *root_sl, const KtglAddrBounds *b) {
     const void *root = ktgl_sl_root_pane(root_sl, b);
     uint8_t snap[KTGL_PANE_MIN_SIZE];
-    if (!root || !ktgl_snap_pane(root, b, snap) || ktgl_is_master_hud(root, b)) return 0;
+    if (!root || !ktgl_snap_pane(root, b, snap) || ktgl_is_master_hud(root_sl, b)) return 0;
     const void *kids[KTGL_MAX_CHILDREN];
     uint32_t lim = ktgl_snap_children(snap, b, kids);
     for (uint32_t i = 0; i < lim; i++) {
@@ -406,27 +409,21 @@ static inline void ktgl_scan_note_snap(
 
 static inline void ktgl_scan_node_children(
     const uint8_t snap[KTGL_PANE_MIN_SIZE], const KtglAddrBounds *b, uint32_t *mask) {
-    uint32_t budget = KTGL_MAX_SL_SCAN - 1u;
+    const void *stk[KTGL_MAX_SL_SCAN];
+    uint32_t sp = 0u, seen = 1u;
     ktgl_scan_note_snap(snap, b, mask);
     const void *k0[KTGL_MAX_CHILDREN];
     uint32_t l0 = ktgl_snap_children(snap, b, k0);
-    for (uint32_t i = 0; i < l0 && budget > 0u; i++) {
-        uint8_t s1[KTGL_PANE_MIN_SIZE];
-        if (!ktgl_snap_pane(k0[i], b, s1)) continue;
-        budget--; ktgl_scan_note_snap(s1, b, mask);
-        const void *k1[KTGL_MAX_CHILDREN];
-        uint32_t l1 = ktgl_snap_children(s1, b, k1);
-        for (uint32_t j = 0; j < l1 && budget > 0u; j++) {
-            uint8_t s2[KTGL_PANE_MIN_SIZE];
-            if (!ktgl_snap_pane(k1[j], b, s2)) continue;
-            budget--; ktgl_scan_note_snap(s2, b, mask);
-            const void *k2[KTGL_MAX_CHILDREN];
-            uint32_t l2 = ktgl_snap_children(s2, b, k2);
-            for (uint32_t t = 0; t < l2 && budget > 0u; t++) {
-                uint8_t s3[KTGL_PANE_MIN_SIZE];
-                if (ktgl_snap_pane(k2[t], b, s3)) { budget--; ktgl_scan_note_snap(s3, b, mask); }
-            }
-        }
+    for (uint32_t i = 0u; i < l0 && sp < KTGL_MAX_SL_SCAN; i++) stk[sp++] = k0[l0 - 1u - i];
+    for (uint32_t step = 0u; step < KTGL_MAX_SL_SCAN && sp > 0u && seen < KTGL_MAX_SL_SCAN; step++) {
+        const void *node = stk[--sp];
+        uint8_t child_snap[KTGL_PANE_MIN_SIZE];
+        if (!ktgl_snap_pane(node, b, child_snap)) continue;
+        seen++;
+        ktgl_scan_note_snap(child_snap, b, mask);
+        const void *kids[KTGL_MAX_CHILDREN];
+        uint32_t lk = ktgl_snap_children(child_snap, b, kids);
+        for (uint32_t j = 0u; j < lk && sp < KTGL_MAX_SL_SCAN; j++) stk[sp++] = kids[lk - 1u - j];
     }
 }
 
@@ -447,7 +444,7 @@ static inline uint8_t ktgl_resolve_sl_mask(uint32_t mask) {
 static inline uint8_t ktgl_scan_owner_sl(const void *sl, const KtglAddrBounds *b) {
     const void *root = ktgl_sl_root_pane(sl, b);
     uint8_t snap[KTGL_PANE_MIN_SIZE];
-    if (!root || !ktgl_snap_pane(root, b, snap) || ktgl_is_master_hud(root, b)) return 0u;
+    if (!root || !ktgl_snap_pane(root, b, snap) || ktgl_is_master_hud(sl, b)) return 0u;
     uint32_t mask = 0u;
     ktgl_scan_node_children(snap, b, &mask);
     return ktgl_resolve_sl_mask(mask);
@@ -512,8 +509,15 @@ typedef struct {
     _Atomic uint64_t slots[KTGL_SNAP_SETS][KTGL_SNAP_WAYS];
 } KtglSnapMap;
 
+static inline uint64_t ktgl_snap_hash(uint64_t key) {
+    uint64_t x = key ^ (key >> 30);
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
 static inline uint32_t ktgl_snap_set_idx(uint64_t key) {
-    return (uint32_t)((key * 2654435761ULL) & (KTGL_SNAP_SETS - 1u));
+    return (uint32_t)(ktgl_snap_hash(key) & (KTGL_SNAP_SETS - 1u));
 }
 
 static inline void ktgl_snap_reset(KtglSnapMap *m) {
@@ -539,7 +543,7 @@ static inline void ktgl_snap_put(KtglSnapMap *m, const void *snap_node, uint8_t 
         }
         if (empty_w < 0 && (cur & KTGL_SNAP_VALID) == 0ULL) empty_w = (int)w;
     }
-    uint32_t dst = empty_w >= 0 ? (uint32_t)empty_w : (uint32_t)((key >> 12) & (KTGL_SNAP_WAYS - 1u));
+    uint32_t dst = empty_w >= 0 ? (uint32_t)empty_w : (uint32_t)((ktgl_snap_hash(key) >> 12) & (KTGL_SNAP_WAYS - 1u));
     atomic_store_explicit(&m->slots[set][dst], tag, memory_order_release);
 }
 

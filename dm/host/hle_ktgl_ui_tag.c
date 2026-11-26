@@ -32,13 +32,14 @@ enum {
     AOI_SPAN_CAP = 8192u,
     AOI_SPAN_MAX_BYTES = 16u << 20,
     AOI_CTX_SLOTS = 64u,
-    AOI_SITE_COUNT = 32u
+    AOI_SITE_COUNT = 38u
 };
 
 static const char AOI_BUILD_ID[] = "659cb288b5c5b2b49853add616c0d5bf";
 
 typedef struct {
-    uintptr_t ctx, lo, hi;
+    _Atomic uintptr_t ctx;
+    uintptr_t lo, hi;
     uint8_t wid;
 } KtglSpan;
 
@@ -50,6 +51,7 @@ typedef struct {
 
 typedef struct {
     uintptr_t mgr, span_ctx, span_start, pend_ctx;
+    uintptr_t pkt_ctx, pkt_lo, pkt_hi;
     const void *cur_pane;
     uint8_t wid, pend_wid, in_mgr, span_open, mgr_depth;
     uint8_t cons_wid, cons_pend_wid, pend_kind;
@@ -95,8 +97,9 @@ enum {
     HK_ENTER = 5,
     HK_PANE = 6,
     HK_SUBMIT = 7,
-    HK_CONS_PRE = 8,
-    HK_CONS_EXIT = 9
+    HK_CONS_PKT_BEGIN = 8,
+    HK_CONS_PKT_END = 9,
+    HK_CONS_EXIT = 10
 };
 
 static const KtglSiteSpec k_aoi_sites[AOI_SITE_COUNT] = {
@@ -121,15 +124,21 @@ static const KtglSiteSpec k_aoi_sites[AOI_SITE_COUNT] = {
     {0xb2e634u, 0xf9400b20u, 1u, 0u,  21u, 31u, HK_NODE},
     {0xb2e6ecu, 0xf9400b34u, 1u, 20u, 21u, 31u, HK_NODE},
     {0xb2ec28u, 0xf9400b20u, 1u, 0u,  21u, 31u, HK_NODE},
+    {0xb2ed14u, 0xf9400b36u, 1u, 22u, 21u, 31u, HK_NODE},
     {0xb2f658u, 0xf9400b37u, 1u, 23u, 21u, 31u, HK_NODE},
+    {0xb31084u, 0xf9400b36u, 1u, 22u, 21u, 31u, HK_NODE},
+    {0xb32084u, 0xf9400b20u, 1u, 0u,  21u, 31u, HK_NODE},
+    {0xb325b0u, 0xf9400b34u, 1u, 20u, 21u, 31u, HK_NODE},
     {0xb32888u, 0xf9400b36u, 1u, 22u, 21u, 31u, HK_NODE},
     {0xb33f3cu, 0xf9400b36u, 1u, 22u, 21u, 31u, HK_NODE},
     {0xb34fb8u, 0xf940091cu, 1u, 28u, 21u, 31u, HK_NODE},
     {0xb34e58u, 0x6d4323e9u, 0u, 21u, 31u, 31u, HK_EXIT},
     {0xb37b20u, 0x6d5623e9u, 0u, 21u, 31u, 31u, HK_EXIT},
+    {0x70bb34u, 0xa9005d28u, 1u, 23u, 20u, 19u, HK_ROLL},
     {0x7234f4u, 0xa9006d28u, 1u, 27u, 24u, 19u, HK_ROLL},
+    {0x725280u, 0xeb09011fu, 0u, 21u, 8u,  9u,  HK_CONS_PKT_BEGIN},
     {0x725288u, 0x79400108u, 0u, 8u,  21u, 31u, HK_CONS},
-    {0x7252b4u, 0xf94013e0u, 1u, 0u,  31u, 31u, HK_CONS_PRE},
+    {0x7252acu, 0x3940e3e8u, 0u, 21u, 31u, 31u, HK_CONS_PKT_END},
     {0x7252ccu, 0xf94013f8u, 1u, 24u, 31u, 31u, HK_CONS_END},
     {0x7253e4u, 0xa94a4ff4u, 0u, 31u, 31u, 31u, HK_CONS_EXIT},
 };
@@ -208,11 +217,40 @@ static uintptr_t resolve_cons_ctx(uintptr_t prod_ctx, int *deferred) {
     return prod_ctx;
 }
 
+static void span_trim_locked(uintptr_t ctx, uintptr_t lo, uintptr_t hi, int trim) {
+    uint32_t h = atomic_load_explicit(&g_ring.head, memory_order_relaxed);
+    uint32_t n = h < AOI_SPAN_CAP ? h : AOI_SPAN_CAP;
+    for (uint32_t i = 0u; i < n; i++) {
+        KtglSpan *s = &g_ring.items[(h - 1u - i) & (AOI_SPAN_CAP - 1u)];
+        if (atomic_load_explicit(&s->ctx, memory_order_relaxed) != ctx) continue;
+        if (s->lo >= hi || s->hi <= lo) continue;
+        if (!trim || (s->lo >= lo && s->hi <= hi)) {
+            atomic_store_explicit(&s->ctx, 0u, memory_order_release);
+        } else if (s->hi <= hi) {
+            s->hi = lo;
+        } else {
+            s->lo = hi;
+        }
+    }
+}
+
+static void span_retire_range(uintptr_t ctx, uintptr_t lo, uintptr_t hi) {
+    if (ctx < 0x10000ULL || hi <= lo || (hi - lo) > AOI_SPAN_MAX_BYTES) return;
+    pthread_mutex_lock(&g_ring.mu);
+    span_trim_locked(ctx, lo, hi, 1);
+    pthread_mutex_unlock(&g_ring.mu);
+}
+
 static void span_push(uintptr_t ctx, uintptr_t lo, uintptr_t hi, uint8_t wid) {
     if (ctx < 0x10000ULL || hi <= lo || (hi - lo) > AOI_SPAN_MAX_BYTES) return;
     pthread_mutex_lock(&g_ring.mu);
+    span_trim_locked(ctx, lo, hi, 0);
     uint32_t h = atomic_load_explicit(&g_ring.head, memory_order_relaxed);
-    g_ring.items[h & (AOI_SPAN_CAP - 1u)] = (KtglSpan){ctx, lo, hi, wid};
+    KtglSpan *slot = &g_ring.items[h & (AOI_SPAN_CAP - 1u)];
+    slot->lo = lo;
+    slot->hi = hi;
+    slot->wid = wid;
+    atomic_store_explicit(&slot->ctx, ctx, memory_order_release);
     atomic_store_explicit(&g_ring.head, h + 1u, memory_order_release);
     pthread_mutex_unlock(&g_ring.mu);
 #ifndef KTGL_HOST_TEST
@@ -224,20 +262,26 @@ static void span_push(uintptr_t ctx, uintptr_t lo, uintptr_t hi, uint8_t wid) {
 }
 
 static uint8_t span_lookup(uintptr_t ctx, uintptr_t va) {
+    if (t_st.pkt_ctx == ctx && t_st.pkt_hi > t_st.pkt_lo
+            && (va < t_st.pkt_lo || va >= t_st.pkt_hi)) {
+        return 0u;
+    }
     if (ctx == t_st.last_ctx && va >= t_st.last_lo && va < t_st.last_hi) return t_st.last_wid;
     uint32_t h = atomic_load_explicit(&g_ring.head, memory_order_acquire);
     if (ctx == t_st.miss_ctx && h == t_st.miss_head && va >= t_st.miss_lo && va < t_st.miss_hi) return 0u;
     uint32_t n = h < AOI_SPAN_CAP ? h : AOI_SPAN_CAP;
     uintptr_t max_lt = 0u, min_gt = UINTPTR_MAX;
     for (uint32_t i = 0; i < n; i++) {
-        KtglSpan s = g_ring.items[(h - 1u - i) & (AOI_SPAN_CAP - 1u)];
-        if (s.ctx != ctx) continue;
-        if (va >= s.lo && va < s.hi) {
-            t_st.last_ctx = ctx; t_st.last_lo = s.lo; t_st.last_hi = s.hi; t_st.last_wid = s.wid;
-            return s.wid;
+        const KtglSpan *sp = &g_ring.items[(h - 1u - i) & (AOI_SPAN_CAP - 1u)];
+        if (atomic_load_explicit(&sp->ctx, memory_order_acquire) != ctx) continue;
+        uintptr_t slo = sp->lo, shi = sp->hi;
+        uint8_t swid = sp->wid;
+        if (va >= slo && va < shi) {
+            t_st.last_ctx = ctx; t_st.last_lo = slo; t_st.last_hi = shi; t_st.last_wid = swid;
+            return swid;
         }
-        if (s.hi <= va && s.hi > max_lt) max_lt = s.hi;
-        if (s.lo > va && s.lo < min_gt) min_gt = s.lo;
+        if (shi <= va && shi > max_lt) max_lt = shi;
+        if (slo > va && slo < min_gt) min_gt = slo;
     }
     t_st.miss_ctx = ctx; t_st.miss_lo = max_lt; t_st.miss_hi = min_gt; t_st.miss_head = h;
     return 0u;
@@ -245,8 +289,11 @@ static uint8_t span_lookup(uintptr_t ctx, uintptr_t va) {
 
 static void close_open_span(uintptr_t prod_ctx, uintptr_t cons_ctx, uintptr_t cur) {
     uintptr_t cbase = rd_ptr_at(prod_ctx, AOI_CTX_BASE_OFF);
-    uintptr_t lo = (t_st.span_open && t_st.span_ctx == prod_ctx) ? t_st.span_start : cbase;
-    if (t_st.in_mgr && cur > lo && cur >= 0x10000ULL && (cur - lo) <= AOI_SPAN_MAX_BYTES) {
+    uintptr_t lo = (t_st.span_open && t_st.span_ctx == prod_ctx
+                    && t_st.span_start >= cbase && t_st.span_start <= cur)
+                       ? t_st.span_start
+                       : cbase;
+    if (t_st.in_mgr && cur > lo && lo >= 0x10000ULL && (cur - lo) <= AOI_SPAN_MAX_BYTES) {
         span_push(cons_ctx, lo, cur, t_st.wid);
     }
     t_st.span_ctx = prod_ctx;
@@ -374,14 +421,21 @@ uintptr_t ktgl_aoi_mgr_exit(uintptr_t mgr, uintptr_t u1, uintptr_t u2) {
 }
 
 uintptr_t ktgl_aoi_rollover(uintptr_t base, uintptr_t end, uintptr_t ctx) {
-    if (t_st.in_mgr && end > base && (end - base) <= AOI_SPAN_MAX_BYTES) {
+    if (end > base && (end - base) <= AOI_SPAN_MAX_BYTES) {
         int deferred = 0;
         uintptr_t cons_ctx = resolve_cons_ctx(ctx, &deferred);
-        uintptr_t lo = (t_st.span_open && t_st.span_ctx == ctx &&
-                        t_st.span_start >= base && t_st.span_start < end)
-                           ? t_st.span_start
-                           : base;
-        span_push(cons_ctx, lo, end, t_st.wid);
+        if (t_st.in_mgr) {
+            uintptr_t lo = (t_st.span_open && t_st.span_ctx == ctx &&
+                            t_st.span_start >= base && t_st.span_start <= end)
+                               ? t_st.span_start
+                               : base;
+            span_push(cons_ctx, lo, end, t_st.wid);
+            t_st.span_ctx = ctx;
+            t_st.span_open = 1u;
+            t_st.span_start = 0u;
+            return 0u;
+        }
+        span_retire_range(cons_ctx, base, end);
     }
     t_st.span_open = 0u;
     t_st.span_start = 0u;
@@ -419,12 +473,41 @@ uintptr_t ktgl_aoi_cons_cmd(uintptr_t cmd_va, uintptr_t ctx, uintptr_t u2) {
     return 0u;
 }
 
-uintptr_t ktgl_aoi_cons_pre(uintptr_t ctx, uintptr_t u1, uintptr_t u2) {
+uintptr_t ktgl_aoi_cons_pkt_begin(uintptr_t ctx, uintptr_t lo, uintptr_t hi) {
+    t_st.pkt_ctx = ctx;
+    t_st.pkt_lo = (hi > lo) ? lo : 0u;
+    t_st.pkt_hi = (hi > lo) ? hi : 0u;
+    t_st.last_ctx = 0u;
+    t_st.miss_ctx = 0u;
+    if (ctx_wid_get(ctx) != 0u || t_st.cons_wid != 0u) {
+        ctx_wid_set(ctx, 0u);
+        t_st.cons_wid = 0u;
+        dm_nvn_set_wid(0u);
+    }
+    return 0u;
+}
+
+uintptr_t ktgl_aoi_cons_pkt_end(uintptr_t ctx, uintptr_t u1, uintptr_t u2) {
     (void)u1;
     (void)u2;
-    uint8_t w = ktgl_tag_live_on() ? ctx_wid_get(ctx) : 0u;
-    t_st.cons_wid = w;
-    dm_nvn_set_wid(w);
+    if (t_st.pkt_ctx == ctx && t_st.pkt_hi > t_st.pkt_lo) {
+        span_retire_range(ctx, t_st.pkt_lo, t_st.pkt_hi);
+    }
+    t_st.pkt_ctx = 0u;
+    t_st.pkt_lo = 0u;
+    t_st.pkt_hi = 0u;
+    t_st.last_ctx = 0u;
+    t_st.miss_ctx = 0u;
+    uint8_t prev = ctx_wid_get(ctx);
+    if (ctx >= 0x10000ULL && rd_u32_at(ctx, AOI_CTX_BATCH_OFF) != 0u
+            && (t_st.cons_wid != 0u || prev != 0u)) {
+        t_st.pend_kind = 2u;
+        t_st.cons_pend_wid = 0u;
+        t_st.pend_ctx = ctx;
+        return ctx;
+    }
+    if (prev != 0u) ctx_wid_set(ctx, 0u);
+    if (t_st.cons_wid != 0u) { t_st.cons_wid = 0u; dm_nvn_set_wid(0u); }
     return 0u;
 }
 
@@ -472,19 +555,20 @@ static uintptr_t hook_va_for(uint8_t kind) {
     case HK_NODE:      return (uintptr_t)ktgl_aoi_pre_node;
     case HK_EXIT:      return (uintptr_t)ktgl_aoi_mgr_exit;
     case HK_ROLL:      return (uintptr_t)ktgl_aoi_rollover;
-    case HK_CONS:      return (uintptr_t)ktgl_aoi_cons_cmd;
-    case HK_CONS_PRE:  return (uintptr_t)ktgl_aoi_cons_pre;
-    case HK_CONS_END:  return (uintptr_t)ktgl_aoi_cons_end;
-    case HK_CONS_EXIT: return (uintptr_t)ktgl_aoi_cons_exit;
-    case HK_ENTER:     return (uintptr_t)ktgl_aoi_mgr_enter;
-    case HK_PANE:      return (uintptr_t)ktgl_aoi_on_pane;
-    case HK_SUBMIT:    return (uintptr_t)ktgl_aoi_on_submit;
-    default:           return 0u;
+    case HK_CONS:           return (uintptr_t)ktgl_aoi_cons_cmd;
+    case HK_CONS_PKT_BEGIN: return (uintptr_t)ktgl_aoi_cons_pkt_begin;
+    case HK_CONS_PKT_END:   return (uintptr_t)ktgl_aoi_cons_pkt_end;
+    case HK_CONS_END:       return (uintptr_t)ktgl_aoi_cons_end;
+    case HK_CONS_EXIT:      return (uintptr_t)ktgl_aoi_cons_exit;
+    case HK_ENTER:          return (uintptr_t)ktgl_aoi_mgr_enter;
+    case HK_PANE:           return (uintptr_t)ktgl_aoi_on_pane;
+    case HK_SUBMIT:         return (uintptr_t)ktgl_aoi_on_submit;
+    default:                return 0u;
     }
 }
 
 static int hook_needs_flush(uint8_t kind) {
-    return kind == HK_NODE || kind == HK_EXIT || kind == HK_CONS;
+    return kind == HK_NODE || kind == HK_EXIT || kind == HK_CONS || kind == HK_CONS_PKT_END;
 }
 
 void ktgl_ui_tag_reset_for_test(void) {
