@@ -796,8 +796,11 @@ static void test_rollover_mid_node_and_va_reuse(void) {
     assert(ktgl_aoi_mgr_exit((uintptr_t)mgr, 0u, 0u) == 0u);
 
     assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
-    assert(ktgl_aoi_cons_cmd(c2 + 8u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
-    assert(ktgl_aoi_rollover(c1, c1_128, pp) == 0u); /* !in_mgr retires [c1, c1+128) only */
+    assert(ktgl_aoi_rollover(c1, c1_128, pp) == 0u); /* !in_mgr end-of-frame submit keeps spans */
+    assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
+    assert(ktgl_aoi_cons_pkt_begin(cp, c1, c1_128) == 0u && g_mock_wid == KTGL_WID_NONE);
+    assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
+    assert(ktgl_aoi_cons_pkt_end(cp, 0u, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
     assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
     assert(ktgl_aoi_cons_cmd(c2 + 8u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
 }

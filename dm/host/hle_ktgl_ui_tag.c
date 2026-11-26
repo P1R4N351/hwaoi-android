@@ -262,10 +262,6 @@ static void span_push(uintptr_t ctx, uintptr_t lo, uintptr_t hi, uint8_t wid) {
 }
 
 static uint8_t span_lookup(uintptr_t ctx, uintptr_t va) {
-    if (t_st.pkt_ctx == ctx && t_st.pkt_hi > t_st.pkt_lo
-            && (va < t_st.pkt_lo || va >= t_st.pkt_hi)) {
-        return 0u;
-    }
     if (ctx == t_st.last_ctx && va >= t_st.last_lo && va < t_st.last_hi) return t_st.last_wid;
     uint32_t h = atomic_load_explicit(&g_ring.head, memory_order_acquire);
     if (ctx == t_st.miss_ctx && h == t_st.miss_head && va >= t_st.miss_lo && va < t_st.miss_hi) return 0u;
@@ -421,21 +417,18 @@ uintptr_t ktgl_aoi_mgr_exit(uintptr_t mgr, uintptr_t u1, uintptr_t u2) {
 }
 
 uintptr_t ktgl_aoi_rollover(uintptr_t base, uintptr_t end, uintptr_t ctx) {
-    if (end > base && (end - base) <= AOI_SPAN_MAX_BYTES) {
+    if (t_st.in_mgr && end > base && (end - base) <= AOI_SPAN_MAX_BYTES) {
         int deferred = 0;
         uintptr_t cons_ctx = resolve_cons_ctx(ctx, &deferred);
-        if (t_st.in_mgr) {
-            uintptr_t lo = (t_st.span_open && t_st.span_ctx == ctx &&
-                            t_st.span_start >= base && t_st.span_start <= end)
-                               ? t_st.span_start
-                               : base;
-            span_push(cons_ctx, lo, end, t_st.wid);
-            t_st.span_ctx = ctx;
-            t_st.span_open = 1u;
-            t_st.span_start = 0u;
-            return 0u;
-        }
-        span_retire_range(cons_ctx, base, end);
+        uintptr_t lo = (t_st.span_open && t_st.span_ctx == ctx &&
+                        t_st.span_start >= base && t_st.span_start <= end)
+                           ? t_st.span_start
+                           : base;
+        span_push(cons_ctx, lo, end, t_st.wid);
+        t_st.span_ctx = ctx;
+        t_st.span_open = 1u;
+        t_st.span_start = 0u;
+        return 0u;
     }
     t_st.span_open = 0u;
     t_st.span_start = 0u;
