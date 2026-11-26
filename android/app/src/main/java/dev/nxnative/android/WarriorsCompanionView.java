@@ -61,8 +61,8 @@ final class WarriorsCompanionView extends View {
             return true;
         }
         actions.onTouchPulse();
+        if (handleHeaderTap(lx, ly)) { performClick(); invalidate(); return true; }
         if (model.touchBlocked()) return true;
-        if (handleHeaderTap(lx, ly)) { invalidate(); return true; }
         if (model.activeTab() == WarriorsCompanionModel.TAB_LEDGER && handleStatusTap(lx, ly)) {
             performClick();
             invalidate();

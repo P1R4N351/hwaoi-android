@@ -37,6 +37,7 @@ public final class WarriorsCompanionJvmTest {
         flts[4] = 30.2f; flts[5] = 33.1f;
         flts[6] = -10f; flts[390] = 40f; flts[391] = 5f;
 
+        m.hasLiveMinimap = true;
         check(m.update(ints, flts, "Boss Arena\n", 1000L), "valid update returns true");
         check(m.activeParty == 2 && m.saveCommits == 3 && m.lastSaveAgeS == 12, "telemetry unpacked");
         check("Boss Arena".equals(m.pinLabels[0]) && "40m \u25b2".equals(m.formatPinDelta(0)), "pin delta formats");
@@ -53,9 +54,28 @@ public final class WarriorsCompanionJvmTest {
         m.toggleHeadingUp();
         check(m.projectXZ(40f, 0f, proj) && Math.abs(proj[0] - 0.5f) < 1e-4f && Math.abs(proj[1]) < 1e-4f,
                 "north-up maps East right");
-        ints[2] = 0; ints[3] = 1;
+        ints[2] = 0; ints[3] = 0;
         m.update(ints, flts, "Boss Arena\n", 2000L);
-        check(m.dimmed() && m.touchBlocked(), "movie auto-dims and blocks touch");
+        m.hasLiveMinimap = false;
+        check(m.dimmed() && m.touchBlocked(), "empty live content auto-dims");
+        m.hasLiveMinimap = true;
+        m.streamMode[WarriorsCompanionModel.STREAM_MINIMAP] = WarriorsCompanionModel.ON_FIRST;
+        check(!m.hasLiveContent() && m.dimmed(), "top-only live stream counts as empty on bottom");
+        m.streamMode[WarriorsCompanionModel.STREAM_MINIMAP] = WarriorsCompanionModel.ON_SECOND;
+        check(m.hasLiveContent() && !m.dimmed(), "bottom-screen live stream un-dims");
+        ints[4] = 1;
+        m.update(ints, flts, "Boss Arena\n", 2200L);
+        check(m.dimmed() && m.touchBlocked(), "menu / hostPaused auto-dims even with buffered art");
+        ints[4] = 0; ints[1] = 0;
+        m.update(ints, flts, "Boss Arena\n", 2300L);
+        check(m.dimmed() && m.touchBlocked(), "not in-game auto-dims");
+        ints[1] = 1; ints[3] = 1;
+        m.update(ints, flts, "Boss Arena\n", 2400L);
+        check(m.dimmed() && m.touchBlocked(), "movie auto-dims and blocks pad content touch");
+        m.selectTab(WarriorsCompanionModel.TAB_LEDGER);
+        check(!m.dimmed() && !m.touchBlocked(), "status tab lifts dim veil");
+        m.selectTab(WarriorsCompanionModel.TAB_TACTICAL);
+        check(m.dimmed() && m.touchBlocked(), "switching back to pad restores dim veil");
         m.toggleAutoDim();
         check(!m.dimmed() && !m.touchBlocked(), "auto-dim opt-out unblocks touch");
     }

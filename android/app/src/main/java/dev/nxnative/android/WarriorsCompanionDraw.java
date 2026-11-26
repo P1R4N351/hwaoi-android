@@ -68,10 +68,12 @@ final class WarriorsCompanionDraw {
         c.translate(ox, oy);
         c.scale(sc, sc, 0f, 0f);
         drawChrome(c);
-        drawTopNav(c, m, glyph, nowMs);
         drawPages(c, m, nowMs);
+        alpha = 1f;
         float dim = scene.dimT(nowMs);
         if (dim > VIS_EPS) drawDimVeil(c, glyph, dim);
+        drawTopNav(c, m, glyph, nowMs, 1f - 0.35f * dim);
+        alpha = 1f;
         c.restore();
         return moving;
     }
@@ -144,17 +146,21 @@ final class WarriorsCompanionDraw {
         }
     }
 
-    private void drawTopNav(Canvas c, WarriorsCompanionModel m, Bitmap glyph, long now) {
+    private void drawTopNav(Canvas c, WarriorsCompanionModel m, Bitmap glyph, long now, float navAlpha) {
         boolean padSel = m.activeTab() == WarriorsCompanionModel.TAB_TACTICAL;
         float cx = WarriorsCompanionLayout.TAB0_CX, cy = WarriorsCompanionLayout.NAV_CY;
+        int navA = Math.round(255f * Math.max(0f, Math.min(1f, navAlpha)));
         if (glyph != null && !glyph.isRecycled()) {
+            Paint gp = padSel ? glyphNavPaint : glyphOffPaint;
+            gp.setAlpha(navA);
             dstF.set(cx - 18f, cy - 18f, cx + 18f, cy + 18f);
-            c.drawBitmap(glyph, null, dstF, padSel ? glyphNavPaint : glyphOffPaint);
+            c.drawBitmap(glyph, null, dstF, gp);
+            gp.setAlpha(255);
         } else {
-            drawDiamond(c, cx, cy, 11f, padSel ? m.primaryColor() : COL_GLYPH_OFF, true);
+            drawDiamond(c, cx, cy, 11f, fade(padSel ? m.primaryColor() : COL_GLYPH_OFF, navAlpha), true);
         }
-        drawStatusIcon(c, WarriorsCompanionLayout.TAB1_CX, cy, !padSel ? m.primaryColor() : COL_GLYPH_OFF);
-        drawNavRules(c, m.primaryColor(), now);
+        drawStatusIcon(c, WarriorsCompanionLayout.TAB1_CX, cy, fade(!padSel ? m.primaryColor() : COL_GLYPH_OFF, navAlpha));
+        drawNavRules(c, fade(m.primaryColor(), navAlpha), now);
     }
 
     /** The selected-tab rule cross-fades between the two header glyphs instead of jumping. */
@@ -359,7 +365,7 @@ final class WarriorsCompanionDraw {
     private void drawDimVeil(Canvas c, Bitmap glyph, float d) {
         p.setStyle(Paint.Style.FILL);
         p.setColor(fade(0xDC000000, d));
-        c.drawRect(0f, 0f, LOGIC_W, LOGIC_H, p);
+        c.drawRect(-BLEED, -BLEED, LOGIC_W + BLEED, LOGIC_H + BLEED, p);
         if (glyph != null && !glyph.isRecycled()) {
             dstRect.set(536, 456, 704, 624);
             glyphDimPaint.setAlpha(Math.round(255f * d));

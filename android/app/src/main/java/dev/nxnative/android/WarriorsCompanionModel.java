@@ -157,7 +157,17 @@ public final class WarriorsCompanionModel {
     public int cycleZoom() { zoomIdx = (zoomIdx + 1) % ZOOM_METERS.length; return zoomIdx; }
     public float radiusMeters() { return ZOOM_METERS[zoomIdx]; }
     public int cyclePreset() { pinPresetIdx = (pinPresetIdx + 1) % 5; return pinPresetIdx; }
-    public boolean dimmed() { return autoDim && moviePlaying; }
+    public boolean hasLiveContent() {
+        return (hasLiveMinimap && onSecond(STREAM_MINIMAP))
+                || (hasLiveObjective && onSecond(STREAM_OBJECTIVE))
+                || (hasLiveLeftHud && onSecond(STREAM_HUD));
+    }
+
+    public boolean dimmed() {
+        if (!autoDim || tab != TAB_TACTICAL) return false;
+        return moviePlaying || hostPaused || !inGame || !hasLiveContent();
+    }
+
     public boolean touchBlocked() { return dimmed(); }
 
     public int pinCount() {
