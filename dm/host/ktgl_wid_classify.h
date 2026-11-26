@@ -507,6 +507,7 @@ enum {
 
 typedef struct {
     _Atomic uint64_t slots[KTGL_SNAP_SETS][KTGL_SNAP_WAYS];
+    _Atomic uint8_t rr[KTGL_SNAP_SETS];
 } KtglSnapMap;
 
 static inline uint64_t ktgl_snap_hash(uint64_t key) {
@@ -523,6 +524,7 @@ static inline uint32_t ktgl_snap_set_idx(uint64_t key) {
 static inline void ktgl_snap_reset(KtglSnapMap *m) {
     if (!m) return;
     for (uint32_t s = 0u; s < KTGL_SNAP_SETS; s++) {
+        atomic_store_explicit(&m->rr[s], 0u, memory_order_relaxed);
         for (uint32_t w = 0u; w < KTGL_SNAP_WAYS; w++) {
             atomic_store_explicit(&m->slots[s][w], 0ULL, memory_order_relaxed);
         }
@@ -543,7 +545,7 @@ static inline void ktgl_snap_put(KtglSnapMap *m, const void *snap_node, uint8_t 
         }
         if (empty_w < 0 && (cur & KTGL_SNAP_VALID) == 0ULL) empty_w = (int)w;
     }
-    uint32_t dst = empty_w >= 0 ? (uint32_t)empty_w : (uint32_t)((ktgl_snap_hash(key) >> 12) & (KTGL_SNAP_WAYS - 1u));
+    uint32_t dst = empty_w >= 0 ? (uint32_t)empty_w : (uint32_t)(atomic_fetch_add_explicit(&m->rr[set], 1u, memory_order_relaxed) & (KTGL_SNAP_WAYS - 1u));
     atomic_store_explicit(&m->slots[set][dst], tag, memory_order_release);
 }
 

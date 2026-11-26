@@ -228,8 +228,10 @@ static void span_trim_locked(uintptr_t ctx, uintptr_t lo, uintptr_t hi, int trim
             atomic_store_explicit(&s->ctx, 0u, memory_order_release);
         } else if (s->hi <= hi) {
             s->hi = lo;
-        } else {
+        } else if (s->lo >= lo) {
             s->lo = hi;
+        } else {
+            atomic_store_explicit(&s->ctx, 0u, memory_order_release);
         }
     }
 }

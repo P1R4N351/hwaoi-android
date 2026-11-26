@@ -768,6 +768,27 @@ static void test_classifier_depth5_btn_guide_and_snap_hash(void) {
     free(sm);
 }
 
+static void test_snap_map_rr_eviction(void) {
+    KtglSnapMap *sm = calloc(1u, sizeof *sm);
+    assert(sm != NULL);
+    ktgl_snap_reset(sm);
+    static const uint64_t rr_keys[16] = {
+        0x666aULL, 0x7178ULL, 0xccd4ULL, 0xd7bdULL,
+        0xe5ccULL, 0x15b0cULL, 0x1af7aULL, 0x1db8fULL,
+        0x20decULL, 0x2b18aULL, 0x2df24ULL, 0x33fe6ULL,
+        0x59a0bULL, 0x629ceULL, 0x64567ULL, 0x70c52ULL,
+    };
+    for (size_t i = 0; i < 16u; i++) {
+        const void *k = (const void *)(uintptr_t)(rr_keys[i] << 4);
+        ktgl_snap_put(sm, k, (uint8_t)((i % 14u) + 1u));
+    }
+    for (size_t i = 8u; i < 16u; i++) {
+        const void *k = (const void *)(uintptr_t)(rr_keys[i] << 4);
+        assert(ktgl_snap_get(sm, k) == (int)((i % 14u) + 1u));
+    }
+    free(sm);
+}
+
 static void test_rollover_mid_node_and_va_reuse(void) {
     ktgl_ui_tag_reset_for_test();
     ktgl_ui_tag_set_bounds_for_test(g_tb);
@@ -803,6 +824,15 @@ static void test_rollover_mid_node_and_va_reuse(void) {
     assert(ktgl_aoi_cons_pkt_end(cp, 0u, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
     assert(ktgl_aoi_cons_cmd(c1 + 40u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_NONE);
     assert(ktgl_aoi_cons_cmd(c2 + 8u, cp, 0u) == 0u && g_mock_wid == KTGL_WID_OBJECTIVE);
+
+    uint8_t *syn = calloc(1u, 0x4000u);
+    assert(syn != NULL);
+    KtglEmitCtx ectx = {.pool_lo = 0x1000u, .pool_hi = 0x2000u, .cur = 0x1000u, .bcall_off = 0x1000u};
+    ectx.cur = 0x1100u;
+    const KtglSiteSpec sp = {0x100u, 0xeb09011fu, 0u, 21u, 8u, 9u, 8u};
+    assert(ktgl_emit_call_stub(syn, &ectx, &sp, 0x12345678ULL) == 1);
+    assert(ktgl_rd32(syn, 0x1118u) == 0xf94003ebu); /* ldr x11, [sp, #0] before x9 clobber */
+    free(syn);
 }
 
 int main(void) {
@@ -819,6 +849,7 @@ int main(void) {
     test_real_screenlayout_and_corpus_fixes();
     test_consumer_cross_thread_and_nested_mgr();
     test_classifier_depth5_btn_guide_and_snap_hash();
+    test_snap_map_rr_eviction();
     test_rollover_mid_node_and_va_reuse();
     printf("ktgl_wid_classify: PASS\n");
     return 0;

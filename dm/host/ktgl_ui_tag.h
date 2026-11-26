@@ -55,6 +55,15 @@ static inline int ktgl_emit_mov_x(
     return ktgl_emit_w(b, e, 0xaa0003e0u | (src << 16) | (rd & 31u));
 }
 
+static inline int ktgl_emit_arg_x(
+    uint8_t *b, KtglEmitCtx *e, uint8_t rd, uint8_t src) {
+    if (src >= 9u && src <= 11u) {
+        uint32_t off8 = (uint32_t)(src - 9u);
+        return ktgl_emit_w(b, e, 0xf94003e0u | (off8 << 10) | (rd & 31u));
+    }
+    return ktgl_emit_mov_x(b, e, rd, src);
+}
+
 static inline int ktgl_emit_mov64(
     uint8_t *b, KtglEmitCtx *e, uint8_t rd, uint64_t val) {
     uint32_t r = rd & 31u;
@@ -146,9 +155,9 @@ static inline int ktgl_emit_hook_stub(
     uint64_t stub_off = e->cur;
     if (s->post_old && !ktgl_emit_w(b, e, s->old_insn)) return 0;
     if (!ktgl_emit_seq(b, e, push48, 4u)) return 0;
-    if (!ktgl_emit_mov_x(b, e, 9u, s->r0)) return 0;
-    if (!ktgl_emit_mov_x(b, e, 10u, s->r1)) return 0;
-    if (!ktgl_emit_mov_x(b, e, 11u, s->r2)) return 0;
+    if (!ktgl_emit_arg_x(b, e, 9u, s->r0)) return 0;
+    if (!ktgl_emit_arg_x(b, e, 10u, s->r1)) return 0;
+    if (!ktgl_emit_arg_x(b, e, 11u, s->r2)) return 0;
     if (!ktgl_emit_mov64(b, e, 16u, (uint64_t)hook_va)) return 0;
     uint32_t bbl = ktgl_b_word(e->cur, e->bcall_off, 1);
     if (!bbl || !ktgl_emit_w(b, e, bbl)) return 0;

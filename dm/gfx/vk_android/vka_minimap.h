@@ -717,6 +717,7 @@ static void vka_mm_try_minimap(const float *mn, const float *mx) {
     if (side > VKA_MM_MAX_SIDE) side = VKA_MM_MAX_SIDE;
     if (side > g_vka_mm.pass_w) side = g_vka_mm.pass_w;
     if (side > g_vka_mm.pass_h) side = g_vka_mm.pass_h;
+    if (g_vka_mm.pass_mm_square && side < g_vka_mm.hit_mm.w) return;
     int32_t x0 = (int32_t)lrintf(cx - side * 0.5f), y0 = (int32_t)lrintf(cy - side * 0.5f);
     if (x0 < 0) { x0 = 0; } if (y0 < 0) { y0 = 0; }
     if (x0 + (int32_t)side > (int32_t)g_vka_mm.pass_w) x0 = (int32_t)g_vka_mm.pass_w - (int32_t)side;
@@ -1090,19 +1091,16 @@ static int vka_mm_tagged_mm(
     int hb, const float *mn, const float *mx) {
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
     int ll = vka_origin_ll();
-    int can_box = hb && !vka_mm_is_center_reset(mn, mx, w)
+    int can_box = hb && cnt <= 12 && !vka_mm_is_center_reset(mn, mx, w)
         && (mx[0] - mn[0]) <= w * 0.30f && (mx[1] - mn[1]) <= h * 0.50f && mx[0] >= w * 0.45f;
     if (stt != 0u && (c0_mask & 0xfu) == 0u) {
         g_vka_mm_tr.cls = 'S';
         if (can_box) vka_mm_try_minimap(mn, mx);
         return vka_mm_mask_target(cb);
     }
-    if (!hb) {
-        g_vka_mm_tr.cls = '-';
-        return vka_mm_switch_target(cb, 0);
-    }
+    if (!hb) return vka_mm_switch_target(cb, 0);
     if (vka_mm_is_center_reset(mn, mx, w)) {
-        if ((mx[0] - mn[0]) <= 0.5f && (mx[1] - mn[1]) <= 0.5f) {
+        if ((mx[0] - mn[0]) < 0.9f && (mx[1] - mn[1]) < 0.9f) {
             g_vka_mm_tr.cls = 'm';
             g_vka_mm.skip_cur_draw = 1;
             return 0;
@@ -1138,10 +1136,7 @@ static int vka_mm_tagged_mm(
 static int vka_mm_tagged_obj(
     VkCommandBuffer cb, int32_t cnt, int hb, const float *mn, const float *mx) {
     float w = (float)g_vka_mm.pass_w, h = (float)g_vka_mm.pass_h;
-    if (!hb) {
-        g_vka_mm_tr.cls = '-';
-        return vka_mm_switch_target(cb, 0);
-    }
+    if (!hb) return vka_mm_switch_target(cb, 0);
     if (vka_mm_is_center_reset(mn, mx, w) || mx[0] < w * 0.45f || mn[0] < w * 0.30f) return -1;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
     if (cnt == 12 && fabsf(bw - bh) <= fmaxf(8.f, bw * 0.20f) && bw <= h * 0.26f) {
@@ -1175,10 +1170,7 @@ static int vka_mm_tagged_lhud(VkCommandBuffer cb, int hb, const float *mn, const
     vka_mm_rect base = vka_mm_lhud_box(g_vka_mm.pass_w, g_vka_mm.pass_h);
     uint32_t w_cap = g_vka_mm.pass_w & ~3u;
     uint32_t max_w = VKA_LHUD_MAX_W < w_cap ? VKA_LHUD_MAX_W : w_cap;
-    if (!hb) {
-        g_vka_mm_tr.cls = '-';
-        return vka_mm_switch_target(cb, 0);
-    }
+    if (!hb) return vka_mm_switch_target(cb, 0);
     if (mn[0] < -w * 0.30f || mn[0] >= (float)max_w || mx[0] > (float)max_w
             || mx[1] < 0.f || mn[1] >= (float)base.h) return -1;
     if (g_vka_mm.cur_wid_bg) {
@@ -1267,7 +1259,7 @@ static int vka_minimap_select_target(
         if (stt == 0u && !blend_en && cnt <= 6
                 && ((bw >= w * 0.90f && bh >= h * 0.90f)
                     || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f))) {
-            g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F';
+            g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F'; g_vka_mm_tr.wid = 0u;
             g_vka_mm.stale_wid = g_vka_mm.cur_wid;   /* an id set before the HUD starts is not a HUD widget's */
             return vka_mm_switch_target(cb, 0);
         }
