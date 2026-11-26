@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
     KtglSpan items[AOI_SPAN_CAP];
     _Atomic uint32_t head;
+    _Atomic uint32_t tail;
     pthread_mutex_t mu;
 } KtglSpanRing;
 
@@ -157,14 +158,16 @@ static void ensure_guest_bounds(void) {
 
 static uintptr_t rd_ptr_at(uintptr_t base, size_t off) {
     uintptr_t v = 0;
-    if (base >= 0x10000ULL && base + off >= base && ktgl_os_read(base + off, &v, sizeof v)) return v;
-    return 0;
+    if (base < 0x10000ULL || base + off < base) return 0;
+    ensure_guest_bounds();
+    return ktgl_read_mem(base + off, &v, sizeof v, &g_bounds) ? v : 0;
 }
 
 static uint32_t rd_u32_at(uintptr_t base, size_t off) {
     uint32_t v = 0;
-    if (base >= 0x10000ULL && base + off >= base && ktgl_os_read(base + off, &v, sizeof v)) return v;
-    return 0;
+    if (base < 0x10000ULL || base + off < base) return 0;
+    ensure_guest_bounds();
+    return ktgl_read_mem(base + off, &v, sizeof v, &g_bounds) ? v : 0;
 }
 
 static uint32_t ctx_wid_hash(uintptr_t ctx) {
@@ -219,7 +222,9 @@ static uintptr_t resolve_cons_ctx(uintptr_t prod_ctx, int *deferred) {
 
 static void span_trim_locked(uintptr_t ctx, uintptr_t lo, uintptr_t hi, int trim) {
     uint32_t h = atomic_load_explicit(&g_ring.head, memory_order_relaxed);
-    uint32_t n = h < AOI_SPAN_CAP ? h : AOI_SPAN_CAP;
+    uint32_t t = atomic_load_explicit(&g_ring.tail, memory_order_relaxed);
+    uint32_t n = h - t;
+    if (n > AOI_SPAN_CAP) { n = AOI_SPAN_CAP; t = h - AOI_SPAN_CAP; }
     for (uint32_t i = 0u; i < n; i++) {
         KtglSpan *s = &g_ring.items[(h - 1u - i) & (AOI_SPAN_CAP - 1u)];
         if (atomic_load_explicit(&s->ctx, memory_order_relaxed) != ctx) continue;
@@ -234,6 +239,10 @@ static void span_trim_locked(uintptr_t ctx, uintptr_t lo, uintptr_t hi, int trim
             atomic_store_explicit(&s->ctx, 0u, memory_order_release);
         }
     }
+    for (uint32_t step = 0u; step < AOI_SPAN_CAP && t != h; step++, t++) {
+        if (atomic_load_explicit(&g_ring.items[t & (AOI_SPAN_CAP - 1u)].ctx, memory_order_relaxed) != 0u) break;
+    }
+    atomic_store_explicit(&g_ring.tail, t, memory_order_release);
 }
 
 static void span_retire_range(uintptr_t ctx, uintptr_t lo, uintptr_t hi) {
@@ -265,9 +274,12 @@ static void span_push(uintptr_t ctx, uintptr_t lo, uintptr_t hi, uint8_t wid) {
 
 static uint8_t span_lookup(uintptr_t ctx, uintptr_t va) {
     if (ctx == t_st.last_ctx && va >= t_st.last_lo && va < t_st.last_hi) return t_st.last_wid;
+    uint32_t t = atomic_load_explicit(&g_ring.tail, memory_order_acquire);
     uint32_t h = atomic_load_explicit(&g_ring.head, memory_order_acquire);
+    uint32_t dist = h - t;
+    if (dist == 0u) return 0u;
     if (ctx == t_st.miss_ctx && h == t_st.miss_head && va >= t_st.miss_lo && va < t_st.miss_hi) return 0u;
-    uint32_t n = h < AOI_SPAN_CAP ? h : AOI_SPAN_CAP;
+    uint32_t n = dist < AOI_SPAN_CAP ? dist : AOI_SPAN_CAP;
     uintptr_t max_lt = 0u, min_gt = UINTPTR_MAX;
     for (uint32_t i = 0; i < n; i++) {
         const KtglSpan *sp = &g_ring.items[(h - 1u - i) & (AOI_SPAN_CAP - 1u)];
@@ -311,10 +323,16 @@ uintptr_t ktgl_aoi_on_submit(uintptr_t snap_node, uintptr_t live_node, uintptr_t
     (void)mgr;
     if (!ktgl_tag_live_on() || !ktgl_ptr_aligned((const void *)snap_node)) return 0u;
     ensure_guest_bounds();
-    const void *pane = (t_st.cur_pane && ktgl_valid_pane(t_st.cur_pane, &g_bounds))
-        ? t_st.cur_pane
-        : ktgl_resolve_live_pane((const void *)live_node, &g_bounds);
-    int cls = pane ? ktgl_classify_pane_cached(pane, &g_bounds, &t_cache) : 0;
+    const void *pane = t_st.cur_pane;
+    if (!pane && live_node == snap_node) {
+        ktgl_snap_del(&g_snap_map, (const void *)snap_node);
+        return 0u;
+    }
+    int cls = pane ? ktgl_classify_pane_cached(pane, &g_bounds, &t_cache) : -1;
+    if (cls < 0 && live_node != snap_node) {
+        const void *lp = ktgl_resolve_live_pane((const void *)live_node, &g_bounds);
+        if (lp && lp != pane) cls = ktgl_classify_pane_cached(lp, &g_bounds, &t_cache);
+    }
     uint8_t wid = cls >= 0 ? (uint8_t)cls : 0u;
     ktgl_snap_put(&g_snap_map, (const void *)snap_node, wid);
     return 0u;
@@ -334,6 +352,11 @@ uintptr_t ktgl_aoi_mgr_enter(uintptr_t mgr, uintptr_t u1, uintptr_t u2) {
     if (t_st.in_mgr && t_st.mgr_depth > 0u) {
         if (t_st.mgr_depth < 255u) t_st.mgr_depth++;
         return 0u;
+    }
+    ensure_guest_bounds();
+    static _Atomic uint32_t s_enter_gen = 0u;
+    if (((atomic_fetch_add_explicit(&s_enter_gen, 1u, memory_order_relaxed) + 1u) & 63u) == 0u) {
+        (void)ktgl_pg_bump_epoch();
     }
     t_st.mgr = mgr;
     uintptr_t ctx = rd_ptr_at(mgr, AOI_MGR_CTX_OFF);
@@ -360,6 +383,7 @@ uintptr_t ktgl_aoi_pre_node(uintptr_t node_obj, uintptr_t mgr, uintptr_t unused)
     ensure_guest_bounds();
     int cls = ktgl_snap_get(&g_snap_map, (const void *)node_obj);
     uint8_t wid = cls >= 0 ? (uint8_t)cls : 0u;
+    if (t_st.in_mgr && wid == t_st.wid) return 0u;
     uintptr_t eff_mgr = t_st.mgr ? t_st.mgr : mgr;
     uintptr_t ctx = rd_ptr_at(eff_mgr, AOI_MGR_CTX_OFF);
     if (ctx < 0x10000ULL) return 0u;
@@ -570,6 +594,7 @@ void ktgl_ui_tag_reset_for_test(void) {
     pthread_mutex_lock(&g_ring.mu);
     memset(g_ring.items, 0, sizeof g_ring.items);
     atomic_store_explicit(&g_ring.head, 0u, memory_order_relaxed);
+    atomic_store_explicit(&g_ring.tail, 0u, memory_order_relaxed);
     pthread_mutex_unlock(&g_ring.mu);
     for (uint32_t i = 0u; i < AOI_CTX_SLOTS; i++) {
         atomic_store_explicit(&g_ctx_keys[i], 0u, memory_order_relaxed);

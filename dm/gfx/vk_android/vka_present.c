@@ -1101,6 +1101,7 @@ uint64_t vka_present_reserve(void) {
     return tk;
 }
 void vka_present_fill(uint64_t tk, const tex_t *t, double period_s, const int crop[4]) {
+    vka_rp_reset_ui_wid();
     vka_layer_poll();   // (a layer the packer made while the game runs: vka_shader.c)
     vka_perf_frame(period_s);
     pthread_mutex_lock(&g_pmu);

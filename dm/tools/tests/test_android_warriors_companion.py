@@ -984,10 +984,18 @@ static void test_zero_area_minimap_and_present_reset(void) {
     make_quad_vtx(q_edge_mm, 1550.f, 860.f, 1603.f, 913.f, 0.f, 0.f);
     make_quad_vtx(q_zero, 960.f, 540.f, 960.f, 540.f, 0.f, 0.f);
     make_quad_vtx(q_sub, 960.f, 540.f, 960.7f, 540.7f, 0.f, 0.f);
+    vtx_idx_pos q_bg[6], q_fs[6];
+    make_quad_vtx(q_bg, 1494.f, 652.f, 1926.f, 1084.f, 0.f, 0.f);
+    make_quad_vtx(q_fs, 0.f, 0.f, 1920.f, 1080.f, 0.f, 0.f);
     nxhost_companion_minimap_enable(0); nxhost_companion_minimap_enable(1);
     g_f += 2;
     vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
+    vka_minimap_note_draw_wid(KTGL_WID_MENU);
+    assert(sel_box_1080(fb, q_fs, 6, 0u, 0u) == 0 && g_vka_mm_tr.cls == 'F' && g_vka_mm_tr.wid == KTGL_WID_MENU);
+    vka_minimap_pass_end(1ull, &im);
+    vka_minimap_pass_begin(1ull, &im, 1u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM, area, 10ull, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 0);
     vka_minimap_note_draw_wid(KTGL_WID_MINIMAP);
+    assert(sel_box_1080(fb, q_bg, 6, 0u, 1u) == 1 && g_vka_mm.hit_mm.w == 432u);
     assert(sel_box_1080(fb, q_mm, 6, 0u, 1u) == 1 && g_vka_mm.hit_mm.w == 360u);
     vka_mm_rect mm_r0 = g_vka_mm.hit_mm;
     assert(sel_box_1080(fb, q_int, 192, 0u, 1u) == 1 && memcmp(&mm_r0, &g_vka_mm.hit_mm, sizeof mm_r0) == 0);

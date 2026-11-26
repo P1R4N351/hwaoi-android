@@ -26,7 +26,9 @@ enum {
     KTGL_PANE_MIN_SIZE     = 0xe0u,
     KTGL_SL_OFF_ROOT_PANE  = 0x358u,
     KTGL_NODE_OFF_PANE     = 0x08u,
-    KTGL_CACHE_SLOTS       = 512u,
+    KTGL_CACHE_SLOTS       = 2048u,
+    KTGL_PG_SETS           = 256u,
+    KTGL_PG_WAYS           = 4u,
     KTGL_MAX_HOPS          = 24u,
     KTGL_MAX_CHILDREN      = 64u,
     KTGL_MAX_SL_SCAN       = 128u,
@@ -69,30 +71,115 @@ static inline int ktgl_in_mem(uintptr_t a, size_t len, const KtglAddrBounds *b) 
     return 0;
 }
 
-static inline int ktgl_os_read(uintptr_t addr, void *dst, size_t len) {
-    if (!len || !dst || addr <= 0x10000ULL) return 0;
+/* TLS epoch-fenced 4 KiB verified-page cache avoids per-read syscalls on repeated heap reads.
+   Production accepts the 64-pass epoch window because the guest heap stays mapped across passes. */
+typedef struct {
+    uintptr_t pages[KTGL_PG_SETS][KTGL_PG_WAYS];
+    uint32_t epochs[KTGL_PG_SETS][KTGL_PG_WAYS];
+    uint8_t rr[KTGL_PG_SETS];
+} KtglPageCache;
+
+static _Atomic uint32_t g_ktgl_pg_epoch = 1u;
+static _Atomic uint64_t g_ktgl_os_probes = 0u;
+#if defined(__linux__)
+static _Atomic pid_t g_ktgl_pid = 0;
+static _Atomic int g_ktgl_pvm_off = 0;
+#endif
+static __thread KtglPageCache t_ktgl_pg;
+
+static inline uint32_t ktgl_pg_bump_epoch(void) {
+    uint32_t ep = atomic_fetch_add_explicit(&g_ktgl_pg_epoch, 1u, memory_order_acq_rel) + 1u;
+    if (ep == 0u) ep = atomic_fetch_add_explicit(&g_ktgl_pg_epoch, 1u, memory_order_acq_rel) + 1u;
+    return ep;
+}
+
+static inline uint64_t ktgl_os_probe_count(void) {
+    return atomic_load_explicit(&g_ktgl_os_probes, memory_order_relaxed);
+}
+
+static inline uint32_t ktgl_pg_set(uintptr_t pg) {
+    return (uint32_t)((((pg ^ (pg >> 8)) * 2654435761u) >> 16) & (KTGL_PG_SETS - 1u));
+}
+
+static inline int ktgl_pg_has(uintptr_t pg, uint32_t ep) {
+    uint32_t s = ktgl_pg_set(pg);
+    for (uint32_t w = 0u; w < KTGL_PG_WAYS; w++) {
+        if (t_ktgl_pg.epochs[s][w] == ep && t_ktgl_pg.pages[s][w] == pg) return 1;
+    }
+    return 0;
+}
+
+static inline void ktgl_pg_add(uintptr_t pg, uint32_t ep) {
+    if (!pg) return;
+    uint32_t s = ktgl_pg_set(pg);
+    for (uint32_t w = 0u; w < KTGL_PG_WAYS; w++) {
+        if (t_ktgl_pg.epochs[s][w] != ep || t_ktgl_pg.pages[s][w] == pg) {
+            t_ktgl_pg.pages[s][w] = pg;
+            t_ktgl_pg.epochs[s][w] = ep;
+            return;
+        }
+    }
+    uint32_t dst = t_ktgl_pg.rr[s] & (KTGL_PG_WAYS - 1u);
+    t_ktgl_pg.rr[s] = (uint8_t)((dst + 1u) & (KTGL_PG_WAYS - 1u));
+    t_ktgl_pg.pages[s][dst] = pg;
+    t_ktgl_pg.epochs[s][dst] = ep;
+}
+
+static inline int ktgl_os_probe_read(uintptr_t addr, void *dst, size_t len) {
+    atomic_fetch_add_explicit(&g_ktgl_os_probes, 1u, memory_order_relaxed);
 #if defined(__APPLE__)
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)len,
                (vm_address_t)(uintptr_t)dst, &got) == KERN_SUCCESS && got == len;
 #elif defined(__linux__)
-    struct iovec l = {dst, len}, r = {(void *)addr, len};
-    ssize_t n = process_vm_readv(getpid(), &l, 1UL, &r, 1UL, 0UL);
-    if (n == (ssize_t)len) return 1;
-    if (n < 0 && (errno == ENOSYS || errno == EPERM || errno == EACCES) && len <= 4096u) {
-        int p[2];
-        if (pipe(p) != 0) return 0;
-        int ok = (write(p[1], (const void *)addr, len) == (ssize_t)len) &&
-                 (read(p[0], dst, len) == (ssize_t)len);
-        close(p[0]);
-        close(p[1]);
-        return ok;
+    if (!atomic_load_explicit(&g_ktgl_pvm_off, memory_order_relaxed)) {
+        pid_t pid = atomic_load_explicit(&g_ktgl_pid, memory_order_relaxed);
+        if (!pid) { pid = getpid(); atomic_store_explicit(&g_ktgl_pid, pid, memory_order_relaxed); }
+        size_t done = 0u;
+        int last_err = 0;
+        for (uint32_t it = 0u; it < 4u && done < len; it++) {
+            struct iovec l = {(uint8_t *)dst + done, len - done};
+            struct iovec r = {(void *)(addr + done), len - done};
+            ssize_t n = process_vm_readv(pid, &l, 1UL, &r, 1UL, 0UL);
+            if (n > 0) { done += (size_t)n; continue; }
+            last_err = n < 0 ? errno : 0;
+            if (n < 0 && last_err == EINTR) continue;
+            break;
+        }
+        if (done == len) return 1;
+        if (done > 0u || (last_err != ENOSYS && last_err != EPERM && last_err != EACCES)) return 0;
+        atomic_store_explicit(&g_ktgl_pvm_off, 1, memory_order_relaxed);
     }
-    return 0;
+    if (len > 4096u) return 0;
+    int p[2];
+    if (pipe(p) != 0) return 0;
+    int ok = (write(p[1], (const void *)addr, len) == (ssize_t)len) &&
+             (read(p[0], dst, len) == (ssize_t)len);
+    close(p[0]);
+    close(p[1]);
+    return ok;
 #else
     memcpy(dst, (const void *)addr, len);
     return 1;
 #endif
+}
+
+static inline int ktgl_os_read(uintptr_t addr, void *dst, size_t len) {
+    if (!len || !dst || addr <= 0x10000ULL || addr + len < addr) return 0;
+    if (len <= 4096u) {
+        uintptr_t p0 = addr >> 12, p1 = (addr + len - 1u) >> 12;
+        uint32_t ep = atomic_load_explicit(&g_ktgl_pg_epoch, memory_order_relaxed);
+        if (!ep) ep = 1u;
+        if (ktgl_pg_has(p0, ep) && (p1 == p0 || ktgl_pg_has(p1, ep))) {
+            memcpy(dst, (const void *)addr, len);
+            return 1;
+        }
+        if (!ktgl_os_probe_read(addr, dst, len)) return 0;
+        ktgl_pg_add(p0, ep);
+        if (p1 != p0) ktgl_pg_add(p1, ep);
+        return 1;
+    }
+    return ktgl_os_probe_read(addr, dst, len);
 }
 
 static inline int ktgl_read_mem(
@@ -141,8 +228,12 @@ static inline int ktgl_snap_pane(
 }
 
 static inline int ktgl_valid_pane(const void *pane, const KtglAddrBounds *b) {
-    uint8_t snap[KTGL_PANE_MIN_SIZE];
-    return ktgl_snap_pane(pane, b, snap);
+    if (!ktgl_ptr_aligned(pane) || !ktgl_in_mem((uintptr_t)pane, KTGL_PANE_MIN_SIZE, b)) return 0;
+    uintptr_t vt = 0u;
+    if (!ktgl_read_mem((uintptr_t)pane, &vt, sizeof vt, b)) return 0;
+    if (!(b->ro_hi > b->ro_lo && !(vt & 7ULL) && vt >= b->ro_lo && vt < b->ro_hi)) return 0;
+    uint8_t tail = 0u;
+    return ktgl_read_mem((uintptr_t)pane + KTGL_PANE_MIN_SIZE - 1u, &tail, 1u, b);
 }
 
 static inline size_t ktgl_snap_name(
@@ -262,7 +353,9 @@ static inline uint8_t ktgl_match_top_nonmenu(const char *n) {
         "center_success", "center_start", "chapter_name", "gameover",
         "btl_plt_marker", "btl_parts_route", "unit_info", "goremsensor",
         "seeksensor", "btl_plt_sensor", "guide_btn_action", "guide_finalblow",
-        "keyguide_finalblow", "action_gacha", "icon_linkstrike"
+        "keyguide_finalblow", "action_gacha", "icon_linkstrike",
+        "guide_item_inout", "guide_item_pos", "guide_btn_item",
+        "NULL_guide_item_cooltime", "icon_tokusyu"
     };
     if (ktgl_has_any(n, ks, sizeof ks / sizeof ks[0])) return KTGL_WID_SPEECH;
     if (strstr(n, "still_speech") && !strstr(n, "still_speech_scale")) return KTGL_WID_SPEECH;
@@ -311,7 +404,7 @@ static inline uint8_t ktgl_match_bot_rest(const char *n) {
     };
     static const char *const kbu[] = {
         "guide_cmn_action", "guide_action_joycon", "guide_item",
-        "guide_btn_item", "guide_icon_item", "item_cooltime", "db_cooltime",
+        "guide_icon_item", "item_cooltime", "db_cooltime",
         "db_keyguide", "zonaugear_sky", "znai_bullet", "timelimit",
         "action_cooltime", "keyguide_sky", "zonaugear_info", "zonaugear_exchange",
         "cmn_win_base_guide", "keyguide_flare_", "btl_parts_action_arrow",
@@ -333,7 +426,10 @@ static inline uint8_t ktgl_match_bot_rest(const char *n) {
     if (ktgl_has_any(n, km, sizeof km / sizeof km[0])) return KTGL_WID_MINIMAP;
     if (ktgl_has_any(n, ko, sizeof ko / sizeof ko[0])) return KTGL_WID_OBJECTIVE;
     if (ktgl_has_any(n, kc, sizeof kc / sizeof kc[0])) return KTGL_WID_COMBO;
-    if (ktgl_has_any(n, kbu, sizeof kbu / sizeof kbu[0])) return KTGL_WID_BTN_GUIDE;
+    if (ktgl_has_any(n, kbu, sizeof kbu / sizeof kbu[0])
+            && !ktgl_match_top_nonmenu(n) && !ktgl_match_menu(n)) {
+        return KTGL_WID_BTN_GUIDE;
+    }
     if (ktgl_has_any(n, kal, sizeof kal / sizeof kal[0])) return KTGL_WID_ALLIES;
     if (ktgl_has_any(n, kko, sizeof kko / sizeof kko[0])) return KTGL_WID_KO_COUNT;
     if (ktgl_has_any_word(n, kkw, sizeof kkw / sizeof kkw[0])) return KTGL_WID_KO_COUNT;
@@ -500,8 +596,8 @@ static inline uint8_t ktgl_tag_combo_bg(
 }
 
 enum {
-    KTGL_SNAP_SETS = 4096u,
-    KTGL_SNAP_WAYS = 8u,
+    KTGL_SNAP_SETS = 8192u,
+    KTGL_SNAP_WAYS = 16u,
     KTGL_SNAP_VALID = 0x100ULL
 };
 
@@ -522,6 +618,7 @@ static inline uint32_t ktgl_snap_set_idx(uint64_t key) {
 }
 
 static inline void ktgl_snap_reset(KtglSnapMap *m) {
+    (void)ktgl_pg_bump_epoch();
     if (!m) return;
     for (uint32_t s = 0u; s < KTGL_SNAP_SETS; s++) {
         atomic_store_explicit(&m->rr[s], 0u, memory_order_relaxed);
@@ -531,21 +628,44 @@ static inline void ktgl_snap_reset(KtglSnapMap *m) {
     }
 }
 
+static inline void ktgl_snap_del(KtglSnapMap *m, const void *snap_node) {
+    if (!m || !ktgl_ptr_aligned(snap_node)) return;
+    uint64_t key = ((uint64_t)(uintptr_t)snap_node >> 4) & 0x0007ffffffffffffULL;
+    uint32_t set = ktgl_snap_set_idx(key);
+    for (uint32_t w = 0u; w < KTGL_SNAP_WAYS; w++) {
+        uint64_t cur = atomic_load_explicit(&m->slots[set][w], memory_order_acquire);
+        if ((cur & KTGL_SNAP_VALID) != 0ULL && (cur >> 9) == key) {
+            atomic_store_explicit(&m->slots[set][w], 0ULL, memory_order_release);
+        }
+    }
+}
+
 static inline void ktgl_snap_put(KtglSnapMap *m, const void *snap_node, uint8_t wid) {
     if (!m || !ktgl_ptr_aligned(snap_node)) return;
+    if (wid == 0u) {
+        ktgl_snap_del(m, snap_node);
+        return;
+    }
     uint64_t key = ((uint64_t)(uintptr_t)snap_node >> 4) & 0x0007ffffffffffffULL;
     uint64_t tag = (key << 9) | KTGL_SNAP_VALID | (uint64_t)wid;
     uint32_t set = ktgl_snap_set_idx(key);
-    int empty_w = -1;
     for (uint32_t w = 0u; w < KTGL_SNAP_WAYS; w++) {
-        uint64_t cur = atomic_load_explicit(&m->slots[set][w], memory_order_relaxed);
+        uint64_t cur = atomic_load_explicit(&m->slots[set][w], memory_order_acquire);
         if ((cur & KTGL_SNAP_VALID) != 0ULL && (cur >> 9) == key) {
             atomic_store_explicit(&m->slots[set][w], tag, memory_order_release);
             return;
         }
-        if (empty_w < 0 && (cur & KTGL_SNAP_VALID) == 0ULL) empty_w = (int)w;
     }
-    uint32_t dst = empty_w >= 0 ? (uint32_t)empty_w : (uint32_t)(atomic_fetch_add_explicit(&m->rr[set], 1u, memory_order_relaxed) & (KTGL_SNAP_WAYS - 1u));
+    for (uint32_t w = 0u; w < KTGL_SNAP_WAYS; w++) {
+        uint64_t cur = atomic_load_explicit(&m->slots[set][w], memory_order_acquire);
+        if ((cur & KTGL_SNAP_VALID) != 0ULL) continue;
+        if (atomic_compare_exchange_strong_explicit(&m->slots[set][w], &cur, tag,
+                memory_order_acq_rel, memory_order_acquire) ||
+            ((cur & KTGL_SNAP_VALID) != 0ULL && (cur >> 9) == key)) {
+            return;
+        }
+    }
+    uint32_t dst = (uint32_t)(atomic_fetch_add_explicit(&m->rr[set], 1u, memory_order_relaxed) & (KTGL_SNAP_WAYS - 1u));
     atomic_store_explicit(&m->slots[set][dst], tag, memory_order_release);
 }
 
@@ -584,15 +704,18 @@ static inline int ktgl_classify_pane_cached(
     const void *pane, const KtglAddrBounds *b, KtglWidCache *cache) {
     uint8_t snap[KTGL_PANE_MIN_SIZE];
     if (!ktgl_snap_pane(pane, b, snap)) return -1;
+    KtglWidCacheEntry *e = NULL;
+    if (cache) {
+        if (cache->epoch == 0u) cache->epoch = 1u;
+        uint32_t idx = (uint32_t)((((uintptr_t)pane >> 4) * 2654435761u) & (KTGL_CACHE_SLOTS - 1u));
+        e = &cache->slots[idx];
+    }
     uintptr_t vt = (uintptr_t)ktgl_snap_ptr(snap, 0u);
     uintptr_t name_ptr = (uintptr_t)ktgl_snap_ptr(snap, KTGL_PANE_OFF_NAME);
     uintptr_t parent_ptr = (uintptr_t)ktgl_snap_ptr(snap, KTGL_PANE_OFF_PARENT);
     uintptr_t owner_sl = (uintptr_t)ktgl_snap_ptr(snap, KTGL_PANE_OFF_OWNER_SL);
     uint32_t child_cnt = ktgl_snap_u32(snap, KTGL_PANE_OFF_CHILDCNT);
-    if (cache) {
-        if (cache->epoch == 0u) cache->epoch = 1u;
-        uint32_t idx = (uint32_t)((((uintptr_t)pane >> 4) * 2654435761u) & (KTGL_CACHE_SLOTS - 1u));
-        KtglWidCacheEntry *e = &cache->slots[idx];
+    if (e) {
         if (e->valid && e->epoch == cache->epoch && e->pane == (uintptr_t)pane
                 && e->vt == vt && e->name_ptr == name_ptr && e->parent_ptr == parent_ptr
                 && e->owner_sl == owner_sl && e->child_cnt == child_cnt) {

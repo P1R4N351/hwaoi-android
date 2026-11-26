@@ -835,6 +835,73 @@ static void test_rollover_mid_node_and_va_reuse(void) {
     free(syn);
 }
 
+static void test_world_wheel_and_zero_non_evict(void) {
+    _Alignas(16) uint8_t sl[0x380] = {0};
+    uintptr_t vt = 0x20000ULL;
+    SynPane r_p, inout_p, pos_p, text_r, bat_l, cool_rt, cool_tok, corner_a, main_bat;
+    const void *rp = &r_p;
+    memcpy(sl, &vt, sizeof vt);
+    memcpy(sl + KTGL_SL_OFF_ROOT_PANE, &rp, sizeof rp);
+    syn_init(&r_p, "NULL_root", NULL, sl);
+    syn_init(&inout_p, "NULL_guide_item_inout", &r_p, sl);
+    syn_init(&pos_p, "NULL_guide_item_pos", &inout_p, sl);
+    syn_init(&text_r, "TEXT28_guide_r", &pos_p, sl);
+    syn_init(&bat_l, "PIC_base_battery_L_00", &inout_p, sl);
+    syn_add_child(&r_p, &inout_p);
+    syn_add_child(&inout_p, &pos_p);
+    syn_add_child(&pos_p, &text_r);
+    syn_add_child(&inout_p, &bat_l);
+    assert(ktgl_classify_pane(&text_r, &g_tb) == KTGL_WID_WORLD_MARKER);
+    assert(ktgl_classify_pane(&bat_l, &g_tb) == KTGL_WID_WORLD_MARKER);
+    syn_init(&cool_rt, "NULL_guide_item_cooltime", NULL, NULL);
+    syn_init(&cool_tok, "PIC_icon_tokusyu", &cool_rt, NULL);
+    assert(ktgl_classify_pane(&cool_tok, &g_tb) == KTGL_WID_WORLD_MARKER);
+    syn_init(&corner_a, "Null_guide_item_a", NULL, NULL);
+    assert(ktgl_classify_pane(&corner_a, &g_tb) == KTGL_WID_BTN_GUIDE);
+    syn_init(&main_bat, "battle_parts_main_gauge_zonaubattery_set", NULL, NULL);
+    assert(ktgl_classify_pane(&main_bat, &g_tb) == KTGL_WID_BATTERIES);
+
+    KtglSnapMap *sm = calloc(1u, sizeof *sm);
+    assert(sm != NULL);
+    for (size_t i = 0; i < 64u; i++) {
+        ktgl_snap_put(sm, (const void *)(0x200000ULL + i * 0x10000u), KTGL_WID_HEARTS);
+    }
+    for (uint32_t j = 0; j < 50000u; j++) {
+        ktgl_snap_put(sm, (const void *)(0x9000000ULL + (uintptr_t)j * 16u), 0u);
+    }
+    for (size_t i = 0; i < 64u; i++) {
+        assert(ktgl_snap_get(sm, (const void *)(0x200000ULL + i * 0x10000u)) == KTGL_WID_HEARTS);
+    }
+    ktgl_snap_del(sm, (const void *)0x200000ULL);
+    assert(ktgl_snap_get(sm, (const void *)0x200000ULL) == -1);
+    free(sm);
+}
+
+
+static void test_page_cache_and_mprotect_guard(void) {
+    ktgl_pg_bump_epoch();
+    SynPane root, mm;
+    syn_init(&root, "NULL_root", NULL, NULL);
+    syn_init(&mm, "PANE_NULL_MINIMAP", &root, &root);
+    assert(ktgl_classify_pane(&mm, &g_tb) == KTGL_WID_MINIMAP);
+    uint64_t p0 = ktgl_os_probe_count();
+    for (int i = 0; i < 500; i++) {
+        assert(ktgl_classify_pane(&mm, &g_tb) == KTGL_WID_MINIMAP);
+    }
+    uint64_t delta = ktgl_os_probe_count() - p0;
+    assert(delta <= 8u);
+
+    uint8_t *pg = mmap(NULL, 4096u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(pg != MAP_FAILED);
+    SynPane *pm = (SynPane *)pg;
+    syn_init(pm, "PANE_NULL_MINIMAP", NULL, NULL);
+    assert(ktgl_classify_pane(pm, &g_tb) == KTGL_WID_MINIMAP);
+    ktgl_pg_bump_epoch();
+    assert(mprotect(pg, 4096u, PROT_NONE) == 0);
+    assert(ktgl_classify_pane(pm, &g_tb) == KTGL_WID_NONE);
+    assert(munmap(pg, 4096u) == 0);
+}
+
 int main(void) {
     test_prot_none_guard();
     test_all_widget_classes();
@@ -851,6 +918,8 @@ int main(void) {
     test_classifier_depth5_btn_guide_and_snap_hash();
     test_snap_map_rr_eviction();
     test_rollover_mid_node_and_va_reuse();
+    test_world_wheel_and_zero_non_evict();
+    test_page_cache_and_mprotect_guard();
     printf("ktgl_wid_classify: PASS\n");
     return 0;
 }

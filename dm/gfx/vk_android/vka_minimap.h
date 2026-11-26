@@ -717,7 +717,6 @@ static void vka_mm_try_minimap(const float *mn, const float *mx) {
     if (side > VKA_MM_MAX_SIDE) side = VKA_MM_MAX_SIDE;
     if (side > g_vka_mm.pass_w) side = g_vka_mm.pass_w;
     if (side > g_vka_mm.pass_h) side = g_vka_mm.pass_h;
-    if (g_vka_mm.pass_mm_square && side < g_vka_mm.hit_mm.w) return;
     int32_t x0 = (int32_t)lrintf(cx - side * 0.5f), y0 = (int32_t)lrintf(cy - side * 0.5f);
     if (x0 < 0) { x0 = 0; } if (y0 < 0) { y0 = 0; }
     if (x0 + (int32_t)side > (int32_t)g_vka_mm.pass_w) x0 = (int32_t)g_vka_mm.pass_w - (int32_t)side;
@@ -1109,7 +1108,7 @@ static int vka_mm_tagged_mm(
     }
     if (mx[0] < w * 0.45f) return -1;
     if (can_box) {
-        vka_mm_try_minimap(mn, mx);
+        if (cnt <= 6) vka_mm_try_minimap(mn, mx);
         float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
         if (stt == 0u && cnt == 12 && g_vka_mm.cur_tex && !g_vka_mm.ring_tex
                 && fabsf(bw - bh) <= fmaxf(8.f, bw * 0.20f) && bw <= 170.f * (h / 1080.f)) {
@@ -1259,7 +1258,7 @@ static int vka_minimap_select_target(
         if (stt == 0u && !blend_en && cnt <= 6
                 && ((bw >= w * 0.90f && bh >= h * 0.90f)
                     || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f))) {
-            g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F'; g_vka_mm_tr.wid = 0u;
+            g_vka_mm.pass_opaque_fs = 1; g_vka_mm_tr.cls = 'F';
             g_vka_mm.stale_wid = g_vka_mm.cur_wid;   /* an id set before the HUD starts is not a HUD widget's */
             return vka_mm_switch_target(cb, 0);
         }

@@ -175,6 +175,11 @@ void vka_rp_queue_activate(uint64_t serial) {
     for (i = 0; i < g_nqs; i++) if (g_qs[i].serial == serial) { S = g_qs[i]; return; }
     memset(&S, 0, sizeof S); S.serial = serial;
 }
+/* Called only from vka_present_fill on vk-replay after qs_force_all drains all queues. */
+void vka_rp_reset_ui_wid(void) {
+    S.d.ui_wid = 0u;
+    for (int i = 0; i < g_nqs; i++) g_qs[i].d.ui_wid = 0u;
+}
 void vka_rp_queue_forget(uint64_t serial) {
     for (int i = 0; i < g_nqs; i++) if (g_qs[i].serial == serial) { g_qs[i] = g_qs[--g_nqs]; break; }
     if (S.serial == serial) memset(&S, 0, sizeof S);

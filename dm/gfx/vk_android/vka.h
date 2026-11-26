@@ -161,6 +161,7 @@ void vka_rp_exec(const uint8_t *handle, uint64_t fence);   // fence: the submiss
 uint64_t vka_rp_sub_commit(uint64_t reserved);
 void vka_rp_queue_activate(uint64_t serial);
 void vka_rp_queue_forget(uint64_t serial);
+void vka_rp_reset_ui_wid(void);
 void vka_rp_prog_forget(const prog_t *p);   // a finalized program leaves every queue's bindings (replay thread)
 void vka_rp_set_queue_origin(int on);
 int vka_worker_on(void);                              // DM_VK_WORKER (default 1): submissions are replayed on the replay worker thread
